@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { codexBlock, removeCodexSection, upsertCodexToml } from '../src/broker/registration.js';
 import { sseEvents } from '../src/broker/cloudcli.js';
-import { callerFrom } from '../src/shim/mcp-shim.js';
+import { callerFrom, protocolMismatch } from '../src/shim/mcp-shim.js';
 import { pushActivity } from '../src/broker/broker.js';
 import { VERSION } from '../src/shared/version.js';
 import fs from 'node:fs';
@@ -34,6 +34,11 @@ describe('codex config.toml registration', () => {
 });
 
 describe('shim caller identity', () => {
+  it('treats a legacy runtime without a protocol as v1', () => {
+    expect(protocolMismatch(undefined)).toBeNull();
+    expect(protocolMismatch(1)).toBeNull();
+    expect(protocolMismatch(2)).toMatch(/restart this session/i);
+  });
   it('uses the Codex turn metadata thread id', () => {
     const meta = { 'x-codex-turn-metadata': { thread_id: 't-1', session_id: 't-1' }, threadId: 't-1' };
     expect(callerFrom({}, meta, '/w')).toEqual({ provider: 'codex', providerSessionId: 't-1', cwd: '/w' });

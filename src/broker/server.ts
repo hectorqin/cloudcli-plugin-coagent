@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ToolRequest } from '../shared/protocol.js';
 import { PROTOCOL_VERSION, VERSION } from '../shared/version.js';
-import { Broker } from './broker.js';
+import { Broker, ToolError } from './broker.js';
 import { HttpCloudCli } from './cloudcli.js';
 import { Git } from './git.js';
 import { brokerLog, writeLog } from './log.js';
@@ -17,22 +17,33 @@ import { Store } from './store.js';
 
 const MAX_BODY = 1024 * 1024;
 const NONCE_TTL = 5 * 60_000;
+const MAX_NONCES = 16;
 
 export class HttpError extends Error { constructor(public code: number, msg: string) { super(msg); } }
 
-function assertOwned(file: string) {
-  if (!fs.existsSync(file) || process.getuid === undefined) return;
+function existingStat(file: string): fs.Stats | null {
+  try { return fs.lstatSync(file); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+function assertOwned(file: string, st: fs.Stats) {
+  if (st.isSymbolicLink()) throw new Error(`refusing to start: ${file} must not be a symbolic link`);
+  if (process.getuid === undefined) return;
   const uid = process.getuid();
-  const actual = fs.statSync(file).uid;
+  const actual = st.uid;
   if (actual !== uid) throw new Error(`refusing to start: ${file} is owned by uid ${actual}, expected uid ${uid}`);
 }
 
 export function secureDataPaths(dataDir = DATA_DIR, runtimeFile = RUNTIME_FILE) {
-  if (fs.existsSync(dataDir)) assertOwned(dataDir);
+  const dataStat = existingStat(dataDir);
+  if (dataStat) assertOwned(dataDir, dataStat);
   else fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(dataDir, 0o700);
-  if (fs.existsSync(runtimeFile)) {
-    assertOwned(runtimeFile);
+  const runtimeStat = existingStat(runtimeFile);
+  if (runtimeStat) {
+    assertOwned(runtimeFile, runtimeStat);
     fs.chmodSync(runtimeFile, 0o600);
   }
 }
@@ -43,7 +54,7 @@ export async function readJson(req: http.IncomingMessage, limit = MAX_BODY): Pro
   for await (const chunk of req) {
     const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += b.length;
-    if (size > limit) throw new HttpError(413, `request body exceeds ${limit} bytes`);
+    if (size > limit) { req.resume(); throw new HttpError(413, `request body exceeds ${limit} bytes`); }
     chunks.push(b);
   }
   if (!chunks.length) return {};
@@ -67,7 +78,7 @@ export interface HandlerDeps {
 }
 
 export function createHandler(d: HandlerDeps): http.RequestListener {
-  let nonce: { value: string; expires: number } | null = null;
+  const nonces = new Map<string, number>();
   const now = d.now ?? Date.now;
   const tabAuthorized = (req: http.IncomingMessage) => Object.entries(req.headers).some(
     ([k, v]) => k.startsWith('x-plugin-secret-') && typeof v === 'string' && d.cloudcli.verifyApiKey(v),
@@ -78,9 +89,15 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
     const method = req.method ?? 'GET';
     const p = url.pathname.replace(/\/+$/, '') || '/';
     if (!validHost(req)) throw new HttpError(400, 'invalid Host header: expected 127.0.0.1 or localhost on the listening port');
-    if (p.startsWith('/mcp/') && req.headers.origin !== undefined) throw new HttpError(403, 'browser-originated MCP requests are not allowed');
+    if (req.headers.origin !== undefined) throw new HttpError(403, 'browser-originated requests are not allowed');
+    if (['POST', 'PUT', 'PATCH'].includes(method) && !/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '')) {
+      throw new HttpError(415, 'content-type must be application/json');
+    }
     if (p === '/mcp/tool' && method === 'POST') {
-      if (req.headers['x-coagent-protocol'] !== String(PROTOCOL_VERSION)) throw new HttpError(426, `CoAgent protocol mismatch: broker requires ${PROTOCOL_VERSION}`);
+      const protocol = req.headers['x-coagent-protocol'];
+      if (protocol !== undefined && protocol !== String(PROTOCOL_VERSION)) {
+        throw new HttpError(426, `CoAgent protocol mismatch: broker requires ${PROTOCOL_VERSION}. Restart this session to update the coagent tools.`);
+      }
       if (req.headers['x-coagent-token'] !== d.token) throw new HttpError(401, 'bad token');
       return d.broker.handleTool((await readJson(req)) as unknown as ToolRequest);
     }
@@ -89,18 +106,21 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
     if (!authorized && !d.cloudcli.apiKeyConfigured()) {
       if (p === '/state' && method === 'GET') return { setup: { apiKeyConfigured: false, registration: d.registration() }, me: null, current: null, runs: [] };
       if (p === '/setup/nonce' && method === 'GET') {
-        nonce = { value: crypto.randomBytes(18).toString('base64url'), expires: now() + NONCE_TTL };
-        return { nonce: nonce.value, expiresAt: new Date(nonce.expires).toISOString() };
+        for (const [value, expires] of nonces) if (expires <= now()) nonces.delete(value);
+        while (nonces.size >= MAX_NONCES) nonces.delete(nonces.keys().next().value!);
+        const value = crypto.randomBytes(18).toString('base64url');
+        const expires = now() + NONCE_TTL;
+        nonces.set(value, expires);
+        return { nonce: value, expiresAt: new Date(expires).toISOString() };
       }
       if (p === '/setup' && method === 'POST') {
         const body = await readJson(req);
         const supplied = typeof body.nonce === 'string' ? body.nonce : '';
-        const suppliedBytes = Buffer.from(supplied);
-        const expectedBytes = Buffer.from(nonce?.value ?? '');
-        const valid = !!nonce && nonce.expires > now() && suppliedBytes.length === expectedBytes.length
-          && crypto.timingSafeEqual(suppliedBytes, expectedBytes);
+        const expires = nonces.get(supplied);
+        const valid = expires !== undefined && expires > now();
         // Protects against stray local web pages/processes, not another process running as the same Unix user.
-        nonce = null;
+        if (valid) nonces.delete(supplied);
+        else if (expires !== undefined) nonces.delete(supplied);
         if (!valid) throw new HttpError(403, 'missing, expired, or already-used setup nonce');
         await d.cloudcli.saveApiKey(String(body.apiKey ?? ''));
         return { ok: true };
@@ -148,11 +168,24 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
     res.setHeader('content-type', 'application/json');
     try { res.end(JSON.stringify(await route(req, new URL(req.url ?? '/', 'http://localhost')))); }
     catch (e) {
-      const code = e instanceof HttpError ? e.code : 500;
+      const code = e instanceof HttpError || e instanceof ToolError ? e.code : 500;
       if (code >= 500) writeLog('error', 'HTTP request failed', { method: req.method, path: req.url, error: e });
-      res.writeHead(code); res.end(JSON.stringify({ error: e instanceof Error ? e.message : 'internal error' }));
+      if (code === 413) res.setHeader('connection', 'close');
+      const message = e instanceof Error ? e.message : 'internal error';
+      res.writeHead(code); res.end(JSON.stringify(code === 426 ? { error: message, text: message } : { error: message }));
     }
   };
+}
+
+export function startupFailureJson(error: unknown) {
+  return JSON.stringify({ ready: false, error: error instanceof Error ? error.message : String(error) });
+}
+
+function reportStartupFailure(error: unknown, server?: http.Server) {
+  console.log(startupFailureJson(error));
+  writeLog('error', 'CoAgent broker refused to start', { error });
+  server?.close();
+  process.exitCode = 1;
 }
 
 export async function start() {
@@ -176,18 +209,21 @@ export async function start() {
     broker, store, cloudcli, token, dbFile: DB_FILE, registration: () => registration,
     register: async (action) => (registration = action === 'unregister' ? await unregister() : await ensureRegistered(shimPath)),
   }));
+  server.once('error', (e) => reportStartupFailure(e, server));
   server.listen(0, '127.0.0.1', () => {
-    const addr = server.address();
-    if (!addr || typeof addr === 'string') throw new Error('no port');
-    fs.writeFileSync(RUNTIME_FILE, JSON.stringify({ port: addr.port, token, pid: process.pid, instance, protocol: PROTOCOL_VERSION }), { mode: 0o600 });
-    fs.chmodSync(RUNTIME_FILE, 0o600);
-    console.log(JSON.stringify({ ready: true, port: addr.port }));
-    writeLog('info', 'broker listening', { port: addr.port, instance });
-    if (store.getJson('autoRegister', true)) {
-      ensureRegistered(shimPath).then((r) => { registration = r; writeLog('info', 'MCP registration complete', { registration: r }); },
-        (e) => writeLog('error', 'MCP registration failed', { error: e }));
-    } else registration = { claude: 'auto-register disabled', codex: 'auto-register disabled' };
-    setInterval(() => { void broker.tick(); }, 3000).unref();
+    try {
+      const addr = server.address();
+      if (!addr || typeof addr === 'string') throw new Error('no port');
+      fs.writeFileSync(RUNTIME_FILE, JSON.stringify({ port: addr.port, token, pid: process.pid, instance, protocol: PROTOCOL_VERSION }), { mode: 0o600 });
+      fs.chmodSync(RUNTIME_FILE, 0o600);
+      console.log(JSON.stringify({ ready: true, port: addr.port }));
+      writeLog('info', 'broker listening', { port: addr.port, instance });
+      if (store.getJson('autoRegister', true)) {
+        ensureRegistered(shimPath).then((r) => { registration = r; writeLog('info', 'MCP registration complete', { registration: r }); },
+          (e) => writeLog('error', 'MCP registration failed', { error: e }));
+      } else registration = { claude: 'auto-register disabled', codex: 'auto-register disabled' };
+      setInterval(() => { void broker.tick(); }, 3000).unref();
+    } catch (e) { reportStartupFailure(e, server); }
   });
   const shutdown = () => {
     try {
@@ -201,5 +237,5 @@ export async function start() {
 }
 
 if (!process.env.VITEST) {
-  void start().catch((e) => { writeLog('error', 'CoAgent broker refused to start', { error: e }); process.exitCode = 1; });
+  void start().catch((e) => reportStartupFailure(e));
 }

@@ -8,9 +8,10 @@ export interface LogFields {
   [key: string]: unknown;
 }
 
-const SECRET_VALUE = /\b(?:ck_[A-Za-z0-9]+|sk-[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|[a-f0-9]{32,})\b|\bBearer\s+[^\s"']+|\b(?:token|api[_-]?key)\s*[:=]\s*[^\s,"'}]+/gi;
-const SENSITIVE_KEY = /^(?:authorization|token|api[_-]?key|.*secret.*)$/i;
-const BODY_KEY = /^(?:prompt|message|body|content|toolInput)$/i;
+const SECRET_VALUE = /\b(?:ck_[A-Za-z0-9]+|sk-[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|[a-f0-9]{48,})\b|\bBearer\s+[^\s"']+|\b(?:token|api[_-]?key)\s*[:=]\s*[^\s,"'}]+/gi;
+const SENSITIVE_KEY = /token|secret|password|cookie|authorization|api[_-]?key/i;
+const BODY_KEY = /^(?:prompt|message|body|content|toolInput|text|plan|note|comment|args|result|details)$/i;
+const clipped = (s: string, max: number) => s.length > max ? `${s.slice(0, max)}…[truncated ${s.length - max} chars]` : s;
 
 export function redact(value: unknown, key = ''): unknown {
   if (BODY_KEY.test(key)) {
@@ -18,8 +19,12 @@ export function redact(value: unknown, key = ''): unknown {
     return { redacted: true, length };
   }
   if (SENSITIVE_KEY.test(key)) return '[REDACTED]';
-  if (typeof value === 'string') return value.replace(SECRET_VALUE, '[REDACTED]');
-  if (value instanceof Error) return { name: value.name, message: redact(value.message) };
+  if (typeof value === 'string') return clipped(value.replace(SECRET_VALUE, '[REDACTED]'), 2000);
+  if (value instanceof Error) return {
+    name: value.name,
+    message: redact(clipped(value.message, 500)),
+    stack: redact(clipped(value.stack ?? '', 2000)),
+  };
   if (Array.isArray(value)) return value.map((v) => redact(v));
   if (value && typeof value === 'object') {
     return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, redact(v, k)]));

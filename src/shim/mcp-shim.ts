@@ -19,6 +19,12 @@ const WAIT_LIMIT_MS = 30 * 60 * 1000;
 const GATE_LIMIT_MS = 100 * 60 * 1000;
 const HEARTBEAT_MS = 60 * 1000;
 
+export function protocolMismatch(protocol: number | undefined): string | null {
+  const actual = protocol ?? PROTOCOL_VERSION; // pre-versioning runtimes speak protocol 1
+  return actual === PROTOCOL_VERSION ? null
+    : `CoAgent protocol mismatch: shim uses ${PROTOCOL_VERSION}, broker runtime uses ${actual}. Restart this session to update the coagent tools.`;
+}
+
 export function callerFrom(env: NodeJS.ProcessEnv, meta: Record<string, unknown> | undefined, cwd: string): Caller {
   // Codex metadata is per request, so it wins over an env var that could have leaked in from an outer Claude session.
   const turn = (meta?.['x-codex-turn-metadata'] ?? {}) as Record<string, unknown>;
@@ -39,9 +45,8 @@ async function call(tool: ToolName, args: Record<string, unknown>, caller: Calle
   } catch {
     return { ok: false, text: 'CoAgent broker is not running. Enable the CoAgent plugin in CloudCLI.' };
   }
-  if (rt.protocol !== PROTOCOL_VERSION) {
-    return { ok: false, text: `CoAgent protocol mismatch: shim uses ${PROTOCOL_VERSION}, broker runtime uses ${String(rt.protocol ?? 'legacy')}. Restart CloudCLI and update/reinstall CoAgent.` };
-  }
+  const mismatch = protocolMismatch(rt.protocol);
+  if (mismatch) return { ok: false, text: mismatch };
   try {
     const res = await fetch(`http://127.0.0.1:${rt.port}/mcp/tool`, {
       method: 'POST',

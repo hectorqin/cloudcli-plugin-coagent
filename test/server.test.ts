@@ -3,10 +3,10 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type { Broker } from '../src/broker/broker.js';
+import { ToolError, type Broker } from '../src/broker/broker.js';
 import { HttpCloudCli } from '../src/broker/cloudcli.js';
 import { redact, writeLog } from '../src/broker/log.js';
-import { createHandler, secureDataPaths } from '../src/broker/server.js';
+import { createHandler, secureDataPaths, startupFailureJson } from '../src/broker/server.js';
 import { Store } from '../src/broker/store.js';
 
 class StubCloudCli extends HttpCloudCli {
@@ -21,6 +21,7 @@ const fakeBroker = {
   roleProviders: () => ({}),
   state: () => ({}),
   handleTool: async () => ({ ok: true, text: 'ok' }),
+  decideGate: () => { throw new ToolError('Gate #3 is already approved.', 409); },
 } as unknown as Broker;
 
 describe('broker HTTP hardening and diagnostics', () => {
@@ -52,7 +53,8 @@ describe('broker HTTP hardening and diagnostics', () => {
 
   function request(method: string, url: string, opts: { headers?: Record<string, string>; body?: string } = {}) {
     return new Promise<{ status: number; body: Record<string, unknown> }>((resolve, reject) => {
-      const req = http.request({ host: '127.0.0.1', port, method, path: url, headers: opts.headers }, (res) => {
+      const headers = opts.body === undefined ? opts.headers : { 'content-type': 'application/json', ...opts.headers };
+      const req = http.request({ host: '127.0.0.1', port, method, path: url, headers }, (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => resolve({ status: res.statusCode!, body: JSON.parse(Buffer.concat(chunks).toString()) }));
@@ -73,28 +75,39 @@ describe('broker HTTP hardening and diagnostics', () => {
       headers: { origin: 'https://evil.example', 'x-coagent-token': 'mcp-token', 'x-coagent-protocol': '1' }, body: '{}',
     });
     expect(result.status).toBe(403);
+    expect((await request('GET', '/state', { headers: { origin: 'null' } })).status).toBe(403);
   });
 
-  it('returns a clear MCP protocol mismatch', async () => {
+  it('accepts a legacy missing protocol header and clearly rejects an explicit mismatch', async () => {
+    expect((await request('POST', '/mcp/tool', { headers: { 'x-coagent-token': 'mcp-token' }, body: '{}' })).status).toBe(200);
     const result = await request('POST', '/mcp/tool', {
       headers: { 'x-coagent-token': 'mcp-token', 'x-coagent-protocol': '0' }, body: '{}',
     });
     expect(result.status).toBe(426);
     expect(result.body.error).toMatch(/protocol mismatch.*requires 1/i);
+    expect(result.body.text).toMatch(/restart this session/i);
+  });
+
+  it('requires JSON for mutation routes and maps ToolError to its client status', async () => {
+    expect((await request('POST', '/setup', { headers: { 'content-type': 'text/plain' }, body: '{}' })).status).toBe(415);
+    const result = await request('POST', '/gates/3', {
+      headers: { 'x-plugin-secret-apikey': 'tab-key' }, body: '{"approve":true}',
+    });
+    expect(result).toMatchObject({ status: 409, body: { error: 'Gate #3 is already approved.' } });
   });
 
   it('requires a fresh, unexpired, one-time setup nonce', async () => {
     const first = await request('GET', '/setup/nonce');
-    expect((await request('POST', '/setup', { body: JSON.stringify({ apiKey: 'ck_first' }) })).status).toBe(403);
+    const second = await request('GET', '/setup/nonce'); // must not replace the first
+    expect((await request('POST', '/setup', { body: JSON.stringify({ apiKey: 'ck_wrong', nonce: 'not-a-real-nonce' }) })).status).toBe(403);
+    expect((await request('POST', '/setup', { body: JSON.stringify({ apiKey: 'ck_valid', nonce: first.body.nonce }) })).status).toBe(200);
+    expect((await request('POST', '/setup', { body: JSON.stringify({ apiKey: 'ck_reuse', nonce: first.body.nonce }) })).status).toBe(403);
+    expect((await request('POST', '/setup', { body: JSON.stringify({ apiKey: 'ck_second', nonce: second.body.nonce }) })).status).toBe(200);
 
     const expiring = await request('GET', '/setup/nonce');
     clock += 5 * 60_000 + 1;
     expect((await request('POST', '/setup', { body: JSON.stringify({ apiKey: 'ck_expired', nonce: expiring.body.nonce }) })).status).toBe(403);
-
-    const valid = await request('GET', '/setup/nonce');
-    expect((await request('POST', '/setup', { body: JSON.stringify({ apiKey: 'ck_valid', nonce: valid.body.nonce }) })).status).toBe(200);
-    expect(cloudcli.saved).toEqual(['ck_valid']);
-    expect((await request('POST', '/setup', { body: JSON.stringify({ apiKey: 'ck_reuse', nonce: valid.body.nonce }) })).status).toBe(403);
+    expect(cloudcli.saved).toEqual(['ck_valid', 'ck_second']);
     expect(first.body).toHaveProperty('expiresAt');
   });
 
@@ -118,6 +131,12 @@ describe('security utilities', () => {
     expect(lines[0]).not.toContain('do not log me');
     expect(JSON.parse(lines[0])).toMatchObject({ level: 'error', runId: 'r-1', prompt: { redacted: true, length: 13 } });
     expect(redact('Bearer abcdef')).toBe('[REDACTED]');
+    expect(redact({ 'x-coagent-token': 'abc', passwordHash: 'hash', comment: 'private' }))
+      .toEqual({ 'x-coagent-token': '[REDACTED]', passwordHash: '[REDACTED]', comment: { redacted: true, length: 7 } });
+    expect(redact('0123456789abcdef0123456789abcdef01234567')).toBe('0123456789abcdef0123456789abcdef01234567');
+    expect(redact('0123456789abcdef0123456789abcdef0123456789abcdef')).toBe('[REDACTED]');
+    expect(redact(new Error('token=secret'))).toMatchObject({ message: '[REDACTED]', stack: expect.any(String) });
+    expect(redact({ details: ['legacy prompt text'] })).toEqual({ details: { redacted: true, length: expect.any(Number) } });
   });
 
   it('tightens existing data and runtime permissions', () => {
@@ -129,5 +148,28 @@ describe('security utilities', () => {
     expect(fs.statSync(tmp).mode & 0o777).toBe(0o700);
     expect(fs.statSync(runtime).mode & 0o777).toBe(0o600);
     fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('refuses symlinked security paths without chmodding their targets', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-link-'));
+    const target = path.join(tmp, 'target');
+    const link = path.join(tmp, 'data');
+    fs.mkdirSync(target, { mode: 0o755 });
+    fs.symlinkSync(target, link);
+    expect(() => secureDataPaths(link, path.join(link, 'runtime.json'))).toThrow(/symbolic link/);
+    expect(fs.statSync(target).mode & 0o777).toBe(0o755);
+
+    const realData = path.join(tmp, 'real-data');
+    const runtimeLink = path.join(realData, 'runtime.json');
+    const missingTarget = path.join(tmp, 'must-not-be-created');
+    fs.mkdirSync(realData);
+    fs.symlinkSync(missingTarget, runtimeLink);
+    expect(() => secureDataPaths(realData, runtimeLink)).toThrow(/symbolic link/);
+    expect(fs.existsSync(missingTarget)).toBe(false);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('formats startup failures as a CloudCLI readiness line', () => {
+    expect(JSON.parse(startupFailureJson(new Error('owner mismatch')))).toEqual({ ready: false, error: 'owner mismatch' });
   });
 });

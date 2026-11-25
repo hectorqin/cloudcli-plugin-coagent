@@ -91,8 +91,10 @@ export interface BrokerDeps {
   log?: (...args: unknown[]) => void;
 }
 
-class ToolError extends Error {}
-const fail = (msg: string): never => { throw new ToolError(msg); };
+export class ToolError extends Error {
+  constructor(message: string, readonly code = 400) { super(message); }
+}
+const fail = (msg: string, code = 400): never => { throw new ToolError(msg, code); };
 const hex = (n: number) => crypto.randomBytes(n).toString('hex');
 const str = (v: unknown, name: string): string => {
   if (typeof v !== 'string' || !v.trim()) fail(`"${name}" is required`);
@@ -393,9 +395,9 @@ export class Broker {
   async decideGate(gateId: number, approve: boolean, comment: string | null): Promise<GateDTO> {
     const { store, git } = this.d;
     const gate = store.gate(gateId) ?? fail(`No gate #${gateId}`);
-    if (gate.status !== 'pending') fail(`Gate #${gateId} is already ${gate.status}.`);
+    if (gate.status !== 'pending') fail(`Gate #${gateId} is already ${gate.status}.`, 409);
     const run = store.run(gate.runId)!;
-    if (run.status !== 'active') fail('This run has ended.');
+    if (run.status !== 'active') fail('This run has ended.', 409);
     const lead = run.leadAgentId;
     const fb = comment ? `\n\nUser comment: ${comment}` : '';
 
@@ -490,7 +492,7 @@ export class Broker {
   userMessage(agentId: string, body: string) {
     const { store } = this.d;
     const a = store.agent(agentId) ?? fail(`No agent ${agentId}`);
-    if (store.run(a.runId)?.status !== 'active') fail('This run has ended.');
+    if (store.run(a.runId)?.status !== 'active') fail('This run has ended.', 409);
     if (a.status === 'merged' || a.status === 'ended') fail(`${a.id} is ${a.status} and no longer receives messages.`);
     const wait = this.slotWait(a);
     store.addMessage(a.runId, null, a.id, 'message', str(body, 'body'));
