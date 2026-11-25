@@ -620,14 +620,20 @@ export class Broker {
     return fail(`could not allocate a unique id for ${prefix}`);
   }
 
-  async endRun(runId: string, removeWorktrees: boolean) {
+  /** Ends a run. Returns the worktrees that could not be deleted; they stay recorded so a retry can find them. */
+  async endRun(runId: string, removeWorktrees: boolean): Promise<{ failedWorktrees: { agentId: string; path: string; error: string }[] }> {
     const { store, git } = this.d;
     const run = store.run(runId) ?? fail(`No run ${runId}`);
+    const failedWorktrees: { agentId: string; path: string; error: string }[] = [];
     if (removeWorktrees) {
       for (const a of store.agents(run.id)) {
-        if (a.worktreePath) { // includes a merged worker whose post-merge removal failed
-          await git.removeWorktree(a.worktreePath).catch((e) => this.log('worktree remove failed', { runId: run.id, agentId: a.id, error: e }));
+        if (!a.worktreePath) continue; // includes a merged worker whose post-merge removal failed
+        try {
+          await git.removeWorktree(a.worktreePath);
           store.updateAgent(a.id, { worktreePath: null });
+        } catch (e) {
+          this.log('worktree remove failed', { runId: run.id, agentId: a.id, error: e });
+          failedWorktrees.push({ agentId: a.id, path: a.worktreePath, error: (e as Error).message.split('\n')[0] });
         }
       }
     }
@@ -641,8 +647,9 @@ export class Broker {
       }
       for (const a of store.agents(run.id)) store.cancelQueued(a.id);
       store.endRun(run.id);
-      store.addEvent(run.id, null, 'run_ended', { removeWorktrees });
+      store.addEvent(run.id, null, 'run_ended', failedWorktrees.length ? { removeWorktrees, failedWorktrees } : { removeWorktrees });
     });
+    return { failedWorktrees };
   }
 
   /** User-requested cleanup, deliberately separate from endRun: branches are never removed automatically. */

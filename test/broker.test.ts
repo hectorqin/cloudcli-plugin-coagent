@@ -1216,6 +1216,21 @@ describe('review fixes (rework)', () => {
     expect(store.agent(w.id)).toMatchObject({ status: 'ended', worktreePath: w.worktreePath });
   });
 
+  it('endRun keeps the worktree path and reports it when deleting the worktree fails', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    broker = new Broker({
+      store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock,
+      git: { ...Git, removeWorktree: async () => { throw new Error('permission denied'); } },
+    });
+    const res = await broker.endRun(run.id, true);
+    expect(res.failedWorktrees).toEqual([{ agentId: w.id, path: w.worktreePath, error: 'permission denied' }]);
+    expect(store.agent(w.id)!.worktreePath).toBe(w.worktreePath);
+    expect(store.run(run.id)!.status).toBe('ended');
+    const ended = store.events(run.id).find((e) => e.type === 'run_ended')!;
+    expect(ended.data.failedWorktrees).toEqual(res.failedWorktrees);
+  });
+
   // 5
   it('rework for a slot-less worker waits for a free slot; interrupted and pending workers hold one', async () => {
     await startApprovedRun();

@@ -168,7 +168,7 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
       return { ok: true, text: await d.broker.endAgent(match[1], body.removeWorktree === true, null) };
     }
     if ((match = p.match(/^\/runs\/([\w-]+)\/end$/)) && method === 'POST') {
-      const body = await readJson(req); await d.broker.endRun(match[1], body.removeWorktrees === true); return { ok: true };
+      const body = await readJson(req); return { ok: true, ...(await d.broker.endRun(match[1], body.removeWorktrees === true)) };
     }
     if ((match = p.match(/^\/runs\/([\w-]+)\/branches\/delete-merged$/)) && method === 'POST') {
       const body = await readJson(req);
