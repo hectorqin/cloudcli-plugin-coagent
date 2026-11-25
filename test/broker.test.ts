@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Broker, MAX_WORKERS } from '../src/broker/broker.js';
 import type { CloudCli, SendInput, SendResult, SessionInfo } from '../src/broker/cloudcli.js';
@@ -9,6 +10,7 @@ import { Git } from '../src/broker/git.js';
 import { filePrompts } from '../src/broker/prompts.js';
 import { Store } from '../src/broker/store.js';
 import type { Caller, ToolName } from '../src/shared/protocol.js';
+import { CLAUDE_TURN, CODEX_TURN, claudeBudget, codexBudget } from './fixtures/usage.js';
 
 const PROMPTS = path.resolve(__dirname, '..', 'prompts');
 const sh = (cwd: string, ...args: string[]) =>
@@ -26,14 +28,18 @@ class FakeCloudCli implements CloudCli {
   status: ((id: string) => boolean | null) | null = null;
   /** Releases for turns started with 'hold' (a worker that keeps working until released). */
   holds: (() => void)[] = [];
+  /** Stream events per accepted turn, emitted after the session id (one list per send, in order). */
+  events: Record<string, unknown>[][] = [];
   private n = 0;
   apiKeyConfigured() { return true; }
   verifyApiKey() { return true; }
   async saveApiKey() { /* not used */ }
-  async send(input: SendInput, onApp?: (id: string) => void): Promise<SendResult> {
+  async send(input: SendInput, onApp?: (id: string) => void, onEvent?: (e: Record<string, unknown>) => void): Promise<SendResult> {
     this.calls.push(input);
     let st = this.next.shift() ?? 'ok';
     if (st === 'busy') return { status: 'busy' };
+    const script = this.events.shift() ?? [];
+    const emit = () => { for (const e of script) onEvent?.(e); };
     if (st === 'hold') {
       let app0 = input.sessionId ?? null;
       if (!app0) {
@@ -41,6 +47,7 @@ class FakeCloudCli implements CloudCli {
         this.sessions.set(`prov-${this.n}`, { appSessionId: app0, providerSessionId: `prov-${this.n}`, provider: input.provider, projectPath: input.projectPath });
       }
       onApp?.(app0);
+      emit();
       this.live.add(app0);
       await new Promise<void>((r) => this.holds.push(r));
       this.live.delete(app0);
@@ -53,6 +60,7 @@ class FakeCloudCli implements CloudCli {
       this.sessions.set(`prov-${this.n}`, { appSessionId: app, providerSessionId: `prov-${this.n}`, provider: input.provider, projectPath: input.projectPath });
     }
     onApp?.(app);
+    emit();
     if (st === 'accepted-error') return { status: 'error', error: 'died mid-turn' };
     return { status: 'ok', appSessionId: app };
   }
@@ -853,7 +861,6 @@ describe('crash recovery', () => {
 
   it('migrates a database that only has delivered_at', () => {
     store.close();
-    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
     const file = path.join(tmp, 'old.sqlite');
     const db = new DatabaseSync(file);
     db.exec(`CREATE TABLE runs (id TEXT PRIMARY KEY, lead_agent_id TEXT NOT NULL, project_path TEXT NOT NULL,
@@ -1111,5 +1118,131 @@ describe('review fixes (rework)', () => {
     expect((await call('report_result', { summary: 'sneaky' }, caller)).ok).toBe(false);
     expect((await call('send_message', { to: 'lead', body: 'hi' }, caller)).ok).toBe(false);
     expect(store.agent(w.id)!.status).toBe('ended');
+  });
+});
+
+describe('turn usage', () => {
+  /** Stream events only (what onEvent receives): drop the route's session-id/done objects. */
+  const stream = (events: Record<string, unknown>[]) => events.filter((e) => e.type !== 'session-id' && e.type !== 'done');
+
+  it('writes a row when the turn is accepted and finishes it with the last usage event (Codex: summed per turn)', async () => {
+    const run = await startApprovedRun();
+    cc.events.push(stream(CODEX_TURN));
+    const w = await spawn('reviewer', 'review it', 'codex');
+    const [t1] = store.turns(w.id);
+    expect(t1).toMatchObject({ outcome: 'ok', usageKind: 'turn', inputTokens: 15_000, outputTokens: 300, contextTokens: null, contextWindow: null });
+    expect(t1.endedAt).not.toBeNull();
+    expect(t1.durationMs).toBeGreaterThanOrEqual(0);
+    const ends = store.events(run.id).filter((e) => e.type === 'turn_end' && e.agentId === w.id);
+    expect(ends.at(-1)!.data).toMatchObject({ ok: true, turn: t1.id });
+
+    cc.events.push([codexBudget(20_000, 700)]);
+    await call('send_message', { to: w.id, body: 'again' });
+    const u = store.agent(w.id)!.usage;
+    expect(u).toMatchObject({ turns: 2, inputTokens: 35_000, outputTokens: 1_000, lastContextTokens: null, contextWindow: null, currentTurnMs: null });
+    expect(u.totalMs).not.toBeNull();
+  });
+
+  it('Claude snapshots: the last one in a turn wins, and they are never summed across turns', async () => {
+    const run = await startApprovedRun();
+    cc.events.push(stream(CLAUDE_TURN));
+    const w = await spawn('planner', 'plan it', 'claude');
+    expect(store.turns(w.id)[0]).toMatchObject({
+      usageKind: 'context', contextTokens: 45_310, contextWindow: 200_000, inputTokens: 44_810, outputTokens: 500,
+      cacheReadTokens: 40_000, cacheCreationTokens: 4_400,
+    });
+    cc.events.push([claudeBudget(52_000, 51_500, 500)]);
+    await call('send_message', { to: w.id, body: 'more' });
+    const u = store.agent(w.id)!.usage;
+    // Not 45k + 52k: a snapshot is the conversation so far, so it is reported as the latest value only.
+    expect(u).toMatchObject({ turns: 2, lastContextTokens: 52_000, contextWindow: 200_000, inputTokens: null, outputTokens: null });
+
+    // Run totals: every broker turn counts (lead included); tokens only from summable (per-turn) usage.
+    cc.events.push(stream(CODEX_TURN));
+    await spawn('reviewer', 'review', 'codex');
+    const ru = store.run(run.id)!.usage;
+    const all = store.agents(run.id).reduce((n, a) => n + a.usage.turns, 0);
+    expect(ru).toMatchObject({ turns: all, inputTokens: 15_000, outputTokens: 300 });
+  });
+
+  it('an error after acceptance closes the row as error; a 409 or an error before acceptance writes none', async () => {
+    await startApprovedRun();
+    cc.next.push('busy', 'ok');
+    const w = await spawn('planner', 'a', 'claude');
+    expect(store.turns(w.id)).toHaveLength(0); // 409: no turn
+    clock += 10 * 60_000;
+    await broker.tick(); await broker.settle();
+    expect(store.turns(w.id).map((t) => t.outcome)).toEqual(['ok']);
+
+    cc.next.push('error');
+    await call('send_message', { to: w.id, body: 'b' });
+    expect(store.turns(w.id)).toHaveLength(1); // refused before acceptance: no turn
+
+    clock += 10 * 60_000;
+    cc.next.push('accepted-error');
+    cc.events.push([claudeBudget(10_000, 9_000, 1_000)]);
+    await broker.tick(); await broker.settle();
+    const last = store.turns(w.id).at(-1)!;
+    expect(last).toMatchObject({ outcome: 'error', contextTokens: 10_000 });
+    expect(last.endedAt).not.toBeNull();
+  });
+
+  it('a turn open across a restart is closed as interrupted, keeping the usage seen so far', async () => {
+    await startApprovedRun();
+    cc.next.push('hold');
+    cc.events.push([claudeBudget(8_000, 7_900, 100)]);
+    const r = await broker.handleTool({ tool: 'spawn_agent', args: { role: 'coder', task: 'x' }, caller: LEAD });
+    const id = r.text.match(/Spawned (\S+)/)![1];
+    await new Promise((x) => setTimeout(x, 0));
+    const open = store.agent(id)!.usage;
+    expect(open.turns).toBe(1);
+    expect(open.currentTurnMs).not.toBeNull();
+    expect(store.turns(id)[0]).toMatchObject({ outcome: null, endedAt: null, contextTokens: 8_000 });
+
+    store.close();
+    store = new Store(path.join(tmp, 'db.sqlite'));
+    cc = Object.assign(new FakeCloudCli(), { sessions: cc.sessions });
+    broker = new Broker({ store, cloudcli: cc, git: Git, prompts: filePrompts(PROMPTS), now: () => clock });
+    await broker.recover();
+    await broker.settle();
+    const [t] = store.turns(id);
+    expect(t).toMatchObject({ outcome: 'interrupted', durationMs: null, contextTokens: 8_000 });
+    expect(t.endedAt).not.toBeNull();
+    expect(store.agent(id)!.usage).toMatchObject({ turns: 1, currentTurnMs: null, lastContextTokens: 8_000 });
+  });
+
+  it('durations come from the store clock; unknown usage stays null', () => {
+    let now = Date.UTC(2026, 10, 25, 9, 0, 0);
+    const s2 = new Store(path.join(tmp, 'clock.sqlite'), () => new Date(now));
+    s2.createRun('r1', 'lead-1', '/x');
+    s2.createAgent({ id: 'w1', runId: 'r1', role: 'coder', provider: 'claude', cwd: '/x', status: 'running' });
+    expect(s2.agent('w1')!.usage).toEqual({
+      turns: 0, totalMs: null, currentTurnMs: null, lastContextTokens: null, contextWindow: null, inputTokens: null, outputTokens: null,
+    });
+    const t = s2.startTurn('w1', 'r1');
+    now += 5_000;
+    expect(s2.agent('w1')!.usage).toMatchObject({ turns: 1, totalMs: 5_000, currentTurnMs: 5_000 });
+    now += 7_000;
+    s2.finishTurn(t, 'ok');
+    s2.finishTurn(t, 'error'); // closing twice is a no-op
+    expect(s2.turns('w1')[0]).toMatchObject({ outcome: 'ok', durationMs: 12_000 });
+    expect(s2.agent('w1')!.usage).toMatchObject({ turns: 1, totalMs: 12_000, currentTurnMs: null, inputTokens: null });
+    expect(s2.run('r1')!.usage).toEqual({ turns: 1, totalMs: 12_000, inputTokens: null, outputTokens: null });
+    s2.close();
+  });
+
+  it('adds the turns table to an older database idempotently', () => {
+    const file = path.join(tmp, 'old.sqlite');
+    const s1 = new Store(file);
+    s1.close();
+    // Simulate a database from before this table existed.
+    const raw = new DatabaseSync(file);
+    raw.exec('DROP TABLE turns');
+    raw.close();
+    const s2 = new Store(file);
+    s2.close();
+    const s3 = new Store(file);
+    expect(s3.diagnostics().schema.missingColumns).toEqual({});
+    s3.close();
   });
 });

@@ -7,6 +7,7 @@ import type { CloudCli } from './cloudcli.js';
 import type { GitOps } from './git.js';
 import type { Prompts } from './prompts.js';
 import type { Store } from './store.js';
+import { extractUsage, type TurnUsage } from './usage.js';
 
 export const MAX_WORKERS = 4;
 /** Roles that only read. Every other role (including custom ones) writes and gets its own worktree. */
@@ -115,6 +116,8 @@ export class Broker {
   private dispatches = new Map<string, number[]>();
   /** Workers whose turn outlived a broker restart (still processing in CloudCLI) → next status check time. */
   private detached = new Map<string, number>();
+  /** Turn rows (store `turns`) this process has open. Any other open row was left by a process that is gone. */
+  private openTurns = new Set<number>();
   private checkingDetached = false;
   private now: () => number;
   private log: (...args: unknown[]) => void;
@@ -747,6 +750,8 @@ export class Broker {
     const { store } = this.d;
     const interrupted: { a: AgentDTO; known: boolean }[] = [];
     const detached: AgentDTO[] = [];
+    // No turn row survives a restart: whatever happens in CloudCLI now, this process never sees its end or usage.
+    store.interruptOpenTurns(this.openTurns);
     for (const a of store.activeRunAgents()) {
       if (a.role === 'lead' || store.busy.has(a.id) || this.dispatches.has(a.id)) continue;
       const inFlight = store.dispatching(a.id);
@@ -911,16 +916,31 @@ export class Broker {
     if (!isLead) store.updateAgent(agent.id, { status: 'running' });
     let res;
     let started = false;
+    let turnId: number | null = null;
+    let lastUsage: TurnUsage | null = null;
+    const openTurn = () => {
+      if (turnId !== null) return;
+      turnId = store.startTurn(agent.id, agent.runId);
+      this.openTurns.add(turnId);
+      if (lastUsage) store.setTurnUsage(turnId, lastUsage);
+    };
     try {
       res = await cloudcli.send(
         { projectPath: agent.cwd, provider: agent.provider, sessionId: agent.appSessionId ?? agent.providerSessionId, message },
         (appId) => {
           // CloudCLI only announces the session once it accepted the run, so a 409 never opens a turn.
           started = true;
-          store.addEvent(agent.runId, agent.id, 'turn_start', {});
+          openTurn();
+          store.addEvent(agent.runId, agent.id, 'turn_start', { turn: turnId });
           if (!agent.appSessionId) store.updateAgent(agent.id, { appSessionId: appId });
         },
         (event) => {
+          // The last usage event of the turn wins (Claude: latest context snapshot; Codex: the turn's one bill).
+          const usage = extractUsage(event, agent.provider);
+          if (usage) {
+            lastUsage = usage;
+            if (turnId !== null) store.setTurnUsage(turnId, usage);
+          }
           const text = describeEvent(event);
           if (!text) return;
           store.activity.set(agent.id, pushActivity(store.activity.get(agent.id) ?? [], event, text, new Date(this.now()).toISOString()));
@@ -938,7 +958,11 @@ export class Broker {
     if (res.status === 'ok' || started) store.completeDispatch(msgIds);
     else store.requeue(msgIds);
     if (started || res.status === 'ok') {
-      store.addEvent(agent.runId, agent.id, 'turn_end', res.status === 'error' ? { ok: false, error: res.error } : { ok: true });
+      openTurn(); // a run that finished without announcing its session still was a turn
+      const id = turnId!;
+      store.finishTurn(id, res.status === 'error' ? 'error' : 'ok');
+      this.openTurns.delete(id);
+      store.addEvent(agent.runId, agent.id, 'turn_end', res.status === 'error' ? { ok: false, error: res.error, turn: id } : { ok: true, turn: id });
     }
     const now = store.agent(agent.id)!;
 

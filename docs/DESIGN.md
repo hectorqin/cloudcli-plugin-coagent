@@ -162,3 +162,12 @@ tab 改为泳道时序图：每个 agent 一条泳道（最左为 You），时�
 - **子 agent 卡片（Q36，fork patch 2）**：CloudCLI 新扩展点——manifest `toolRenderers` + 模块导出 `renderTool(container, ctx, host)`；coagent 用它把 `mcp__coagent__*` 渲染成卡片：spawn/wait 显示每个 worker 的状态、最近 3 条活动（broker 从 `/api/agent` 事件流截取）、结果和“Open ↗”；计划/合并显示关卡状态。
 - **实测**（真实 CloudCLI + Claude）：计划审批 → 派 coder → wait_for_agents → 合并审批 → 总结，全程在 lead 的**一轮**内完成，broker 未额外唤醒 lead。
 - 未实测：卡片在真实 UI 中的渲染（需安装 fork 后查看）；Codex lead 的完整流程。
+
+## 13. Token/耗时可见性（2026-11-25，ROADMAP 方向 5）
+
+- **数据源（已核对 CloudCLI v1.37.10 源码，引用见 `src/broker/usage.ts`）**：`/api/agent` SSE 中的 `{kind:'status', text:'token_budget', tokenBudget}`。
+  - Claude：每条主线程 assistant 消息一次，是**该次请求的上下文快照**（`used`=整段 prompt+输出，`total`=上下文窗口），不是本轮用量，也不累计；跨 turn 相加会重复计算。
+  - Codex：每轮 `turn.completed` 一次，是**本轮用量**（input/output，可跨 turn 相加）；`total` 恒为默认 200000、`used` 是本轮 input+output，均不代表上下文占用，记为未知。
+- **`turns` 表**：CloudCLI 接受 turn（收到 session-id）时写入一行，结束时写 `ended_at/duration_ms/outcome(ok|error)`；用量列保存该 turn 最后一个 usage 事件，`usage_kind` 区分 `context`（快照）与 `turn`（账单）。409/接受前出错不写行。重启时 `recover()` 把遗留的未结束行置 `interrupted`（时长未知，保留已见用量）。
+- **汇总**：`AgentDTO.usage`（turns、总时长含进行中 turn、当前 turn 时长、最新上下文快照、仅对 `turn` 类求和的 input/output）；`RunDTO.usage` 为 run 合计（不含上下文）。未知一律为 null，UI 显示 “—”，不显示美元。
+- 只覆盖 broker 跑的 turn；用户在 UI 里直接与 lead 的对话不经过 broker，不计入。

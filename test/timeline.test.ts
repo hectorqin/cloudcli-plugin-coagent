@@ -5,12 +5,14 @@ import type { AgentDTO, RunDetailDTO } from '../src/shared/protocol.js';
 const t = (s: number) => new Date(Date.UTC(2026, 10, 25, 9, 0, s)).toISOString();
 const agent = (id: string, role: string, extra: Partial<AgentDTO> = {}): AgentDTO => ({
   id, runId: 'r', role, provider: 'claude', providerSessionId: null, appSessionId: null, cwd: '/x', branch: null,
-  worktreePath: null, status: 'idle', task: null, result: null, lastError: null, busy: false, activity: [], ...extra,
+  worktreePath: null, status: 'idle', task: null, result: null, lastError: null, busy: false, activity: [],
+  usage: { turns: 0, totalMs: null, currentTurnMs: null, lastContextTokens: null, contextWindow: null, inputTokens: null, outputTokens: null },
+  ...extra,
 });
 
 function detail(): RunDetailDTO {
   return {
-    run: { id: 'r', leadAgentId: 'lead', projectPath: '/x', status: 'active', planStatus: 'approved', createdAt: t(0) },
+    run: { id: 'r', leadAgentId: 'lead', projectPath: '/x', status: 'active', planStatus: 'approved', createdAt: t(0), usage: { turns: 0, totalMs: null, inputTokens: null, outputTokens: null } },
     agents: [agent('lead', 'lead', { status: 'lead' }), agent('coder-1', 'coder', { busy: true })],
     gates: [{ id: 1, runId: 'r', kind: 'plan', requestedBy: 'lead', subjectAgent: null, payload: 'p', status: 'approved', comment: null, createdAt: t(1), snapshot: null }],
     events: [

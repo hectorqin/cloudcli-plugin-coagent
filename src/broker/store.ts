@@ -1,11 +1,13 @@
 import { DatabaseSync } from 'node:sqlite';
 import type {
   AgentDTO, AgentStatus, DeliveryState, EventDTO, EventType, GateDTO, GateKind, GateStatus, MergeSnapshot,
-  MergeSnapshotData, MessageDTO, PlanStatus, Provider, RunDTO,
+  AgentUsageDTO, MergeSnapshotData, MessageDTO, PlanStatus, Provider, RunDTO, RunUsageDTO, TurnOutcome,
 } from '../shared/protocol.js';
+import type { TurnUsage } from './usage.js';
 
 type Row = Record<string, unknown>;
 const s = (v: unknown) => (v === null || v === undefined ? null : String(v));
+const n = (v: unknown) => (v === null || v === undefined ? null : Number(v));
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS runs (
@@ -76,6 +78,17 @@ CREATE INDEX IF NOT EXISTS events_run ON events(run_id, id);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 `;
 
+/**
+ * One row per turn CloudCLI accepted for an agent (see TurnOutcome). Usage columns hold the last usage event of the
+ * turn; usage_kind says whether they are a context snapshot ('context') or the turn's bill ('turn').
+ * Added by migrate() so that it reaches older databases the same way as every other column.
+ */
+const TURN_COLUMNS: Record<string, string> = {
+  agent_id: 'TEXT', run_id: 'TEXT', started_at: 'TEXT', ended_at: 'TEXT', duration_ms: 'INTEGER', outcome: 'TEXT',
+  usage_kind: 'TEXT', context_tokens: 'INTEGER', context_window: 'INTEGER', input_tokens: 'INTEGER',
+  output_tokens: 'INTEGER', cache_read_tokens: 'INTEGER', cache_creation_tokens: 'INTEGER',
+};
+
 export interface NewAgent {
   id: string;
   runId: string;
@@ -129,6 +142,18 @@ export class Store {
     for (const [name, type] of Object.entries(gateMigrations)) {
       if (!gateCols.has(name)) this.db.exec(`ALTER TABLE gates ADD COLUMN ${name} ${type}`);
     }
+    this.db.exec(`CREATE TABLE IF NOT EXISTS turns (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      started_at TEXT NOT NULL
+    )`);
+    const turnCols = new Set((this.db.prepare('PRAGMA table_info(turns)').all() as Row[]).map((r) => String(r.name)));
+    for (const [name, type] of Object.entries(TURN_COLUMNS)) {
+      if (!turnCols.has(name)) this.db.exec(`ALTER TABLE turns ADD COLUMN ${name} ${type}`);
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS turns_agent ON turns(agent_id, id)');
+    this.db.exec('CREATE INDEX IF NOT EXISTS turns_run ON turns(run_id)');
   }
 
   close() { this.db.close(); }
@@ -142,6 +167,7 @@ export class Store {
       gates: ['id', 'run_id', 'kind', 'status', 'created_at', 'worker_head', 'lead_head', 'merge_base',
         'diff_stat', 'name_status', 'snapshot_files', 'unified_diff', 'diff_truncated'],
       events: ['id', 'run_id', 'type', 'data', 'created_at'],
+      turns: ['id', ...Object.keys(TURN_COLUMNS)],
       kv: ['k', 'v'],
     };
     const missingColumns: Record<string, string[]> = {};
@@ -187,10 +213,10 @@ export class Store {
   }
   run(id: string): RunDTO | null {
     const r = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id) as Row | undefined;
-    return r ? toRun(r) : null;
+    return r ? this.toRun(r) : null;
   }
   runs(): RunDTO[] {
-    return (this.db.prepare('SELECT * FROM runs ORDER BY created_at DESC').all() as Row[]).map(toRun);
+    return (this.db.prepare('SELECT * FROM runs ORDER BY created_at DESC').all() as Row[]).map((r) => this.toRun(r));
   }
   setPlanStatus(runId: string, st: PlanStatus) {
     this.db.prepare('UPDATE runs SET plan_status = ? WHERE id = ?').run(st, runId);
@@ -375,6 +401,84 @@ export class Store {
     }));
   }
 
+  // ── turns ─────────────────────────────────────────────────────────
+  /** Opens a turn row (CloudCLI accepted the turn). */
+  startTurn(agentId: string, runId: string): number {
+    const r = this.db.prepare('INSERT INTO turns (agent_id, run_id, started_at) VALUES (?,?,?)').run(agentId, runId, this.ts());
+    return Number(r.lastInsertRowid);
+  }
+  /** Replaces the turn's usage with the latest usage event seen (only while the turn is open). */
+  setTurnUsage(id: number, u: TurnUsage) {
+    this.db.prepare(`UPDATE turns SET usage_kind = ?, context_tokens = ?, context_window = ?, input_tokens = ?, output_tokens = ?,
+      cache_read_tokens = ?, cache_creation_tokens = ? WHERE id = ? AND ended_at IS NULL`).run(
+      u.kind, u.contextTokens, u.contextWindow, u.inputTokens, u.outputTokens, u.cacheReadTokens, u.cacheCreationTokens, id);
+  }
+  /** Closes an open turn; its duration is measured from started_at. */
+  finishTurn(id: number, outcome: TurnOutcome) {
+    const r = this.db.prepare('SELECT started_at FROM turns WHERE id = ? AND ended_at IS NULL').get(id) as Row | undefined;
+    if (!r) return;
+    const now = this.now();
+    const ms = Math.max(0, now.getTime() - Date.parse(String(r.started_at)));
+    this.db.prepare('UPDATE turns SET ended_at = ?, duration_ms = ?, outcome = ? WHERE id = ?').run(now.toISOString(), ms, outcome, id);
+  }
+  /**
+   * Closes every open turn not in `keep` as interrupted (the process that ran it is gone). Its duration is unknown:
+   * the turn may have ended at any time before the restart. Returns the ids closed.
+   */
+  interruptOpenTurns(keep: Set<number> = new Set()): number[] {
+    const open = (this.db.prepare('SELECT id FROM turns WHERE ended_at IS NULL').all() as Row[]).map((r) => Number(r.id))
+      .filter((id) => !keep.has(id));
+    const st = this.db.prepare("UPDATE turns SET ended_at = ?, outcome = 'interrupted' WHERE id = ? AND ended_at IS NULL");
+    const ts = this.ts();
+    this.transaction(() => { for (const id of open) st.run(ts, id); });
+    return open;
+  }
+  turns(agentId: string) {
+    return (this.db.prepare('SELECT * FROM turns WHERE agent_id = ? ORDER BY id').all(agentId) as Row[]).map((r) => ({
+      id: Number(r.id), agentId: String(r.agent_id), runId: String(r.run_id), startedAt: String(r.started_at),
+      endedAt: s(r.ended_at), durationMs: n(r.duration_ms), outcome: s(r.outcome) as TurnOutcome | null,
+      usageKind: s(r.usage_kind) as TurnUsage['kind'] | null, contextTokens: n(r.context_tokens),
+      contextWindow: n(r.context_window), inputTokens: n(r.input_tokens), outputTokens: n(r.output_tokens),
+      cacheReadTokens: n(r.cache_read_tokens), cacheCreationTokens: n(r.cache_creation_tokens),
+    }));
+  }
+
+  /**
+   * Sums over turns, valid for any set of turns: count, time, and the token bills of 'turn'-kind rows only.
+   * Context snapshots are never summed (they would count the same conversation once per turn).
+   */
+  private turnTotals(where: string, key: string): RunUsageDTO & { currentTurnMs: number | null } {
+    const r = this.db.prepare(`SELECT COUNT(*) AS turns,
+        SUM(duration_ms) AS done_ms,
+        MAX(CASE WHEN ended_at IS NULL THEN started_at END) AS open_since,
+        SUM(CASE WHEN usage_kind = 'turn' THEN input_tokens END) AS input,
+        SUM(CASE WHEN usage_kind = 'turn' THEN output_tokens END) AS output
+      FROM turns WHERE ${where} = ?`).get(key) as Row;
+    const currentTurnMs = r.open_since == null ? null : Math.max(0, this.now().getTime() - Date.parse(String(r.open_since)));
+    const done = n(r.done_ms);
+    return {
+      turns: Number(r.turns),
+      totalMs: done === null && currentTurnMs === null ? null : (done ?? 0) + (currentTurnMs ?? 0),
+      currentTurnMs,
+      inputTokens: n(r.input),
+      outputTokens: n(r.output),
+    };
+  }
+  agentUsage(agentId: string): AgentUsageDTO {
+    const t = this.turnTotals('agent_id', agentId);
+    const ctx = this.db.prepare(`SELECT context_tokens, context_window FROM turns
+      WHERE agent_id = ? AND context_tokens IS NOT NULL ORDER BY id DESC LIMIT 1`).get(agentId) as Row | undefined;
+    return {
+      turns: t.turns, totalMs: t.totalMs, currentTurnMs: t.currentTurnMs,
+      lastContextTokens: n(ctx?.context_tokens), contextWindow: n(ctx?.context_window),
+      inputTokens: t.inputTokens, outputTokens: t.outputTokens,
+    };
+  }
+  runUsage(runId: string): RunUsageDTO {
+    const { currentTurnMs: _, ...t } = this.turnTotals('run_id', runId);
+    return t;
+  }
+
   // ── kv (settings) ─────────────────────────────────────────────────
   getJson<T>(k: string, fallback: T): T {
     const r = this.db.prepare('SELECT v FROM kv WHERE k = ?').get(k) as Row | undefined;
@@ -391,16 +495,19 @@ export class Store {
       branch: s(r.branch), worktreePath: s(r.worktree_path), status: String(r.status) as AgentStatus,
       task: s(r.task), result: s(r.result), lastError: s(r.last_error), busy: this.busy.has(String(r.id)),
       activity: (this.activity.get(String(r.id)) ?? []).map(({ ts, text }) => ({ ts, text })),
+      usage: this.agentUsage(String(r.id)),
+    };
+  }
+
+  private toRun(r: Row): RunDTO {
+    return {
+      id: String(r.id), leadAgentId: String(r.lead_agent_id), projectPath: String(r.project_path),
+      status: String(r.status) as RunDTO['status'], planStatus: String(r.plan_status) as PlanStatus, createdAt: String(r.created_at),
+      usage: this.runUsage(String(r.id)),
     };
   }
 }
 
-function toRun(r: Row): RunDTO {
-  return {
-    id: String(r.id), leadAgentId: String(r.lead_agent_id), projectPath: String(r.project_path),
-    status: String(r.status) as RunDTO['status'], planStatus: String(r.plan_status) as PlanStatus, createdAt: String(r.created_at),
-  };
-}
 function toMessage(r: Row): MessageDTO {
   return {
     id: Number(r.id), runId: String(r.run_id), from: s(r.from_agent), to: String(r.to_agent),

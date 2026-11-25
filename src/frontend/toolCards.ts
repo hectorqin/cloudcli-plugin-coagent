@@ -3,6 +3,7 @@
  * spawn_agent / wait_for_agents read like native subagent calls: one row per worker with live status and activity.
  */
 import type { AgentDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
+import { cardUsageText } from './usage.js';
 
 export interface ToolContext {
   toolName: string;
@@ -58,6 +59,7 @@ const CSS = `
 .cat-a{border-top:1px solid var(--line);padding:6px 10px}
 .cat-a .row{display:flex;gap:8px;align-items:center}
 .cat-a b{font-weight:600}.cat-a .m{color:var(--muted);font-size:12px}
+.cat .u{color:var(--muted);font-size:11px;white-space:nowrap;font-variant-numeric:tabular-nums}
 .cat-act{margin:4px 0 0 2px;padding-left:8px;border-left:2px solid var(--line);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
 .cat-act div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cat-files{margin-top:5px;border:1px solid var(--line);border-radius:5px;overflow:hidden}.cat-file{display:flex;gap:7px;padding:2px 6px;border-top:1px solid var(--line);font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}.cat-file:first-child{border-top:0}.cat-file .path{flex:1;min-width:0;overflow-wrap:anywhere}.cat-file .plus{color:var(--ok)}.cat-file .minus{color:var(--bad)}
@@ -87,9 +89,14 @@ function callBadge(ctx: ToolContext): string {
   return '<span class="cat-b ok">done</span>';
 }
 
+/** Elapsed time of the running turn (or totals) and context use; "—" for anything unknown. */
+function usageSpan(a: AgentDTO): string {
+  return a.usage ? `<span class="m u" title="turn time · context window use">${esc(cardUsageText(a.usage))}</span>` : '';
+}
+
 function agentRow(a: AgentDTO, opts: { activity: boolean }): string {
   const acts = opts.activity ? a.activity.slice(-3) : [];
-  return `<div class="cat-a"><div class="row"><b>${esc(a.id)}</b><span class="m">${esc(a.role)} · ${esc(a.provider)}</span>${statusBadge(a)}
+  return `<div class="cat-a"><div class="row"><b>${esc(a.id)}</b><span class="m">${esc(a.role)} · ${esc(a.provider)}</span>${statusBadge(a)}${usageSpan(a)}
       ${a.appSessionId ? `<button data-open="${esc(a.appSessionId)}">Open ↗</button>` : ''}</div>
     ${acts.length ? `<div class="cat-act">${acts.map((x) => `<div title="${esc(x.text)}">${esc(x.text)}</div>`).join('')}</div>` : ''}
     ${a.lastError ? `<div class="m" style="color:var(--bad)">${esc(clip(a.lastError, 200))}</div>` : ''}
@@ -129,7 +136,7 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null): string {
       const who = a ? `${a.id} · ${a.role} · ${a.provider}` : `${String(args.role ?? '')}${args.provider ? ` · ${String(args.provider)}` : ''}`;
       const open = a?.appSessionId ? `<button data-open="${esc(a.appSessionId)}">Open ↗</button>` : '';
       return `<div class="cat-h"><span class="t">Spawned</span><span class="s">${esc(who)} — ${esc(clip(String(args.task ?? ''), 90))}</span>`
-        + `${a ? statusBadge(a) : callBadge(ctx)}${open}</div>`
+        + `${a ? statusBadge(a) + usageSpan(a) : callBadge(ctx)}${open}</div>`
         + (a?.result ? `<div class="cat-a"><details><summary>Result</summary><pre>${esc(a.result)}</pre></details></div>` : '')
         + (a ? '' : resultBlock);
     }
