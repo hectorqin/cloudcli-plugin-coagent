@@ -194,6 +194,16 @@ const TOOLS: { name: ToolName; description: string; shape: z.ZodRawShape }[] = [
     shape: { worker: z.string().describe('Worker agent id'), note: z.string().optional() },
   },
   {
+    name: 'end_agent',
+    description: 'LEAD ONLY: end a worker you no longer need (e.g. a finished reviewer, an abandoned or interrupted '
+      + 'coder). It stops receiving messages and frees its worker slot; a pending merge request for it is rejected. '
+      + 'Its unmerged worktree is kept unless remove_worktree is true; its branch is always kept.',
+    shape: {
+      worker: z.string().describe('Worker agent id'),
+      remove_worktree: z.boolean().optional().describe('Also delete its unmerged worktree (default false).'),
+    },
+  },
+  {
     name: 'list_agents',
     description: 'List the agents in your run with role, provider, status and working directory.',
     shape: { agent_id: agentId },

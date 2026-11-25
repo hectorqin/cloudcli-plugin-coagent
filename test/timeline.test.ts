@@ -23,9 +23,9 @@ function detail(): RunDetailDTO {
       { id: 7, runId: 'r', agentId: 'coder-1', type: 'turn_start', data: {}, createdAt: t(6) },
     ],
     messages: [
-      { id: 1, runId: 'r', from: null, to: 'lead', kind: 'gate', body: 'The user APPROVED your plan (gate #1).', createdAt: t(2), deliveredAt: t(3) },
-      { id: 2, runId: 'r', from: 'lead', to: 'coder-1', kind: 'message', body: '\nwrite hello\nmore', createdAt: t(4), deliveredAt: t(4) },
-      { id: 3, runId: 'r', from: 'coder-1', to: 'lead', kind: 'result', body: 'done', createdAt: t(7), deliveredAt: null },
+      { id: 1, runId: 'r', from: null, to: 'lead', kind: 'gate', body: 'The user APPROVED your plan (gate #1).', createdAt: t(2), deliveredAt: t(3), state: 'delivered', attempts: 1 },
+      { id: 2, runId: 'r', from: 'lead', to: 'coder-1', kind: 'message', body: '\nwrite hello\nmore', createdAt: t(4), deliveredAt: t(4), state: 'delivered', attempts: 1 },
+      { id: 3, runId: 'r', from: 'coder-1', to: 'lead', kind: 'result', body: 'done', createdAt: t(7), deliveredAt: null, state: 'queued', attempts: 0 },
     ],
   };
 }

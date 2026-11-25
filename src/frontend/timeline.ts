@@ -64,6 +64,14 @@ export function buildTimeline(d: RunDetailDTO): Timeline {
           ? { kind: 'node', ts: e.createdAt, lane, label: `merged ${String(e.data.commit ?? '').slice(0, 7)}`, tone: 'ok', shape: 'dot', ref }
           : { kind: 'node', ts: e.createdAt, lane, label: `merge failed: ${String(e.data.reason ?? '')}`, tone: 'error', shape: 'dot', ref };
         break;
+      case 'agent_ended': row = { kind: 'node', ts: e.createdAt, lane, label: 'ended', tone: 'muted', shape: 'square', ref }; break;
+      case 'recovered': {
+        const label = e.data.status === 'interrupted' ? 'interrupted (broker restart)'
+          : e.data.status === 'resumed' ? 'resumed'
+            : `re-queued ${Array.isArray(e.data.requeued) ? e.data.requeued.length : 0} message(s) after restart`;
+        row = { kind: 'node', ts: e.createdAt, lane, label, tone: e.data.status === 'resumed' ? 'accent' : 'warn', shape: 'dot', ref };
+        break;
+      }
       case 'turn_start':
       case 'turn_end':
       case 'wait_start':

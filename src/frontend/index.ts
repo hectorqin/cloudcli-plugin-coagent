@@ -35,7 +35,7 @@ const CSS = `
 .ca .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:8px}
 .ca .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.ca .grow{flex:1;min-width:0}
 .ca .badge{display:inline-block;padding:0 7px;border-radius:999px;border:1px solid var(--line);font-size:11px;line-height:18px;white-space:nowrap}
-.ca .t-accent,.ca .b-lead{color:var(--accent);border-color:var(--accent)}.ca .t-warn,.ca .b-running,.ca .b-starting,.ca .b-pending{color:var(--warn);border-color:var(--warn)}
+.ca .t-accent,.ca .b-lead{color:var(--accent);border-color:var(--accent)}.ca .t-warn,.ca .b-running,.ca .b-starting,.ca .b-pending,.ca .b-interrupted{color:var(--warn);border-color:var(--warn)}
 .ca .t-ok,.ca .b-reported,.ca .b-merged,.ca .b-approved{color:var(--ok);border-color:var(--ok)}.ca .t-error,.ca .b-error,.ca .b-rejected{color:var(--bad);border-color:var(--bad)}
 .ca pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:40vh;overflow:auto}
 .ca button{font:inherit;font-size:12px;padding:3px 10px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg);cursor:pointer;white-space:nowrap}
@@ -269,7 +269,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       const m = d.messages.find((x) => x.id === selected!.id);
       if (!m) return '';
       return `<div class="drawer"><div class="row"><b class="grow">${esc(m.from ?? 'You')} → ${esc(m.to)} · ${esc(m.kind)}</b>
-        <span class="sub">${esc(new Date(m.createdAt).toLocaleString())}${m.deliveredAt ? ` · delivered ${esc(hms(m.deliveredAt))}` : ' · queued'}</span>${close}</div>
+        <span class="sub">${esc(new Date(m.createdAt).toLocaleString())}${m.deliveredAt ? ` · delivered ${esc(hms(m.deliveredAt))}` : m.state === 'dispatching' ? ' · delivering' : ' · queued'}${m.attempts > 1 ? ` · ${m.attempts} attempts` : ''}</span>${close}</div>
         <pre>${esc(m.body)}</pre></div>`;
     }
     const e = d.events.find((x) => x.id === selected!.id);
@@ -297,8 +297,11 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       ${a.lastError ? `<div class="err sub">${esc(a.lastError)}</div>` : ''}
       ${a.task ? `<h3>Task</h3><pre>${esc(a.task)}</pre>` : ''}
       ${a.result ? `<h3>Result</h3><pre>${esc(a.result)}</pre>` : ''}
+      ${a.status === 'interrupted' ? '<div class="sub">Interrupted by a broker restart. Send it a message to continue in its session, or end it.</div>' : ''}
       ${canMsg ? `<div class="row" style="margin-top:8px"><input class="grow" style="width:auto" data-draft="msg-${esc(a.id)}" placeholder="Message ${esc(a.id)}…">
-        <button data-act="msg" data-id="${esc(a.id)}">Send</button></div>` : ''}`;
+        <button data-act="msg" data-id="${esc(a.id)}">Send</button></div>` : ''}
+      ${canMsg && a.role !== 'lead' && !a.busy ? `<div class="row" style="margin-top:8px"><span class="grow sub">Ending frees its worker slot; it stops receiving messages.</span>
+        <button class="danger" data-act="end-agent" data-id="${esc(a.id)}" data-wt="${a.worktreePath ? '1' : ''}">End agent</button></div>` : ''}`;
   }
 
   // ── events ───────────────────────────────────────────────────────
@@ -332,6 +335,12 @@ export function mount(container: HTMLElement, api: PluginAPI) {
         if (!confirm(`End run ${id}? Agents stop receiving messages.`)) return;
         const removeWorktrees = confirm('Also delete the unmerged worktrees of this run? (Branches are kept.)');
         void act(() => api.rpc('POST', `runs/${id}/end`, { removeWorktrees }));
+        break;
+      }
+      case 'end-agent': {
+        if (!confirm(`End ${id}? It stops receiving messages and frees its worker slot.`)) return;
+        const removeWorktree = ds.wt === '1' && confirm(`Also delete the unmerged worktree of ${id}? (Its branch is kept.)`);
+        void act(() => api.rpc('POST', `agents/${id}/end`, { removeWorktree }));
         break;
       }
       case 'setup': {

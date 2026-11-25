@@ -31,6 +31,11 @@ const broker = new Broker({
   store, cloudcli, git: Git, prompts: filePrompts(path.join(pluginRoot, 'prompts')), log,
   setupInfo: () => registration,
 });
+// Before serving: settle what a previous process left mid-flight (orphaned dispatches, workers cut off mid-turn).
+try {
+  const r = broker.recover();
+  if (r.interrupted.length || r.requeued.length) log('startup recovery', r);
+} catch (e) { log('startup recovery failed', e); }
 const token = crypto.randomBytes(24).toString('hex');
 
 class HttpError extends Error { constructor(public code: number, msg: string) { super(msg); } }
@@ -95,6 +100,10 @@ async function route(req: http.IncomingMessage, url: URL): Promise<unknown> {
     const b = await readJson(req);
     broker.userMessage(mm[1], String(b.body ?? ''));
     return { ok: true };
+  }
+  if ((mm = p.match(/^\/agents\/([\w-]+)\/end$/)) && m === 'POST') {
+    const b = await readJson(req);
+    return { ok: true, text: await broker.endAgent(mm[1], b.removeWorktree === true, null) };
   }
   if ((mm = p.match(/^\/runs\/([\w-]+)\/end$/)) && m === 'POST') {
     const b = await readJson(req);

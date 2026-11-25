@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import type {
-  AgentDTO, AgentStatus, EventDTO, EventType, GateDTO, GateKind, GateStatus, MessageDTO, PlanStatus, Provider, RunDTO,
+  AgentDTO, AgentStatus, DeliveryState, EventDTO, EventType, GateDTO, GateKind, GateStatus, MessageDTO, PlanStatus, Provider, RunDTO,
 } from '../shared/protocol.js';
 
 type Row = Record<string, unknown>;
@@ -43,7 +43,6 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL,
   delivered_at TEXT
 );
-CREATE INDEX IF NOT EXISTS messages_inbox ON messages(to_agent, delivered_at);
 CREATE TABLE IF NOT EXISTS gates (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL REFERENCES runs(id),
@@ -94,16 +93,36 @@ export class Store {
     this.db = new DatabaseSync(file);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /** Idempotent: safe on fresh and on any older database. */
+  private migrate() {
     const cols = (this.db.prepare('PRAGMA table_info(messages)').all() as Row[]).map((r) => String(r.name));
     if (!cols.includes('gate_id')) this.db.exec('ALTER TABLE messages ADD COLUMN gate_id INTEGER');
+    if (!cols.includes('delivery_state')) {
+      this.transaction(() => {
+        this.db.exec("ALTER TABLE messages ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'queued'");
+        // Older databases only had delivered_at (set before dispatch, cleared on failure): it is the truth we have.
+        this.db.exec("UPDATE messages SET delivery_state = 'delivered' WHERE delivered_at IS NOT NULL");
+      });
+    }
+    if (!cols.includes('attempts')) this.db.exec('ALTER TABLE messages ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
+    if (!cols.includes('lease_until')) this.db.exec('ALTER TABLE messages ADD COLUMN lease_until INTEGER');
+    this.db.exec('DROP INDEX IF EXISTS messages_inbox');
+    this.db.exec('CREATE INDEX IF NOT EXISTS messages_delivery ON messages(to_agent, delivery_state)');
   }
 
   close() { this.db.close(); }
   private ts() { return this.now().toISOString(); }
 
+  private txDepth = 0;
+  /** Runs `fn` atomically. Nested calls join the outer transaction. */
   transaction<T>(fn: () => T): T {
+    if (this.txDepth) { this.txDepth++; try { return fn(); } finally { this.txDepth--; } }
     this.db.exec('BEGIN');
-    try { const r = fn(); this.db.exec('COMMIT'); return r; } catch (e) { this.db.exec('ROLLBACK'); throw e; }
+    this.txDepth = 1;
+    try { const r = fn(); this.db.exec('COMMIT'); return r; } catch (e) { this.db.exec('ROLLBACK'); throw e; } finally { this.txDepth = 0; }
   }
 
   // ── runs ──────────────────────────────────────────────────────────
@@ -173,23 +192,69 @@ export class Store {
     const r = this.db.prepare('SELECT * FROM messages WHERE gate_id = ? ORDER BY id DESC LIMIT 1').get(gateId) as Row | undefined;
     return r ? toMessage(r) : null;
   }
-  /** The undelivered decision message of a gate, if the gate has been decided. */
+  /** The queued decision message of a gate, if the gate has been decided. */
   undeliveredGateMessage(gateId: number): MessageDTO | null {
-    const r = this.db.prepare('SELECT * FROM messages WHERE gate_id = ? AND delivered_at IS NULL ORDER BY id LIMIT 1').get(gateId) as Row | undefined;
+    const r = this.db.prepare("SELECT * FROM messages WHERE gate_id = ? AND delivery_state = 'queued' ORDER BY id LIMIT 1")
+      .get(gateId) as Row | undefined;
     return r ? toMessage(r) : null;
   }
+  /** Messages waiting for delivery (not those a turn is currently carrying). */
   undelivered(agentId: string): MessageDTO[] {
-    return (this.db.prepare('SELECT * FROM messages WHERE to_agent = ? AND delivered_at IS NULL ORDER BY id').all(agentId) as Row[])
+    return (this.db.prepare("SELECT * FROM messages WHERE to_agent = ? AND delivery_state = 'queued' ORDER BY id").all(agentId) as Row[])
       .map(toMessage);
   }
   agentsWithUndelivered(): string[] {
     return (this.db.prepare(`SELECT DISTINCT m.to_agent AS id FROM messages m JOIN runs r ON r.id = m.run_id
-      WHERE m.delivered_at IS NULL AND r.status = 'active'`).all() as Row[]).map((r) => String(r.id));
+      WHERE m.delivery_state = 'queued' AND r.status = 'active'`).all() as Row[]).map((r) => String(r.id));
   }
-  markDelivered(ids: number[], delivered: boolean) {
-    const st = this.db.prepare('UPDATE messages SET delivered_at = ? WHERE id = ?');
-    const ts = delivered ? this.ts() : null;
-    for (const id of ids) st.run(ts, id);
+  /** The first message ever addressed to an agent (a worker's task). */
+  firstMessageId(agentId: string): number | null {
+    const r = this.db.prepare('SELECT MIN(id) AS id FROM messages WHERE to_agent = ?').get(agentId) as Row | undefined;
+    return r && r.id !== null && r.id !== undefined ? Number(r.id) : null;
+  }
+  /** Handed over directly (tool result): queued → delivered. */
+  markDelivered(ids: number[]) {
+    const st = this.db.prepare(`UPDATE messages SET delivery_state = 'delivered', delivered_at = ?, lease_until = NULL
+      WHERE id = ? AND delivery_state != 'delivered'`);
+    const ts = this.ts();
+    this.transaction(() => { for (const id of ids) st.run(ts, id); });
+  }
+  /** queued → dispatching under a lease. Returns the ids actually claimed. */
+  claimForDispatch(ids: number[], leaseUntil: number): number[] {
+    const st = this.db.prepare(`UPDATE messages SET delivery_state = 'dispatching', attempts = attempts + 1, lease_until = ?
+      WHERE id = ? AND delivery_state = 'queued'`);
+    return this.transaction(() => ids.filter((id) => Number(st.run(leaseUntil, id).changes) > 0));
+  }
+  renewDispatch(ids: number[], leaseUntil: number) {
+    const st = this.db.prepare("UPDATE messages SET lease_until = ? WHERE id = ? AND delivery_state = 'dispatching'");
+    this.transaction(() => { for (const id of ids) st.run(leaseUntil, id); });
+  }
+  /** dispatching → delivered (the turn was accepted and finished). */
+  completeDispatch(ids: number[]) {
+    const st = this.db.prepare(`UPDATE messages SET delivery_state = 'delivered', delivered_at = ?, lease_until = NULL
+      WHERE id = ? AND delivery_state = 'dispatching'`);
+    const ts = this.ts();
+    this.transaction(() => { for (const id of ids) st.run(ts, id); });
+  }
+  /** dispatching → queued (409, error, or an orphaned dispatch after a crash). */
+  requeue(ids: number[]) {
+    const st = this.db.prepare("UPDATE messages SET delivery_state = 'queued', lease_until = NULL WHERE id = ? AND delivery_state = 'dispatching'");
+    this.transaction(() => { for (const id of ids) st.run(id); });
+  }
+  /** Dispatches whose lease ran out (the broker process that sent them is gone). */
+  expiredDispatches(now: number): MessageDTO[] {
+    return (this.db.prepare(`SELECT * FROM messages WHERE delivery_state = 'dispatching' AND (lease_until IS NULL OR lease_until < ?)
+      ORDER BY id`).all(now) as Row[]).map(toMessage);
+  }
+  /** Messages currently carried by a turn, for one agent. */
+  dispatching(agentId: string): MessageDTO[] {
+    return (this.db.prepare("SELECT * FROM messages WHERE to_agent = ? AND delivery_state = 'dispatching' ORDER BY id").all(agentId) as Row[])
+      .map(toMessage);
+  }
+  /** Agents of active runs, any status (for startup recovery). */
+  activeRunAgents(): AgentDTO[] {
+    return (this.db.prepare(`SELECT a.* FROM agents a JOIN runs r ON r.id = a.run_id WHERE r.status = 'active' ORDER BY a.created_at`)
+      .all() as Row[]).map((r) => this.toAgent(r));
   }
   messages(runId: string, limit = 500): MessageDTO[] {
     return (this.db.prepare('SELECT * FROM (SELECT * FROM messages WHERE run_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id')
@@ -260,6 +325,8 @@ function toMessage(r: Row): MessageDTO {
   return {
     id: Number(r.id), runId: String(r.run_id), from: s(r.from_agent), to: String(r.to_agent),
     kind: String(r.kind) as MessageDTO['kind'], body: String(r.body), createdAt: String(r.created_at), deliveredAt: s(r.delivered_at),
+    state: (r.delivery_state === undefined ? (r.delivered_at ? 'delivered' : 'queued') : String(r.delivery_state)) as DeliveryState,
+    attempts: Number(r.attempts ?? 0),
   };
 }
 function toGate(r: Row): GateDTO {

@@ -198,8 +198,9 @@ describe('workers', () => {
   it('spawns a writing role in its own worktree with a rendered prompt', async () => {
     await startApprovedRun();
     const w = await spawn('coder', 'add hello.txt');
-    expect(w.branch).toBe(`coagent/${w.id}`);
-    expect(w.worktreePath).toBe(path.join(tmp, 'proj-worktrees', `coagent-${w.id}`));
+    expect(w.id).toMatch(/^coder-[0-9a-f]{6}$/);
+    expect(w.branch).toBe(`coagent/${w.runId}/${w.id}`);
+    expect(w.worktreePath).toBe(path.join(tmp, 'proj-worktrees', `coagent-${w.runId}-${w.id}`));
     expect(fs.existsSync(path.join(w.worktreePath!, 'README.md'))).toBe(true);
     const first = cc.calls.find((c) => c.projectPath === w.worktreePath)!;
     expect(first.sessionId ?? null).toBeNull();
@@ -218,7 +219,7 @@ describe('workers', () => {
 
   it('enforces the worker limit', async () => {
     await startApprovedRun();
-    for (let i = 0; i < MAX_WORKERS; i++) await spawn('planner');
+    for (let i = 0; i < MAX_WORKERS; i++) await spawn('coder'); // unmerged writers keep their slot
     const r = await call('spawn_agent', { role: 'planner', task: 't' });
     expect(r.ok).toBe(false);
     expect(r.text).toMatch(/Worker limit/);
@@ -434,5 +435,229 @@ describe('inline gates (elicitation path)', () => {
     const r = await call('gate_decide', { gate: g.id, approve: true }, workerCaller(w.providerSessionId!));
     expect(r.ok).toBe(false);
     expect(r.text).toMatch(/Only the lead/);
+  });
+});
+
+describe('worker capacity and end_agent', () => {
+  it('finished read-only workers free their slot', async () => {
+    await startApprovedRun();
+    for (let i = 0; i < MAX_WORKERS; i++) {
+      const w = await spawn('planner');
+      await call('report_result', { summary: `plan ${i}` }, workerCaller(w.providerSessionId!));
+    }
+    const r = await call('spawn_agent', { role: 'planner', task: 'one more' });
+    expect(r.ok, r.text).toBe(true);
+  });
+
+  it('end_agent frees the slot of an unmerged writer, keeps its worktree unless asked, and rejects its merge gate', async () => {
+    await startApprovedRun();
+    const ws = [];
+    for (let i = 0; i < MAX_WORKERS; i++) ws.push(await spawn('coder'));
+    expect((await call('spawn_agent', { role: 'coder', task: 't' })).ok).toBe(false);
+
+    await call('request_merge', { worker: ws[0].id });
+    const ended = await call('end_agent', { worker: ws[0].id });
+    expect(ended.ok, ended.text).toBe(true);
+    expect(store.agent(ws[0].id)!.status).toBe('ended');
+    expect(fs.existsSync(ws[0].worktreePath!)).toBe(true);
+    expect(store.gates(ws[0].runId).find((g) => g.kind === 'merge')!.status).toBe('rejected');
+    expect((await call('spawn_agent', { role: 'coder', task: 't' })).ok).toBe(true);
+
+    expect((await call('end_agent', { worker: ws[1].id, remove_worktree: true })).ok).toBe(true);
+    expect(fs.existsSync(ws[1].worktreePath!)).toBe(false);
+    expect(sh(repo, 'branch', '--list', ws[1].branch!)).toContain(ws[1].branch!);
+    expect((await call('end_agent', { worker: ws[1].id })).text).toMatch(/already ended/);
+    expect((await call('end_agent', { worker: ws[2].id }, workerCaller(ws[2].providerSessionId!))).text).toMatch(/Only the lead/);
+  });
+
+  it('the user can end a worker from the tab; the lead is told', async () => {
+    await startApprovedRun();
+    const w = await spawn('reviewer');
+    await broker.endAgent(w.id, false, null);
+    await broker.settle();
+    expect(store.agent(w.id)!.status).toBe('ended');
+    expect(cc.calls.at(-1)!.message).toMatch(new RegExp(`user ended ${w.id}`));
+  });
+});
+
+describe('run-scoped ids', () => {
+  it('ids, branches and worktrees do not collide across runs of the same repo', async () => {
+    const run1 = await startApprovedRun();
+    const a = await spawn('coder');
+    await broker.endRun(run1.id, false);
+    // A new lead session in the same project starts a second run.
+    cc.sessions.set('lead2-prov', { appSessionId: 'lead2-app', providerSessionId: 'lead2-prov', provider: 'claude', projectPath: repo });
+    const LEAD2: Caller = { provider: 'claude', providerSessionId: 'lead2-prov', cwd: null };
+    await call('submit_plan', { plan: 'p2' }, LEAD2);
+    const run2 = store.runs().find((r) => r.id !== run1.id)!;
+    await broker.decideGate(store.gates(run2.id)[0].id, true, null);
+    await broker.settle();
+    const r = await call('spawn_agent', { role: 'coder', task: 't' }, LEAD2);
+    const b = store.agent(r.text.match(/Spawned (\S+)/)![1])!;
+    expect(run2.id).not.toBe(run1.id);
+    expect(b.id).not.toBe(a.id);
+    expect(b.branch).toBe(`coagent/${run2.id}/${b.id}`);
+    expect(b.branch).not.toBe(a.branch);
+    expect(b.worktreePath).not.toBe(a.worktreePath);
+    expect(fs.existsSync(a.worktreePath!) && fs.existsSync(b.worktreePath!)).toBe(true);
+  });
+
+  it('a failed spawn leaves no agent, message, event, worktree or branch behind', async () => {
+    const run = await startApprovedRun();
+    const before = { msgs: store.messages(run.id).length, events: store.events(run.id).length };
+    const orig = store.createAgent.bind(store);
+    store.createAgent = () => { throw new Error('disk full'); };
+    const r = await call('spawn_agent', { role: 'coder', task: 't' });
+    store.createAgent = orig;
+    expect(r.ok).toBe(false);
+    expect(store.agents(run.id).map((x) => x.role)).toEqual(['lead']);
+    expect(store.messages(run.id)).toHaveLength(before.msgs);
+    expect(store.events(run.id)).toHaveLength(before.events);
+    expect(fs.readdirSync(path.join(tmp, 'proj-worktrees'))).toEqual([]);
+    expect(sh(repo, 'branch', '--list', 'coagent/*')).toBe('');
+    expect(sh(repo, 'worktree', 'list').split('\n')).toHaveLength(1);
+  });
+
+  it('a worktree that cannot be created fails the spawn cleanly', async () => {
+    const run = await startApprovedRun();
+    fs.rmSync(path.join(repo, '.git'), { recursive: true, force: true }); // no longer a repo
+    const r = await call('spawn_agent', { role: 'coder', task: 't' });
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/Could not create a worktree/);
+    expect(store.agents(run.id)).toHaveLength(1);
+  });
+});
+
+describe('crash recovery', () => {
+  const dbFile = () => path.join(tmp, 'db.sqlite');
+  /** Simulates a broker crash: the old process's memory is gone; a fresh Store + Broker open the same DB. */
+  function restart(advanceMs = 0) {
+    store.close();
+    clock += advanceMs;
+    store = new Store(dbFile());
+    cc = Object.assign(new FakeCloudCli(), { sessions: cc.sessions });
+    broker = new Broker({ store, cloudcli: cc, git: Git, prompts: filePrompts(PROMPTS), now: () => clock });
+    return broker;
+  }
+
+  it('a message stuck in dispatching is re-queued after its lease and delivered exactly once', async () => {
+    await call('submit_plan', { plan: 'p' });
+    const run = store.runs()[0];
+    cc.next.push('hold'); // the lead's turn carrying the approval never finishes: the broker dies mid-turn
+    await broker.decideGate(store.gates(run.id)[0].id, true, null);
+    await new Promise((r) => setTimeout(r, 0));
+    const [m] = store.messages(run.id).filter((x) => x.to === run.leadAgentId);
+    expect(m).toMatchObject({ state: 'dispatching', attempts: 1, deliveredAt: null });
+
+    // Restart before the lease runs out: not touched yet (another process might still own it).
+    restart(1_000).recover();
+    await broker.settle();
+    expect(store.messages(run.id).find((x) => x.id === m.id)!.state).toBe('dispatching');
+    expect(cc.calls).toHaveLength(0);
+
+    clock += 2 * 120_000;
+    await broker.tick(); await broker.settle();
+    const after = store.messages(run.id).find((x) => x.id === m.id)!;
+    expect(after).toMatchObject({ state: 'delivered', attempts: 2 });
+    expect(after.deliveredAt).not.toBeNull();
+    expect(cc.calls.filter((c) => /APPROVED your plan/.test(c.message))).toHaveLength(1);
+    await broker.tick(); await broker.settle();
+    expect(cc.calls).toHaveLength(1);
+    expect(store.events(run.id).some((e) => e.type === 'recovered' && (e.data.requeued as number[]).includes(m.id))).toBe(true);
+  });
+
+  it('expired dispatches are re-queued at startup', async () => {
+    await call('submit_plan', { plan: 'p' });
+    const run = store.runs()[0];
+    cc.next.push('hold');
+    await broker.decideGate(store.gates(run.id)[0].id, false, 'no');
+    await new Promise((r) => setTimeout(r, 0));
+    const res = restart(10 * 60_000).recover();
+    expect(res.requeued).toHaveLength(1);
+    await broker.settle();
+    expect(cc.calls.filter((c) => /REJECTED your plan/.test(c.message))).toHaveLength(1);
+    expect(store.undelivered(run.leadAgentId)).toHaveLength(0);
+  });
+
+  it('a worker stuck running becomes interrupted, its task is not re-sent, and the lead is told', async () => {
+    const run = await startApprovedRun();
+    cc.next.push('hold');
+    const r = await broker.handleTool({ tool: 'spawn_agent', args: { role: 'coder', task: 'write x' }, caller: LEAD });
+    const id = r.text.match(/Spawned (\S+)/)![1];
+    await new Promise((x) => setTimeout(x, 0));
+    expect(store.agent(id)!.status).toBe('running');
+
+    const res = restart(10 * 60_000).recover();
+    await broker.settle();
+    expect(res.interrupted).toEqual([id]);
+    expect(store.agent(id)!.status).toBe('interrupted');
+    const toWorker = cc.calls.filter((c) => c.projectPath === store.agent(id)!.cwd);
+    expect(toWorker).toHaveLength(0); // never re-sent automatically
+    const note = cc.calls.find((c) => c.sessionId === 'lead-app')!;
+    expect(note.message).toContain(id);
+    expect(note.message).toMatch(/NOT re-sent/);
+    expect(note.message).toMatch(/end_agent/);
+    expect(store.events(run.id).some((e) => e.type === 'recovered' && e.agentId === id && e.data.status === 'interrupted')).toBe(true);
+
+    // Nothing is pushed while interrupted; the lead's message resumes it in the same session.
+    await broker.tick(); await broker.settle();
+    expect(cc.calls.filter((c) => c.projectPath === store.agent(id)!.cwd)).toHaveLength(0);
+    const sent = await call('send_message', { to: id, body: 'you were interrupted; continue' });
+    expect(sent.ok, sent.text).toBe(true);
+    const resumed = cc.calls.filter((c) => c.projectPath === store.agent(id)!.cwd);
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0].sessionId).toBe(store.agent(id)!.appSessionId);
+    expect(resumed[0].message).toMatch(/continue/);
+    expect(resumed[0].message).not.toMatch(/write x/);
+    expect(store.agent(id)!.status).toBe('idle');
+  });
+
+  it('an interrupted worker can be ended to free its slot', async () => {
+    await startApprovedRun();
+    cc.next.push('hold');
+    const r = await broker.handleTool({ tool: 'spawn_agent', args: { role: 'planner', task: 't' }, caller: LEAD });
+    const id = r.text.match(/Spawned (\S+)/)![1];
+    await new Promise((x) => setTimeout(x, 0));
+    restart(10 * 60_000).recover();
+    await broker.settle();
+    expect((await call('end_agent', { worker: id })).ok).toBe(true);
+    expect(store.agent(id)!.status).toBe('ended');
+  });
+
+  it('a spawned worker whose first turn was never dispatched is simply started after a restart', async () => {
+    const run = await startApprovedRun();
+    // Persisted but not dispatched (crash right after the spawn transaction).
+    store.createAgent({ id: 'coder-aaaaaa', runId: run.id, role: 'planner', provider: 'claude', cwd: repo, status: 'starting', task: 'plan it' });
+    store.addMessage(run.id, run.leadAgentId, 'coder-aaaaaa', 'message', 'plan it');
+    const res = restart().recover();
+    await broker.settle();
+    expect(res.interrupted).toEqual([]);
+    const first = cc.calls.find((c) => c.message.includes('agent id: coder-aaaaaa'))!;
+    expect(first.message).toContain('plan it');
+    expect(store.agent('coder-aaaaaa')!.status).toBe('idle');
+  });
+
+  it('migrates a database that only has delivered_at', () => {
+    store.close();
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+    const file = path.join(tmp, 'old.sqlite');
+    const db = new DatabaseSync(file);
+    db.exec(`CREATE TABLE runs (id TEXT PRIMARY KEY, lead_agent_id TEXT NOT NULL, project_path TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active', plan_status TEXT NOT NULL DEFAULT 'none', created_at TEXT NOT NULL, ended_at TEXT);
+    CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, from_agent TEXT, to_agent TEXT NOT NULL,
+      kind TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, delivered_at TEXT);
+    CREATE INDEX messages_inbox ON messages(to_agent, delivered_at);
+    INSERT INTO runs (id, lead_agent_id, project_path, created_at) VALUES ('r-1', 'lead-1', '/p', 't');
+    INSERT INTO messages (run_id, to_agent, kind, body, created_at, delivered_at) VALUES ('r-1', 'lead-1', 'message', 'old', 't', 't2');
+    INSERT INTO messages (run_id, to_agent, kind, body, created_at) VALUES ('r-1', 'lead-1', 'message', 'pending', 't');`);
+    db.close();
+    for (let i = 0; i < 2; i++) { // idempotent
+      store = new Store(file);
+      const ms = store.messages('r-1');
+      expect(ms.map((m) => [m.body, m.state, m.deliveredAt])).toEqual([['old', 'delivered', 't2'], ['pending', 'queued', null]]);
+      expect(store.undelivered('lead-1').map((m) => m.body)).toEqual(['pending']);
+      store.close();
+    }
+    store = new Store(dbFile());
   });
 });

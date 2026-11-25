@@ -42,7 +42,10 @@
 
 - 状态：插件自有 SQLite（`~/.cloudcli-coagent/coagent.db`）为唯一事实源。原定的 `.coagent/` markdown 导出**未实现**。
 - 派活 / 投递：`POST /api/agent`，鉴权用 API key（存插件 secret）。注意该接口对 worker 强制跳过审批。
-- worktree：写代码角色由 broker 执行 `git worktree add`，路径沿用 CloudCLI 约定 `<repo>-worktrees/coagent-<agent_id>`，作为 `projectPath` 传入（自动注册为项目）。只读角色共享 lead 目录。
+- worktree：写代码角色由 broker 执行 `git worktree add`，路径沿用 CloudCLI 约定 `<repo>-worktrees/coagent-<run_id>-<agent_id>`，分支 `coagent/<run_id>/<agent_id>`（id 为 `<role>-<6 hex>`，跨 run 不碰撞），作为 `projectPath` 传入（自动注册为项目）。只读角色共享 lead 目录。spawn 先建 worktree，再在一个事务里写 agent+spawned 事件+任务消息，失败则回滚并删除 worktree/分支；首轮与普通消息走同一投递路径。
+- 投递状态机：`messages.delivery_state` = `queued → dispatching（attempts+1, lease_until）→ delivered`，409/错误回 `queued`；`delivered_at` 仍表示投递时间。进程内的 turn 每次 tick 续租，租约过期即视为孤儿：回队（若收件人已 `interrupted` 则关闭，不重发）。
+- 启动恢复（`Broker.recover()`，server 启动时调用）：仍标 `starting/running` 的 worker → `interrupted`，给 lead 发 system 消息（续跑用 `send_message`，或 `end_agent`），不自动重发任务；记 `recovered` 事件。
+- 容量：占名额的是正在工作的 worker（starting/running/busy）和有未合并 worktree 的写角色；`end_agent`（lead 工具，或 tab 抽屉「End agent」）释放名额，`remove_worktree: true` 才删 worktree。
 - 消息：收件箱模型。agent 可主动 `read_inbox`；agent 一轮结束（空闲）时 broker 将未读消息作为下一轮输入自动投递；409（运行中）则排队重试。
 - 关卡：
   - 计划：lead `submit_plan` → pending → tab 中批准/驳回+意见 → 结果经收件箱回到 lead。

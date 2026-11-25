@@ -18,18 +18,34 @@ export const Git = {
   },
 
   /**
-   * Creates `<repo>-worktrees/coagent-<agentId>` on a new branch `coagent/<agentId>` from the lead's HEAD.
-   * Same container directory CloudCLI uses for its own worktrees.
+   * Creates `<repo>-worktrees/coagent-<runId>-<agentId>` on a new branch `coagent/<runId>/<agentId>` from the lead's
+   * HEAD (the same container directory CloudCLI uses for its own worktrees). Run-scoped names never collide across
+   * runs. On failure nothing is left behind.
    */
-  async createWorktree(leadCwd: string, agentId: string): Promise<{ worktreePath: string; branch: string }> {
+  async createWorktree(leadCwd: string, runId: string, agentId: string): Promise<{ worktreePath: string; branch: string }> {
     const root = await Git.repoRoot(leadCwd);
     if (!root) throw new Error(`${leadCwd} is not inside a git repository; writing agents need one for worktrees`);
     const container = path.join(path.dirname(root), `${path.basename(root)}-worktrees`);
     fs.mkdirSync(container, { recursive: true });
-    const worktreePath = path.join(container, `coagent-${agentId}`);
-    const branch = `coagent/${agentId}`;
-    await git(root, 'worktree', 'add', '-b', branch, worktreePath, 'HEAD');
+    const worktreePath = path.join(container, `coagent-${runId}-${agentId}`);
+    const branch = `coagent/${runId}/${agentId}`;
+    if (fs.existsSync(worktreePath)) throw new Error(`${worktreePath} already exists`);
+    if (await git(root, 'branch', '--list', branch)) throw new Error(`branch ${branch} already exists`);
+    try {
+      await git(root, 'worktree', 'add', '-b', branch, worktreePath, 'HEAD');
+    } catch (e) {
+      await Git.discardWorktree(root, worktreePath, branch);
+      throw e;
+    }
     return { worktreePath, branch };
+  },
+
+  /** Best-effort removal of a worktree and its branch that never held any work (spawn compensation). */
+  async discardWorktree(repoCwd: string, worktreePath: string, branch: string): Promise<void> {
+    await git(repoCwd, 'worktree', 'remove', '--force', worktreePath).catch(() => undefined);
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    await git(repoCwd, 'worktree', 'prune').catch(() => undefined);
+    await git(repoCwd, 'branch', '-D', branch).catch(() => undefined);
   },
 
   /** Commits anything the agent left uncommitted, so the merge sees all of its work. */
