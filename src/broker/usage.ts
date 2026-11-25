@@ -19,6 +19,9 @@
  *  - So the values are a snapshot, NOT per-turn and NOT cumulative usage: summing them across messages or turns
  *    double-counts the conversation. Only for SDK builds with no per-assistant usage does it fall back once to the
  *    turn's `result.usage` bill (`extractCumulativeTokenBudget` :778, used at :1715); that case is indistinguishable on the wire and treated the same.
+ *    KNOWN LIMITATION: on such builds the last event of a turn is that cumulative bill (every request of the turn,
+ *    subagents included), so the recorded context occupancy can be several times too high. coagent cannot detect
+ *    this; the UI labels context use as approximate.
  *
  * Codex (modules/providers/list/codex/codex-runtime.provider.ts):
  *  - Emitted once per turn, on the SDK's `turn.completed` (:448-453), via `extractCodexTokenBudget` (:58-79).

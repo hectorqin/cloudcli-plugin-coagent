@@ -8,7 +8,7 @@ import { Broker, MAX_WORKERS } from '../src/broker/broker.js';
 import type { CloudCli, SendInput, SendResult, SessionInfo } from '../src/broker/cloudcli.js';
 import { Git } from '../src/broker/git.js';
 import { filePrompts } from '../src/broker/prompts.js';
-import { Store } from '../src/broker/store.js';
+import { MIGRATIONS, pendingMigrations, Store } from '../src/broker/store.js';
 import type { Caller, ToolName } from '../src/shared/protocol.js';
 import { CLAUDE_TURN, CODEX_TURN, claudeBudget, codexBudget } from './fixtures/usage.js';
 
@@ -62,6 +62,7 @@ class FakeCloudCli implements CloudCli {
     onApp?.(app);
     emit();
     if (st === 'accepted-error') return { status: 'error', error: 'died mid-turn' };
+    if (st === 'aborted') return { status: 'aborted', appSessionId: app };
     return { status: 'ok', appSessionId: app };
   }
   async sessionStatus(id: string) {
@@ -1244,5 +1245,86 @@ describe('turn usage', () => {
     const s3 = new Store(file);
     expect(s3.diagnostics().schema.missingColumns).toEqual({});
     s3.close();
+  });
+});
+
+describe('turn usage (review rework)', () => {
+  it('run totals count every open turn at once; per-agent current time is its own turn', () => {
+    let now = Date.UTC(2026, 10, 25, 9, 0, 0);
+    const s2 = new Store(path.join(tmp, 'concurrent.sqlite'), () => new Date(now));
+    s2.createRun('r1', 'lead-1', '/x');
+    for (const id of ['lead-1', 'w1', 'w2']) s2.createAgent({ id, runId: 'r1', role: id === 'lead-1' ? 'lead' : 'coder', provider: 'claude', cwd: '/x', status: 'running' });
+    const tl = s2.startTurn('lead-1', 'r1');
+    now += 2_000;
+    s2.startTurn('w1', 'r1');
+    now += 3_000;
+    s2.startTurn('w2', 'r1');
+    now += 1_000;
+    // Open: lead 6s, w1 4s, w2 1s.
+    expect(s2.run('r1')!.usage).toMatchObject({ turns: 3, totalMs: 11_000 });
+    const byId = new Map(s2.agents('r1').map((a) => [a.id, a.usage]));
+    expect(byId.get('w1')).toMatchObject({ currentTurnMs: 4_000, totalMs: 4_000 });
+    expect(byId.get('w2')).toMatchObject({ currentTurnMs: 1_000, totalMs: 1_000 });
+    // Closing a turn does not make the run total jump: its elapsed time simply becomes its duration.
+    s2.finishTurn(tl, 'ok');
+    expect(s2.run('r1')!.usage.totalMs).toBe(11_000);
+    expect(s2.runSummaries()[0].usage.totalMs).toBe(11_000);
+    s2.close();
+  });
+
+  it('a turn the user aborted is closed as aborted: no retry, no error, the worker goes idle and the lead is told', async () => {
+    const run = await startApprovedRun();
+    cc.next.push('aborted');
+    cc.events.push([claudeBudget(9_000, 8_800, 200)]);
+    const w = await spawn('planner', 'abort me', 'claude');
+    expect(store.turns(w.id)[0]).toMatchObject({ outcome: 'aborted', contextTokens: 9_000 });
+    expect(store.agent(w.id)).toMatchObject({ status: 'idle', lastError: null });
+    expect(store.messages(run.id).find((m) => m.to === w.id)!.state).toBe('delivered');
+    expect(store.events(run.id).filter((e) => e.type === 'turn_end' && e.agentId === w.id).at(-1)!.data).toMatchObject({ ok: false, aborted: true });
+    const note = store.messages(run.id).filter((m) => m.to === run.leadAgentId && m.kind === 'system').at(-1)!;
+    expect(note.body).toMatch(/aborted/);
+    expect(note.body).not.toMatch(/failed/);
+    clock += 10 * 60_000;
+    await broker.tick(); await broker.settle();
+    expect(cc.calls.filter((c) => /abort me/.test(c.message))).toHaveLength(1);
+  });
+
+  it('/state does a constant number of queries however many runs and turns exist', async () => {
+    await startApprovedRun();
+    const db = (store as unknown as { db: { prepare: (sql: string) => unknown } }).db;
+    const count = () => {
+      let n = 0;
+      const orig = db.prepare.bind(db);
+      db.prepare = (sql: string) => { n++; return orig(sql); };
+      broker.state('lead-app', null);
+      db.prepare = orig;
+      return n;
+    };
+    const before = count();
+    for (let i = 0; i < 15; i++) {
+      store.createRun(`r-old${i}`, `lead-old${i}`, repo);
+      for (const k of [0, 1, 2]) {
+        store.createAgent({ id: `w-old${i}-${k}`, runId: `r-old${i}`, role: 'coder', provider: 'claude', cwd: repo, status: 'idle' });
+        store.finishTurn(store.startTurn(`w-old${i}-${k}`, `r-old${i}`), 'ok');
+      }
+    }
+    expect(count()).toBe(before);
+    expect(broker.state('lead-app', null).runs.find((r) => r.id === 'r-old3')).toMatchObject({ agentCount: 3, pendingGates: 0, usage: { turns: 3 } });
+  });
+
+  it('exports the migration list; pendingMigrations sees what an older database lacks', () => {
+    expect(MIGRATIONS.map((m) => m.table)).toContain('turns');
+    const file = path.join(tmp, 'pending.sqlite');
+    new Store(file).close();
+    const raw = new DatabaseSync(file);
+    expect(pendingMigrations(raw)).toEqual([]);
+    raw.exec('DROP TABLE turns');
+    raw.exec('DROP INDEX messages_delivery');
+    expect(pendingMigrations(raw)).toEqual(['index messages_delivery', 'table turns']);
+    raw.close();
+    new Store(file).close();
+    const again = new DatabaseSync(file, { readOnly: true });
+    expect(pendingMigrations(again)).toEqual([]);
+    again.close();
   });
 });

@@ -642,11 +642,7 @@ export class Broker {
       setup: { apiKeyConfigured: cloudcli.apiKeyConfigured(), registration: this.d.setupInfo?.() ?? {} },
       me: me?.id ?? null,
       current: showRun ? this.detail(showRun) : null,
-      runs: store.runs().map((r) => ({
-        ...r,
-        agentCount: store.agents(r.id).length,
-        pendingGates: store.gates(r.id).filter((g) => g.status === 'pending').length,
-      })),
+      runs: store.runSummaries(),
     };
   }
 
@@ -725,7 +721,7 @@ export class Broker {
     const { store } = this.d;
     const mine = new Set([...this.dispatches.values()].flat());
     const orphans = store.expiredDispatches(this.now()).filter((m) => !mine.has(m.id));
-    const leads = new Set(store.runs().map((r) => r.leadAgentId));
+    const leads = store.leadIds();
     const requeued = orphans.filter((m) => leads.has(m.to));
     const closed = orphans.filter((m) => !leads.has(m.to));
     store.markDelivered(closed.map((m) => m.id));
@@ -955,14 +951,17 @@ export class Broker {
     }
     // Once CloudCLI accepted the turn the agent has seen the messages and may have acted on them: never re-send
     // them automatically. Only a 409 or an error before acceptance puts them back in the queue.
-    if (res.status === 'ok' || started) store.completeDispatch(msgIds);
+    // An aborted run was accepted (CloudCLI only aborts a registered run), so it is closed like any accepted turn.
+    const accepted = started || res.status === 'ok' || res.status === 'aborted';
+    if (accepted) store.completeDispatch(msgIds);
     else store.requeue(msgIds);
-    if (started || res.status === 'ok') {
+    if (accepted) {
       openTurn(); // a run that finished without announcing its session still was a turn
       const id = turnId!;
-      store.finishTurn(id, res.status === 'error' ? 'error' : 'ok');
+      store.finishTurn(id, res.status === 'error' ? 'error' : res.status === 'aborted' ? 'aborted' : 'ok');
       this.openTurns.delete(id);
-      store.addEvent(agent.runId, agent.id, 'turn_end', res.status === 'error' ? { ok: false, error: res.error, turn: id } : { ok: true, turn: id });
+      store.addEvent(agent.runId, agent.id, 'turn_end', res.status === 'error' ? { ok: false, error: res.error, turn: id }
+        : res.status === 'aborted' ? { ok: false, aborted: true, turn: id } : { ok: true, turn: id });
     }
     const now = store.agent(agent.id)!;
 
@@ -987,6 +986,21 @@ export class Broker {
       return false;
     }
 
+    if (res.status === 'aborted') {
+      // The user stopped it on purpose: not a failure (no error status, no backoff), and nothing is re-sent.
+      this.backoff.delete(agent.id);
+      if (res.appSessionId && !now.appSessionId) store.updateAgent(agent.id, { appSessionId: res.appSessionId });
+      if (!isLead && now.status === 'running') {
+        store.transaction(() => {
+          store.updateAgent(agent.id, { status: 'idle' });
+          store.addMessage(agent.runId, null, store.run(agent.runId)!.leadAgentId, 'system',
+            `The user aborted ${agent.id}'s turn in CloudCLI before it reported. Its messages were not re-sent. `
+            + `Check its work, then send_message it to continue, or end_agent it.`);
+        });
+      }
+      this.kick();
+      return false;
+    }
     this.backoff.delete(agent.id);
     if (res.appSessionId && !now.appSessionId) store.updateAgent(agent.id, { appSessionId: res.appSessionId });
     const appId = res.appSessionId ?? now.appSessionId;

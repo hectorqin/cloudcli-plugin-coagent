@@ -60,14 +60,18 @@ export function cardUsageText(u: AgentUsageDTO): string {
 // ── tab snippets (HTML, escaped) ──────────────────────────────────────
 const esc = (s: unknown) => String(s ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
+/** Tooltip caveat for context use (see src/broker/usage.ts: a CloudCLI fallback can report a whole turn's bill). */
+export const CTX_CAVEAT = 'ctx = context-window use at the latest request, as CloudCLI reports it. Approximate: on SDK builds '
+  + 'without per-message usage it is the whole turn\'s cumulative bill and can be several times too high. — = unknown.';
+
 /** Lane header line: compact, with the full line (tokens included) as a tooltip. */
 export function laneUsageHtml(u: AgentUsageDTO | undefined): string {
-  return u ? `<div class="sub" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(agentUsageLong(u))}">${esc(agentUsageShort(u))}</div>` : '';
+  return u ? `<div class="sub" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(`${agentUsageLong(u)}\n${CTX_CAVEAT}`)}">${esc(agentUsageShort(u))}</div>` : '';
 }
 
 /** Agent drawer line. */
 export function drawerUsageHtml(u: AgentUsageDTO | undefined): string {
-  return u ? `<div class="sub" data-usage>${esc(agentUsageLong(u))}</div>` : '';
+  return u ? `<div class="sub" data-usage title="${esc(CTX_CAVEAT)}">${esc(agentUsageLong(u))}</div>` : '';
 }
 
 /** Run header totals (inline). */

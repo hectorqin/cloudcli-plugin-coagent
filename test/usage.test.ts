@@ -9,7 +9,7 @@ import {
   agentUsageShort, ctxText, drawerUsageHtml, fmtDuration, fmtTokens, laneUsageHtml, runUsageHtml,
 } from '../src/frontend/usage.js';
 import type { AgentDTO, AgentUsageDTO, RunDetailDTO, StateDTO } from '../src/shared/protocol.js';
-import { CLAUDE_TURN, CODEX_TURN, claudeBudget, codexBudget, sseBody } from './fixtures/usage.js';
+import { assistantText, CLAUDE_TURN, CODEX_TURN, claudeBudget, codexBudget, sseBody } from './fixtures/usage.js';
 
 /** Runs one turn through the real SSE loop of HttpCloudCli.send against a canned /api/agent response. */
 async function streamTurn(events: unknown[]) {
@@ -84,7 +84,10 @@ describe('usage formatting', () => {
 
   it('tab snippets: lane header, drawer and run header, known vs unknown, escaped', () => {
     expect(laneUsageHtml(known)).toContain('3 turns · 4m 10s · ctx 45k/200k');
-    expect(laneUsageHtml(known)).toContain('title="3 turns · 4m 10s · ctx 45k/200k · in 1.2M · out 4.5k"');
+    expect(laneUsageHtml(known)).toContain('title="3 turns · 4m 10s · ctx 45k/200k · in 1.2M · out 4.5k\n');
+    // Context use is approximate (CloudCLI may fall back to a cumulative turn bill): every place says so.
+    expect(laneUsageHtml(known)).toContain('Approximate');
+    expect(drawerUsageHtml(known)).toContain('Approximate');
     expect(drawerUsageHtml(unknown)).toContain('0 turns · — · ctx —/— · in — · out —');
     expect(runUsageHtml({ turns: 5, totalMs: 61_000, inputTokens: null, outputTokens: 900 })).toContain('5 turns · 1m 01s · in — · out 900');
     expect(laneUsageHtml(undefined)).toBe('');
@@ -122,5 +125,26 @@ describe('usage on chat cards', () => {
   it('spawn_agent: the spawned worker line carries its usage', () => {
     const html = cardHtml(ctx('spawn_agent', { role: 'coder', task: 't' }, 'Spawned coder-1 (role coder, provider claude) in /x', 'completed'), state);
     expect(html).toContain('turn 1m 23s · ctx 45k/200k');
+  });
+});
+
+describe('aborted runs (real SSE sequence)', () => {
+  it('a run a tab aborted after acceptance resolves as aborted, not ok or error', async () => {
+    // agent.routes.ts:834/:1165-1167 and createCompleteMessage (shared/utils.ts:535-553).
+    const { res, seen } = await streamTurn([
+      { type: 'status', message: 'Agent started', projectPath: '/x' },
+      { type: 'session-id', sessionId: 'app-claude' },
+      assistantText('claude', 'working'),
+      claudeBudget(12_000, 11_800, 200),
+      { kind: 'complete', provider: 'claude', sessionId: 'app-claude', actualSessionId: 'app-claude', exitCode: 1, success: false, aborted: true },
+      { type: 'status', message: 'Run aborted', aborted: true },
+      { type: 'done' },
+    ]);
+    expect(res).toEqual({ status: 'aborted', appSessionId: 'app-claude' });
+    expect(lastUsage(seen)).toMatchObject({ contextTokens: 12_000 });
+  });
+
+  it('a normal complete is still ok', async () => {
+    expect((await streamTurn(CLAUDE_TURN)).res.status).toBe('ok');
   });
 });

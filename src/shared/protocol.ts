@@ -95,9 +95,10 @@ export interface RunDTO {
 
 /**
  * How a turn ended. Rows exist only for turns CloudCLI accepted: a 409 (busy) or an error before acceptance never
- * started a turn and writes none. `interrupted`: the broker restarted while it was open. null = still running.
+ * started a turn and writes none. `aborted`: the user stopped it in CloudCLI. `interrupted`: the broker restarted while it
+ * was open. null = still running.
  */
-export type TurnOutcome = 'ok' | 'error' | 'interrupted';
+export type TurnOutcome = 'ok' | 'error' | 'aborted' | 'interrupted';
 
 /**
  * Usage of the turns the broker ran for one agent (turns the user drives in the UI are not seen). null = unknown.

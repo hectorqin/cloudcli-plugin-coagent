@@ -3,7 +3,7 @@
  * spawn_agent / wait_for_agents read like native subagent calls: one row per worker with live status and activity.
  */
 import type { AgentDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
-import { cardUsageText } from './usage.js';
+import { CTX_CAVEAT, cardUsageText } from './usage.js';
 
 export interface ToolContext {
   toolName: string;
@@ -91,7 +91,7 @@ function callBadge(ctx: ToolContext): string {
 
 /** Elapsed time of the running turn (or totals) and context use; "—" for anything unknown. */
 function usageSpan(a: AgentDTO): string {
-  return a.usage ? `<span class="m u" title="turn time · context window use">${esc(cardUsageText(a.usage))}</span>` : '';
+  return a.usage ? `<span class="m u" title="${esc(`turn time · context window use\n${CTX_CAVEAT}`)}">${esc(cardUsageText(a.usage))}</span>` : '';
 }
 
 function agentRow(a: AgentDTO, opts: { activity: boolean }): string {
