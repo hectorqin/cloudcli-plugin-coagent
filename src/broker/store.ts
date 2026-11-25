@@ -1,0 +1,271 @@
+import { DatabaseSync } from 'node:sqlite';
+import type {
+  AgentDTO, AgentStatus, EventDTO, EventType, GateDTO, GateKind, GateStatus, MessageDTO, PlanStatus, Provider, RunDTO,
+} from '../shared/protocol.js';
+
+type Row = Record<string, unknown>;
+const s = (v: unknown) => (v === null || v === undefined ? null : String(v));
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS runs (
+  id TEXT PRIMARY KEY,
+  lead_agent_id TEXT NOT NULL,
+  project_path TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  plan_status TEXT NOT NULL DEFAULT 'none',
+  created_at TEXT NOT NULL,
+  ended_at TEXT
+);
+CREATE TABLE IF NOT EXISTS agents (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  role TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  provider_session_id TEXT,
+  app_session_id TEXT,
+  cwd TEXT NOT NULL,
+  branch TEXT,
+  worktree_path TEXT,
+  status TEXT NOT NULL,
+  task TEXT,
+  result TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS agents_provider_session ON agents(provider, provider_session_id);
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  from_agent TEXT,
+  to_agent TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  delivered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS messages_inbox ON messages(to_agent, delivered_at);
+CREATE TABLE IF NOT EXISTS gates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  kind TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  subject_agent TEXT,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  comment TEXT,
+  created_at TEXT NOT NULL,
+  decided_at TEXT
+);
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  agent_id TEXT,
+  type TEXT NOT NULL,
+  data TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS events_run ON events(run_id, id);
+CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+`;
+
+export interface NewAgent {
+  id: string;
+  runId: string;
+  role: string;
+  provider: Provider;
+  providerSessionId?: string | null;
+  appSessionId?: string | null;
+  cwd: string;
+  branch?: string | null;
+  worktreePath?: string | null;
+  status: AgentStatus;
+  task?: string | null;
+}
+
+/** Single source of truth for coagent state. Synchronous (node:sqlite), safe because the broker is one process. */
+export class Store {
+  private db: DatabaseSync;
+  /** In-flight dispatches are process-local and intentionally not persisted. */
+  readonly busy = new Set<string>();
+  /** Recent activity per agent, captured from the run streams (process-local, like `busy`). */
+  readonly activity = new Map<string, { ts: string; text: string; key?: string }[]>();
+
+  constructor(file: string, private now: () => Date = () => new Date()) {
+    this.db = new DatabaseSync(file);
+    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+    this.db.exec(SCHEMA);
+    const cols = (this.db.prepare('PRAGMA table_info(messages)').all() as Row[]).map((r) => String(r.name));
+    if (!cols.includes('gate_id')) this.db.exec('ALTER TABLE messages ADD COLUMN gate_id INTEGER');
+  }
+
+  close() { this.db.close(); }
+  private ts() { return this.now().toISOString(); }
+
+  transaction<T>(fn: () => T): T {
+    this.db.exec('BEGIN');
+    try { const r = fn(); this.db.exec('COMMIT'); return r; } catch (e) { this.db.exec('ROLLBACK'); throw e; }
+  }
+
+  // ── runs ──────────────────────────────────────────────────────────
+  createRun(id: string, leadAgentId: string, projectPath: string) {
+    this.db.prepare('INSERT INTO runs (id, lead_agent_id, project_path, created_at) VALUES (?,?,?,?)')
+      .run(id, leadAgentId, projectPath, this.ts());
+  }
+  run(id: string): RunDTO | null {
+    const r = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id) as Row | undefined;
+    return r ? toRun(r) : null;
+  }
+  runs(): RunDTO[] {
+    return (this.db.prepare('SELECT * FROM runs ORDER BY created_at DESC').all() as Row[]).map(toRun);
+  }
+  setPlanStatus(runId: string, st: PlanStatus) {
+    this.db.prepare('UPDATE runs SET plan_status = ? WHERE id = ?').run(st, runId);
+  }
+  endRun(runId: string) {
+    this.db.prepare("UPDATE runs SET status = 'ended', ended_at = ? WHERE id = ?").run(this.ts(), runId);
+    this.db.prepare("UPDATE agents SET status = 'ended' WHERE run_id = ? AND status NOT IN ('merged')").run(runId);
+  }
+
+  // ── agents ────────────────────────────────────────────────────────
+  createAgent(a: NewAgent) {
+    this.db.prepare(`INSERT INTO agents (id, run_id, role, provider, provider_session_id, app_session_id, cwd, branch,
+      worktree_path, status, task, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      a.id, a.runId, a.role, a.provider, a.providerSessionId ?? null, a.appSessionId ?? null, a.cwd,
+      a.branch ?? null, a.worktreePath ?? null, a.status, a.task ?? null, this.ts());
+  }
+  agent(id: string): AgentDTO | null {
+    const r = this.db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as Row | undefined;
+    return r ? this.toAgent(r) : null;
+  }
+  agentByProviderSession(provider: Provider, providerSessionId: string): AgentDTO | null {
+    const r = this.db.prepare(`SELECT a.* FROM agents a JOIN runs r ON r.id = a.run_id
+      WHERE a.provider = ? AND a.provider_session_id = ? AND r.status = 'active'`).get(provider, providerSessionId) as Row | undefined;
+    return r ? this.toAgent(r) : null;
+  }
+  agentByAppSession(appSessionId: string): AgentDTO | null {
+    const r = this.db.prepare(`SELECT a.* FROM agents a JOIN runs r ON r.id = a.run_id
+      WHERE a.app_session_id = ? ORDER BY r.status = 'active' DESC, r.created_at DESC LIMIT 1`).get(appSessionId) as Row | undefined;
+    return r ? this.toAgent(r) : null;
+  }
+  agents(runId: string): AgentDTO[] {
+    return (this.db.prepare('SELECT * FROM agents WHERE run_id = ? ORDER BY created_at').all(runId) as Row[])
+      .map((r) => this.toAgent(r));
+  }
+  updateAgent(id: string, patch: Partial<Pick<AgentDTO,
+    'providerSessionId' | 'appSessionId' | 'status' | 'result' | 'lastError' | 'worktreePath'>>) {
+    const cols: Record<string, string> = {
+      providerSessionId: 'provider_session_id', appSessionId: 'app_session_id', status: 'status',
+      result: 'result', lastError: 'last_error', worktreePath: 'worktree_path',
+    };
+    const entries = Object.entries(patch).filter(([k]) => k in cols);
+    if (!entries.length) return;
+    this.db.prepare(`UPDATE agents SET ${entries.map(([k]) => `${cols[k]} = ?`).join(', ')} WHERE id = ?`)
+      .run(...entries.map(([, v]) => (v ?? null) as string | null), id);
+  }
+
+  // ── messages ──────────────────────────────────────────────────────
+  addMessage(runId: string, from: string | null, to: string, kind: MessageDTO['kind'], body: string, gateId: number | null = null): number {
+    const r = this.db.prepare('INSERT INTO messages (run_id, from_agent, to_agent, kind, body, created_at, gate_id) VALUES (?,?,?,?,?,?,?)')
+      .run(runId, from, to, kind, body, this.ts(), gateId);
+    return Number(r.lastInsertRowid);
+  }
+  lastGateMessage(gateId: number): MessageDTO | null {
+    const r = this.db.prepare('SELECT * FROM messages WHERE gate_id = ? ORDER BY id DESC LIMIT 1').get(gateId) as Row | undefined;
+    return r ? toMessage(r) : null;
+  }
+  /** The undelivered decision message of a gate, if the gate has been decided. */
+  undeliveredGateMessage(gateId: number): MessageDTO | null {
+    const r = this.db.prepare('SELECT * FROM messages WHERE gate_id = ? AND delivered_at IS NULL ORDER BY id LIMIT 1').get(gateId) as Row | undefined;
+    return r ? toMessage(r) : null;
+  }
+  undelivered(agentId: string): MessageDTO[] {
+    return (this.db.prepare('SELECT * FROM messages WHERE to_agent = ? AND delivered_at IS NULL ORDER BY id').all(agentId) as Row[])
+      .map(toMessage);
+  }
+  agentsWithUndelivered(): string[] {
+    return (this.db.prepare(`SELECT DISTINCT m.to_agent AS id FROM messages m JOIN runs r ON r.id = m.run_id
+      WHERE m.delivered_at IS NULL AND r.status = 'active'`).all() as Row[]).map((r) => String(r.id));
+  }
+  markDelivered(ids: number[], delivered: boolean) {
+    const st = this.db.prepare('UPDATE messages SET delivered_at = ? WHERE id = ?');
+    const ts = delivered ? this.ts() : null;
+    for (const id of ids) st.run(ts, id);
+  }
+  messages(runId: string, limit = 500): MessageDTO[] {
+    return (this.db.prepare('SELECT * FROM (SELECT * FROM messages WHERE run_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id')
+      .all(runId, limit) as Row[]).map(toMessage);
+  }
+
+  // ── gates ─────────────────────────────────────────────────────────
+  addGate(runId: string, kind: GateKind, requestedBy: string, subjectAgent: string | null, payload: string): number {
+    const r = this.db.prepare('INSERT INTO gates (run_id, kind, requested_by, subject_agent, payload, created_at) VALUES (?,?,?,?,?,?)')
+      .run(runId, kind, requestedBy, subjectAgent, payload, this.ts());
+    return Number(r.lastInsertRowid);
+  }
+  gate(id: number): GateDTO | null {
+    const r = this.db.prepare('SELECT * FROM gates WHERE id = ?').get(id) as Row | undefined;
+    return r ? toGate(r) : null;
+  }
+  gates(runId: string): GateDTO[] {
+    return (this.db.prepare('SELECT * FROM gates WHERE run_id = ? ORDER BY id').all(runId) as Row[]).map(toGate);
+  }
+  pendingGate(runId: string, kind: GateKind, subjectAgent: string | null): GateDTO | null {
+    const r = this.db.prepare(`SELECT * FROM gates WHERE run_id = ? AND kind = ? AND status = 'pending'
+      AND subject_agent IS ?`).get(runId, kind, subjectAgent) as Row | undefined;
+    return r ? toGate(r) : null;
+  }
+  decideGate(id: number, status: GateStatus, comment: string | null) {
+    this.db.prepare('UPDATE gates SET status = ?, comment = ?, decided_at = ? WHERE id = ?').run(status, comment, this.ts(), id);
+  }
+
+  // ── events ────────────────────────────────────────────────────────
+  addEvent(runId: string, agentId: string | null, type: EventType, data: Record<string, unknown> = {}) {
+    this.db.prepare('INSERT INTO events (run_id, agent_id, type, data, created_at) VALUES (?,?,?,?,?)')
+      .run(runId, agentId, type, JSON.stringify(data), this.ts());
+  }
+  events(runId: string): EventDTO[] {
+    return (this.db.prepare('SELECT * FROM events WHERE run_id = ? ORDER BY id').all(runId) as Row[]).map((r) => ({
+      id: Number(r.id), runId: String(r.run_id), agentId: s(r.agent_id), type: String(r.type) as EventType,
+      data: JSON.parse(String(r.data)) as Record<string, unknown>, createdAt: String(r.created_at),
+    }));
+  }
+
+  // ── kv (settings) ─────────────────────────────────────────────────
+  getJson<T>(k: string, fallback: T): T {
+    const r = this.db.prepare('SELECT v FROM kv WHERE k = ?').get(k) as Row | undefined;
+    return r ? (JSON.parse(String(r.v)) as T) : fallback;
+  }
+  setJson(k: string, v: unknown) {
+    this.db.prepare('INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(k, JSON.stringify(v));
+  }
+
+  private toAgent(r: Row): AgentDTO {
+    return {
+      id: String(r.id), runId: String(r.run_id), role: String(r.role), provider: String(r.provider) as Provider,
+      providerSessionId: s(r.provider_session_id), appSessionId: s(r.app_session_id), cwd: String(r.cwd),
+      branch: s(r.branch), worktreePath: s(r.worktree_path), status: String(r.status) as AgentStatus,
+      task: s(r.task), result: s(r.result), lastError: s(r.last_error), busy: this.busy.has(String(r.id)),
+      activity: (this.activity.get(String(r.id)) ?? []).map(({ ts, text }) => ({ ts, text })),
+    };
+  }
+}
+
+function toRun(r: Row): RunDTO {
+  return {
+    id: String(r.id), leadAgentId: String(r.lead_agent_id), projectPath: String(r.project_path),
+    status: String(r.status) as RunDTO['status'], planStatus: String(r.plan_status) as PlanStatus, createdAt: String(r.created_at),
+  };
+}
+function toMessage(r: Row): MessageDTO {
+  return {
+    id: Number(r.id), runId: String(r.run_id), from: s(r.from_agent), to: String(r.to_agent),
+    kind: String(r.kind) as MessageDTO['kind'], body: String(r.body), createdAt: String(r.created_at), deliveredAt: s(r.delivered_at),
+  };
+}
+function toGate(r: Row): GateDTO {
+  return {
+    id: Number(r.id), runId: String(r.run_id), kind: String(r.kind) as GateKind, requestedBy: String(r.requested_by),
+    subjectAgent: s(r.subject_agent), payload: String(r.payload), status: String(r.status) as GateStatus,
+    comment: s(r.comment), createdAt: String(r.created_at),
+  };
+}

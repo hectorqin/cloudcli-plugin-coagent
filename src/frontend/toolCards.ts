@@ -1,0 +1,212 @@
+/**
+ * Chat cards for coagent tool calls, drawn by CloudCLI's plugin tool-renderer slot (`renderTool`).
+ * spawn_agent / wait_for_agents read like native subagent calls: one row per worker with live status and activity.
+ */
+import type { AgentDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
+
+export interface ToolContext {
+  toolName: string;
+  toolId: string | null;
+  toolInput: unknown;
+  toolResult: { content: unknown; isError: boolean } | null;
+  status: 'running' | 'completed' | 'error' | 'denied';
+  theme: 'dark' | 'light';
+  project: { name: string; path: string } | null;
+  sessionId: string | null;
+}
+export interface ToolHost {
+  rpc(method: string, path: string, body?: unknown): Promise<unknown>;
+  openSession(sessionId: string): void;
+}
+
+const POLL_MS = 2000;
+const esc = (s: unknown) => String(s ?? '').replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+/** Tool results arrive as a string or as MCP content blocks. */
+export function resultText(result: ToolContext['toolResult']): string {
+  const c = result?.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.map((b) => (b && typeof b === 'object' && 'text' in b ? String((b as { text: unknown }).text) : '')).join('\n');
+  return c == null ? '' : JSON.stringify(c);
+}
+const input = (ctx: ToolContext) => (ctx.toolInput && typeof ctx.toolInput === 'object' ? ctx.toolInput : {}) as Record<string, unknown>;
+const shortName = (toolName: string) => toolName.replace(/^mcp__coagent__/, '');
+
+// One state request per session every POLL_MS, however many cards are on screen.
+const cache = new Map<string, { at: number; p: Promise<StateDTO | null> }>();
+function loadState(host: ToolHost, sessionId: string | null, force = false): Promise<StateDTO | null> {
+  const key = sessionId ?? '';
+  const hit = cache.get(key);
+  if (!force && hit && Date.now() - hit.at < POLL_MS - 200) return hit.p;
+  const p = host.rpc('GET', `state${key ? `?session=${encodeURIComponent(key)}` : ''}`).then((s) => s as StateDTO, () => null);
+  cache.set(key, { at: Date.now(), p });
+  return p;
+}
+
+const CSS = `
+.cat{--fg:#1f2328;--muted:#656d76;--line:#d0d7de;--card:#f6f8fa;--accent:#0969da;--ok:#1a7f37;--bad:#cf222e;--warn:#9a6700;
+  font:13px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--fg);border:1px solid var(--line);border-radius:8px;background:var(--card);margin:4px 0;overflow:hidden}
+.cat.dark{--fg:#e6edf3;--muted:#8d96a0;--line:#30363d;--card:#161b22;--accent:#4493f8;--ok:#3fb950;--bad:#f85149;--warn:#d29922}
+.cat *{box-sizing:border-box}
+.cat-h{display:flex;gap:8px;align-items:center;padding:6px 10px}
+.cat-h .t{font-weight:600}.cat-h .s{color:var(--muted);font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cat-b{display:inline-flex;align-items:center;gap:4px;padding:0 7px;border-radius:999px;border:1px solid var(--line);font-size:11px;line-height:18px;white-space:nowrap}
+.cat-b.run{color:var(--warn);border-color:var(--warn)}.cat-b.ok{color:var(--ok);border-color:var(--ok)}.cat-b.bad{color:var(--bad);border-color:var(--bad)}.cat-b.acc{color:var(--accent);border-color:var(--accent)}
+.cat-dot{width:7px;height:7px;border-radius:50%;background:currentColor;animation:cat-p 1s infinite}
+@keyframes cat-p{50%{opacity:.25}}
+.cat-a{border-top:1px solid var(--line);padding:6px 10px}
+.cat-a .row{display:flex;gap:8px;align-items:center}
+.cat-a b{font-weight:600}.cat-a .m{color:var(--muted);font-size:12px}
+.cat-act{margin:4px 0 0 2px;padding-left:8px;border-left:2px solid var(--line);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+.cat-act div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cat pre{white-space:pre-wrap;word-break:break-word;margin:4px 0 0;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:280px;overflow:auto}
+.cat details>summary{cursor:pointer;color:var(--muted);font-size:12px}
+.cat button{font:inherit;font-size:12px;padding:1px 8px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--fg);cursor:pointer;margin-left:auto}
+.cat-h button{margin-left:0}
+.cat button:hover{border-color:var(--accent);color:var(--accent)}
+`;
+function ensureStyle() {
+  if (document.getElementById('coagent-tool-style')) return;
+  const el = document.createElement('style');
+  el.id = 'coagent-tool-style';
+  el.textContent = CSS;
+  document.head.append(el);
+}
+
+function statusBadge(a: AgentDTO): string {
+  if (a.busy || a.status === 'starting' || a.status === 'running') return '<span class="cat-b run"><span class="cat-dot"></span>working</span>';
+  const tone = a.status === 'error' ? 'bad' : a.status === 'reported' || a.status === 'merged' ? 'ok' : a.status === 'lead' ? 'acc' : '';
+  return `<span class="cat-b ${tone}">${esc(a.status)}</span>`;
+}
+
+function callBadge(ctx: ToolContext): string {
+  if (ctx.status === 'running') return '<span class="cat-b run"><span class="cat-dot"></span>running</span>';
+  if (ctx.status === 'error' || ctx.status === 'denied') return `<span class="cat-b bad">${esc(ctx.status)}</span>`;
+  return '<span class="cat-b ok">done</span>';
+}
+
+function agentRow(a: AgentDTO, opts: { activity: boolean }): string {
+  const acts = opts.activity ? a.activity.slice(-3) : [];
+  return `<div class="cat-a"><div class="row"><b>${esc(a.id)}</b><span class="m">${esc(a.role)} · ${esc(a.provider)}</span>${statusBadge(a)}
+      ${a.appSessionId ? `<button data-open="${esc(a.appSessionId)}">Open ↗</button>` : ''}</div>
+    ${acts.length ? `<div class="cat-act">${acts.map((x) => `<div title="${esc(x.text)}">${esc(x.text)}</div>`).join('')}</div>` : ''}
+    ${a.lastError ? `<div class="m" style="color:var(--bad)">${esc(clip(a.lastError, 200))}</div>` : ''}
+    ${a.result ? `<details><summary>Result</summary><pre>${esc(a.result)}</pre></details>` : ''}</div>`;
+}
+
+/** The workers a call is about, resolved against the run the current session belongs to. */
+export function agentsFor(ctx: ToolContext, run: RunDetailDTO | null): AgentDTO[] {
+  if (!run) return [];
+  const name = shortName(ctx.toolName);
+  const text = resultText(ctx.toolResult);
+  if (name === 'spawn_agent') {
+    const id = text.match(/Spawned (\S+)/)?.[1];
+    return run.agents.filter((a) => a.id === id);
+  }
+  if (name === 'wait_for_agents') {
+    const wanted = Array.isArray(input(ctx).agents) ? (input(ctx).agents as unknown[]).map(String) : null;
+    return run.agents.filter((a) => a.role !== 'lead' && (wanted ? wanted.includes(a.id) : true));
+  }
+  if (name === 'request_merge') return run.agents.filter((a) => a.id === input(ctx).worker);
+  return [];
+}
+
+export function cardHtml(ctx: ToolContext, state: StateDTO | null): string {
+  const name = shortName(ctx.toolName);
+  const run = state?.current ?? null;
+  const args = input(ctx);
+  const text = resultText(ctx.toolResult);
+  const head = (title: string, sub: string, badge = callBadge(ctx)) =>
+    `<div class="cat-h"><span class="t">${esc(title)}</span><span class="s">${esc(sub)}</span>${badge}</div>`;
+  const resultBlock = text && ctx.status !== 'running' ? `<div class="cat-a"><details><summary>Tool result</summary><pre>${esc(text)}</pre></details></div>` : '';
+
+  switch (name) {
+    case 'spawn_agent': {
+      // One compact line: live activity is shown once, by the wait_for_agents card at the bottom of the chat.
+      const a = agentsFor(ctx, run)[0];
+      const who = a ? `${a.id} · ${a.role} · ${a.provider}` : `${String(args.role ?? '')}${args.provider ? ` · ${String(args.provider)}` : ''}`;
+      const open = a?.appSessionId ? `<button data-open="${esc(a.appSessionId)}">Open ↗</button>` : '';
+      return `<div class="cat-h"><span class="t">Spawned</span><span class="s">${esc(who)} — ${esc(clip(String(args.task ?? ''), 90))}</span>`
+        + `${a ? statusBadge(a) : callBadge(ctx)}${open}</div>`
+        + (a?.result ? `<div class="cat-a"><details><summary>Result</summary><pre>${esc(a.result)}</pre></details></div>` : '')
+        + (a ? '' : resultBlock);
+    }
+    case 'wait_for_agents': {
+      const agents = agentsFor(ctx, run);
+      const mode = args.mode === 'any' ? 'first result' : 'all results';
+      const working = agents.filter((a) => a.busy || a.status === 'starting' || a.status === 'running').length;
+      const sub = ctx.status === 'running' ? `waiting for ${mode} · ${working} working` : `waited for ${mode}`;
+      return head('Waiting on agents', sub) + agents.map((a) => agentRow(a, { activity: ctx.status === 'running' })).join('') + resultBlock;
+    }
+    case 'submit_plan':
+    case 'request_merge': {
+      const gateId = Number(text.match(/gate #(\d+)/)?.[1] ?? NaN);
+      const kind = name === 'submit_plan' ? 'plan' : 'merge';
+      const gate = run?.gates.find((g) => g.id === gateId)
+        ?? [...(run?.gates ?? [])].reverse().find((g) => g.kind === kind && (kind === 'plan' || g.subjectAgent === args.worker));
+      const st = gate?.status ?? (ctx.status === 'running' ? 'pending' : 'unknown');
+      const badge = `<span class="cat-b ${st === 'approved' ? 'ok' : st === 'rejected' ? 'bad' : 'run'}">${st === 'pending' ? '<span class="cat-dot"></span>' : ''}${esc(st)}</span>`;
+      const title = kind === 'plan' ? 'Plan approval' : `Merge approval · ${String(args.worker ?? '')}`;
+      const body = String(kind === 'plan' ? args.plan ?? '' : args.note ?? gate?.payload ?? '');
+      const hint = st === 'pending' ? '<div class="cat-a m">Waiting for you: answer the form below, or in the CoAgent tab.</div>' : '';
+      return head(title, gate?.comment ? `comment: ${gate.comment}` : '', badge)
+        + `<div class="cat-a"><details ${st === 'pending' ? 'open' : ''}><summary>${kind === 'plan' ? 'Plan' : 'Note'}</summary><pre>${esc(body)}</pre></details></div>`
+        + hint + resultBlock;
+    }
+    case 'send_message':
+      return head('Message', `→ ${String(args.to ?? '')}: ${clip(String(args.body ?? ''), 120)}`) + resultBlock;
+    case 'report_result':
+      return head('Report to lead', clip(String(args.summary ?? ''), 140)) + resultBlock;
+    default:
+      return head(name.replace(/_/g, ' '), '') + resultBlock;
+  }
+}
+
+export function renderTool(container: HTMLElement, initial: ToolContext, host: ToolHost) {
+  ensureStyle();
+  let ctx = initial;
+  let state: StateDTO | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let alive = true;
+  const root = document.createElement('div');
+  root.className = 'cat';
+  container.append(root);
+
+  const openDetails = () => new Set([...root.querySelectorAll('details')].map((d, i) => (d.open ? i : -1)).filter((i) => i >= 0));
+  function draw() {
+    const keep = openDetails();
+    root.classList.toggle('dark', ctx.theme === 'dark');
+    root.innerHTML = cardHtml(ctx, state);
+    root.querySelectorAll('details').forEach((d, i) => { if (keep.has(i)) d.open = true; });
+  }
+  const live = () => ctx.status === 'running'
+    || agentsFor(ctx, state?.current ?? null).some((a) => a.busy || a.status === 'starting' || a.status === 'running');
+  async function refresh(force = false) {
+    clearTimeout(timer);
+    state = await loadState(host, ctx.sessionId, force);
+    if (!alive) return;
+    draw();
+    if (live()) timer = setTimeout(() => { void refresh(); }, POLL_MS);
+  }
+  root.addEventListener('click', (ev) => {
+    const btn = (ev.target as Element).closest<HTMLElement>('[data-open]');
+    if (btn) host.openSession(btn.dataset.open!);
+  });
+
+  draw();
+  void refresh(true);
+  return {
+    update(next: ToolContext) {
+      const statusChanged = next.status !== ctx.status;
+      ctx = next;
+      draw();
+      if (statusChanged) void refresh(true);
+    },
+    destroy() {
+      alive = false;
+      clearTimeout(timer);
+      root.remove();
+    },
+  };
+}

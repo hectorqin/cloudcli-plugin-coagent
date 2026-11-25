@@ -1,0 +1,454 @@
+From fbc1e9b9ca19e0b031f421fb3fd235361d8abd9e Mon Sep 17 00:00:00 2001
+From: hectorqin <14220132+hectorqin@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:45:23 +0000
+Subject: [PATCH 2/2] feat(plugins): let plugins render the chat rows of their
+ tools
+
+A plugin can now list tool names (or prefixes ending in *) under
+toolRenderers in its manifest and export renderTool(container, context,
+host) from its module. Chat's ToolRenderer hands those rows to the plugin
+with the tool input, result, status, theme, project and session, pushes
+updates as the call streams and completes, and keeps the host rendering
+whenever the plugin cannot draw. This lets an MCP-backed plugin present
+its own tools, e.g. a delegated agent shown like a native subagent.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../plugins/plugin-registry.service.ts        |  10 ++
+ .../plugin-tool-renderers-manifest.test.ts    |  17 +++
+ src/modules/chat/tools/ToolRenderer.tsx       |  36 ++++++
+ .../plugins/context/PluginsContext.tsx        |   6 +
+ src/modules/plugins/index.ts                  |   5 +-
+ .../plugins/tests/toolRenderers.test.tsx      |  50 +++++++++
+ .../tool-renderers/PluginToolRenderer.tsx     | 106 ++++++++++++++++++
+ .../tool-renderers/loadToolRendererModule.ts  |  57 ++++++++++
+ .../tool-renderers/matchToolRenderer.ts       |  12 ++
+ src/shared/types.ts                           |   2 +
+ 10 files changed, 300 insertions(+), 1 deletion(-)
+ create mode 100644 server/modules/plugins/tests/plugin-tool-renderers-manifest.test.ts
+ create mode 100644 src/modules/plugins/tests/toolRenderers.test.tsx
+ create mode 100644 src/modules/plugins/tool-renderers/PluginToolRenderer.tsx
+ create mode 100644 src/modules/plugins/tool-renderers/loadToolRendererModule.ts
+ create mode 100644 src/modules/plugins/tool-renderers/matchToolRenderer.ts
+
+diff --git a/server/modules/plugins/plugin-registry.service.ts b/server/modules/plugins/plugin-registry.service.ts
+index b54c28f6..acad2130 100644
+--- a/server/modules/plugins/plugin-registry.service.ts
++++ b/server/modules/plugins/plugin-registry.service.ts
+@@ -90,6 +90,15 @@ export function validateManifest(manifest) {
+     }
+   }
+ 
++  if (manifest.toolRenderers !== undefined) {
++    // Tool names (e.g. `mcp__myserver__do_thing`) or prefixes ending in `*` that the plugin's
++    // frontend module renders in chat through its `renderTool` export.
++    if (!Array.isArray(manifest.toolRenderers) || manifest.toolRenderers.length > 50
++      || !manifest.toolRenderers.every(p => typeof p === 'string' && /^[A-Za-z0-9_.-]+\*?$/.test(p))) {
++      return { valid: false, error: 'toolRenderers must be an array of tool names or prefixes ending in "*"' };
++    }
++  }
++
+   if (manifest.permissions !== undefined) {
+     if (!Array.isArray(manifest.permissions) || !manifest.permissions.every(p => typeof p === 'string')) {
+       return { valid: false, error: 'Permissions must be an array of strings' };
+@@ -216,6 +225,7 @@ export function scanPlugins() {
+         entry: manifest.entry,
+         server: manifest.server || null,
+         permissions: manifest.permissions || [],
++        toolRenderers: manifest.toolRenderers || [],
+         enabled: config[manifest.name]?.enabled !== false, // enabled by default
+         dirName: entry.name,
+         repoUrl,
+diff --git a/server/modules/plugins/tests/plugin-tool-renderers-manifest.test.ts b/server/modules/plugins/tests/plugin-tool-renderers-manifest.test.ts
+new file mode 100644
+index 00000000..71081e8a
+--- /dev/null
++++ b/server/modules/plugins/tests/plugin-tool-renderers-manifest.test.ts
+@@ -0,0 +1,17 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++
++import { validateManifest } from '@/modules/plugins/plugin-registry.service.js';
++
++const base = { name: 'demo', displayName: 'Demo', entry: 'dist/index.js' };
++
++test('toolRenderers accepts exact tool names and trailing-star prefixes', () => {
++  assert.deepEqual(validateManifest({ ...base, toolRenderers: ['mcp__demo__run', 'mcp__demo__*'] }), { valid: true });
++  assert.deepEqual(validateManifest(base), { valid: true });
++});
++
++test('toolRenderers rejects anything else', () => {
++  for (const toolRenderers of ['mcp__demo__*', [42], ['*'], ['mcp__*__x'], ['a b'], new Array(51).fill('x')]) {
++    assert.equal(validateManifest({ ...base, toolRenderers }).valid, false, JSON.stringify(toolRenderers).slice(0, 40));
++  }
++});
+diff --git a/src/modules/chat/tools/ToolRenderer.tsx b/src/modules/chat/tools/ToolRenderer.tsx
+index cbcdb484..10ebe360 100644
+--- a/src/modules/chat/tools/ToolRenderer.tsx
++++ b/src/modules/chat/tools/ToolRenderer.tsx
+@@ -17,6 +17,7 @@ import { PlanDisplay } from '@/modules/chat/tools/PlanDisplay';
+ import { ToolStatusBadge } from '@/modules/chat/tools/ToolStatusBadge';
+ import { DiffStatsBadge } from '@/modules/chat/tools/DiffStatsBadge';
+ import { parseToolPayload, summarizeDiff } from '@/modules/chat/utils/messageTransforms';
++import { PluginToolRenderer, findToolRendererPlugin, useOptionalPlugins } from '@/modules/plugins';
+ 
+ type ToolRendererProps = {
+   toolName: string;
+@@ -31,6 +32,8 @@ type ToolRendererProps = {
+   rawToolInput?: string;
+   /** Lifecycle the provider reported, when it reports one. Overrides the result-based inference. */
+   toolStatus?: string;
++  /** Set on the host rendering a plugin falls back to, so it does not recurse into the plugin again. */
++  disablePluginRenderer?: boolean;
+ };
+ 
+ function getToolCategory(toolName: string): string {
+@@ -88,6 +91,7 @@ export const ToolRenderer: React.FC<ToolRendererProps> = memo(({
+   showRawParameters = false,
+   rawToolInput,
+   toolStatus: reportedStatus,
++  disablePluginRenderer = false,
+ }) => {
+   const config = getToolConfig(toolName);
+   const displayConfig: any = mode === 'input' ? config.input : config.result;
+@@ -106,6 +110,12 @@ export const ToolRenderer: React.FC<ToolRendererProps> = memo(({
+     [mode, toolResult, reportedStatus],
+   );
+ 
++  const plugins = useOptionalPlugins();
++  const rendererPlugin = useMemo(
++    () => (disablePluginRenderer ? null : findToolRendererPlugin(plugins, toolName)),
++    [disablePluginRenderer, plugins, toolName],
++  );
++
+   const handleAction = useCallback(() => {
+     if (displayConfig?.action === 'open-file' && onFileOpen) {
+       const value = displayConfig.getValue?.(parsedData) || '';
+@@ -113,6 +123,32 @@ export const ToolRenderer: React.FC<ToolRendererProps> = memo(({
+     }
+   }, [displayConfig, parsedData, onFileOpen]);
+ 
++  // A plugin that claims this tool draws one row covering both the call and its result.
++  if (rendererPlugin) {
++    if (mode === 'result') return null;
++    const hostProps = {
++      toolName, toolInput, toolResult, toolId, onFileOpen, createDiff, selectedProject, showRawParameters, rawToolInput,
++      toolStatus: reportedStatus, disablePluginRenderer: true,
++    };
++    return (
++      <PluginToolRenderer
++        plugin={rendererPlugin}
++        toolName={toolName}
++        toolId={toolId}
++        toolInput={parseToolPayload(toolInput)}
++        toolResult={toolResult}
++        status={toolStatus ?? 'running'}
++        selectedProject={selectedProject}
++        fallback={(
++          <>
++            <ToolRenderer {...hostProps} mode="input" />
++            {toolResult && !toolResult.isError && <ToolRenderer {...hostProps} mode="result" />}
++          </>
++        )}
++      />
++    );
++  }
++
+   if (!displayConfig) return null;
+ 
+   // Bash renders as a Codex-style command row: the command on a single line with
+diff --git a/src/modules/plugins/context/PluginsContext.tsx b/src/modules/plugins/context/PluginsContext.tsx
+index dc131b08..7b9db23b 100644
+--- a/src/modules/plugins/context/PluginsContext.tsx
++++ b/src/modules/plugins/context/PluginsContext.tsx
+@@ -26,6 +26,12 @@ export function usePlugins() {
+   return context;
+ }
+ 
++/** Like usePlugins, for components that also render outside the provider (exports, tests): no plugins there. */
++export function useOptionalPlugins(): Plugin[] {
++  return useContext(PluginsContext)?.plugins ?? NO_PLUGINS;
++}
++const NO_PLUGINS: Plugin[] = [];
++
+ /** Mounted by the app root so the plugins and project-workspace modules can read and mutate installed plugins through usePlugins. */
+ export function PluginsProvider({ children }: { children: ReactNode }) {
+   const [plugins, setPlugins] = useState<Plugin[]>([]);
+diff --git a/src/modules/plugins/index.ts b/src/modules/plugins/index.ts
+index bd9c4ea8..4da1ed31 100644
+--- a/src/modules/plugins/index.ts
++++ b/src/modules/plugins/index.ts
+@@ -1,4 +1,7 @@
+-export { PluginsProvider, usePlugins } from '@/modules/plugins/context/PluginsContext';
++export { PluginsProvider, useOptionalPlugins, usePlugins } from '@/modules/plugins/context/PluginsContext';
+ export { default as PluginIcon } from '@/modules/plugins/PluginIcon';
+ export { default as PluginSettingsTab } from '@/modules/plugins/PluginSettingsTab';
+ export { default as PluginTabContent } from '@/modules/plugins/PluginTabContent';
++// PluginToolRenderer + findToolRendererPlugin: used by chat's ToolRenderer so plugins can draw the rows of the tools they list in `toolRenderers`.
++export { default as PluginToolRenderer } from '@/modules/plugins/tool-renderers/PluginToolRenderer';
++export { findToolRendererPlugin } from '@/modules/plugins/tool-renderers/matchToolRenderer';
+diff --git a/src/modules/plugins/tests/toolRenderers.test.tsx b/src/modules/plugins/tests/toolRenderers.test.tsx
+new file mode 100644
+index 00000000..5fc81a6d
+--- /dev/null
++++ b/src/modules/plugins/tests/toolRenderers.test.tsx
+@@ -0,0 +1,50 @@
++import assert from 'node:assert/strict';
++
++import { render, screen, waitFor } from '@testing-library/react';
++import { MemoryRouter } from 'react-router-dom';
++import { test, vi } from 'vitest';
++
++import type { Plugin } from '@/shared/types';
++import { findToolRendererPlugin, toolPatternMatches } from '@/modules/plugins/tool-renderers/matchToolRenderer';
++
++vi.mock('@/shared/context/ThemeContext', () => ({ useTheme: () => ({ isDarkMode: false }) }));
++vi.mock('@/shared/api', () => ({
++  api: { plugins: { asset: vi.fn(async () => ({ ok: false, status: 404 })), rpc: vi.fn() } },
++}));
++
++const plugin = (over: Partial<Plugin>): Plugin => ({
++  name: 'p', displayName: 'P', version: '1', description: '', author: '', icon: '', type: 'module', slot: 'tab',
++  entry: 'dist/index.js', server: null, permissions: [], enabled: true, serverRunning: false, dirName: 'p', repoUrl: null,
++  ...over,
++});
++
++test('patterns match exact names and trailing-star prefixes only', () => {
++  assert.equal(toolPatternMatches('mcp__coagent__*', 'mcp__coagent__spawn_agent'), true);
++  assert.equal(toolPatternMatches('mcp__coagent__*', 'mcp__other__x'), false);
++  assert.equal(toolPatternMatches('Bash', 'Bash'), true);
++  assert.equal(toolPatternMatches('Bash', 'BashOutput'), false);
++});
++
++test('disabled plugins and plugins without the tool are skipped', () => {
++  const plugins = [
++    plugin({ name: 'off', enabled: false, toolRenderers: ['mcp__x__*'] }),
++    plugin({ name: 'none' }),
++    plugin({ name: 'on', toolRenderers: ['mcp__x__*'] }),
++  ];
++  assert.equal(findToolRendererPlugin(plugins, 'mcp__x__go')?.name, 'on');
++  assert.equal(findToolRendererPlugin(plugins, 'Read'), null);
++});
++
++test('a plugin that fails to load keeps the host rendering', async () => {
++  const { default: PluginToolRenderer } = await import('@/modules/plugins/tool-renderers/PluginToolRenderer');
++  vi.spyOn(console, 'error').mockImplementation(() => undefined);
++  render(
++    <MemoryRouter>
++      <PluginToolRenderer plugin={plugin({ toolRenderers: ['mcp__x__*'] })} toolName="mcp__x__go" toolInput={{}}
++        status="running" fallback={<span>host row</span>} />
++    </MemoryRouter>,
++  );
++  await waitFor(() => screen.getByText('host row'));
++  await new Promise((r) => setTimeout(r, 20));
++  screen.getByText('host row');
++});
+diff --git a/src/modules/plugins/tool-renderers/PluginToolRenderer.tsx b/src/modules/plugins/tool-renderers/PluginToolRenderer.tsx
+new file mode 100644
+index 00000000..0f791cf1
+--- /dev/null
++++ b/src/modules/plugins/tool-renderers/PluginToolRenderer.tsx
+@@ -0,0 +1,106 @@
++import { useEffect, useRef, useState } from 'react';
++import type { ReactNode } from 'react';
++import { useNavigate, useParams } from 'react-router-dom';
++
++import { api } from '@/shared/api';
++import type { Plugin, Project } from '@/shared/types';
++import { useTheme } from '@/shared/context/ThemeContext';
++import {
++  loadToolRendererModule,
++  type PluginToolContext,
++  type PluginToolHandle,
++} from '@/modules/plugins/tool-renderers/loadToolRendererModule';
++
++type PluginToolRendererProps = {
++  plugin: Plugin;
++  toolName: string;
++  toolId?: string;
++  toolInput: unknown;
++  toolResult?: { content?: unknown; isError?: boolean } | null;
++  status: PluginToolContext['status'];
++  selectedProject?: Project | null;
++  /** The host's own rendering, shown until the plugin draws and whenever it cannot. */
++  fallback: ReactNode;
++};
++
++/**
++ * Renders one chat tool row with a plugin's `renderTool`. Rendered by chat's ToolRenderer for tools a plugin
++ * claims through `toolRenderers` in its manifest. Any failure keeps the host's own rendering.
++ */
++export default function PluginToolRenderer({
++  plugin, toolName, toolId, toolInput, toolResult, status, selectedProject, fallback,
++}: PluginToolRendererProps) {
++  const containerRef = useRef<HTMLDivElement>(null);
++  const handleRef = useRef<PluginToolHandle | null>(null);
++  const [state, setState] = useState<'loading' | 'ready' | 'failed'>('loading');
++  const { isDarkMode } = useTheme();
++  const navigate = useNavigate();
++  const { sessionId = null } = useParams();
++
++  const context: PluginToolContext = {
++    toolName,
++    toolId: toolId ?? null,
++    toolInput,
++    toolResult: toolResult ? { content: toolResult.content ?? null, isError: Boolean(toolResult.isError) } : null,
++    status,
++    theme: isDarkMode ? 'dark' : 'light',
++    project: selectedProject
++      ? { name: selectedProject.projectId, path: selectedProject.fullPath || selectedProject.path || '' }
++      : null,
++    sessionId,
++  };
++  const contextRef = useRef(context);
++  contextRef.current = context;
++  const navigateRef = useRef(navigate);
++  navigateRef.current = navigate;
++
++  useEffect(() => {
++    const container = containerRef.current;
++    if (!container) return undefined;
++    let active = true;
++    (async () => {
++      try {
++        const mod = await loadToolRendererModule(plugin.name, plugin.entry);
++        if (!active) return;
++        if (typeof mod.renderTool !== 'function') throw new Error('plugin module has no renderTool export');
++        const handle = await mod.renderTool(container, contextRef.current, {
++          async rpc(method, path, body) {
++            const res = await api.plugins.rpc(plugin.name, method, path, body);
++            if (!res.ok) throw new Error(`RPC error ${res.status}`);
++            return res.json();
++          },
++          openSession: (id) => navigateRef.current(`/session/${encodeURIComponent(id)}`),
++        });
++        if (!active) {
++          handle?.destroy?.();
++          return;
++        }
++        handleRef.current = handle ?? null;
++        setState('ready');
++      } catch (error) {
++        console.error(`[Plugin:${plugin.name}] renderTool failed for ${toolName}:`, error);
++        if (active) setState('failed');
++      }
++    })();
++    return () => {
++      active = false;
++      try { handleRef.current?.destroy?.(); } catch { /* plugin error — ignore */ }
++      handleRef.current = null;
++      container.replaceChildren();
++    };
++  }, [plugin.name, plugin.entry, toolName]);
++
++  // Push every prop change (streamed input, the result arriving, theme) to the mounted renderer.
++  const contextKey = JSON.stringify([toolInput, toolResult?.content, toolResult?.isError, status, isDarkMode, sessionId]);
++  useEffect(() => {
++    if (state !== 'ready') return;
++    try { handleRef.current?.update?.(contextRef.current); } catch { /* plugin error — ignore */ }
++  }, [contextKey, state]);
++
++  return (
++    <>
++      {state !== 'ready' && fallback}
++      <div ref={containerRef} hidden={state !== 'ready'} data-plugin-tool={plugin.name} />
++    </>
++  );
++}
+diff --git a/src/modules/plugins/tool-renderers/loadToolRendererModule.ts b/src/modules/plugins/tool-renderers/loadToolRendererModule.ts
+new file mode 100644
+index 00000000..0ad30e69
+--- /dev/null
++++ b/src/modules/plugins/tool-renderers/loadToolRendererModule.ts
+@@ -0,0 +1,57 @@
++import { api } from '@/shared/api';
++
++/** What a plugin module exports to render chat rows for the tools its manifest lists in `toolRenderers`. */
++export type PluginToolRendererModule = {
++  renderTool?: (
++    container: HTMLElement,
++    context: PluginToolContext,
++    host: PluginToolHostApi,
++  ) => PluginToolHandle | void | Promise<PluginToolHandle | void>;
++};
++
++export type PluginToolContext = {
++  toolName: string;
++  toolId: string | null;
++  toolInput: unknown;
++  toolResult: { content: unknown; isError: boolean } | null;
++  status: 'running' | 'completed' | 'error' | 'denied';
++  theme: 'dark' | 'light';
++  project: { name: string; path: string } | null;
++  /** App session id of the conversation this row belongs to. */
++  sessionId: string | null;
++};
++
++export type PluginToolHostApi = {
++  rpc(method: string, path: string, body?: unknown): Promise<unknown>;
++  /** Opens another session in the app, e.g. a session the tool started. */
++  openSession(sessionId: string): void;
++};
++
++export type PluginToolHandle = {
++  update?: (context: PluginToolContext) => void;
++  destroy?: () => void;
++};
++
++// One module instance per plugin for every tool row it renders, loaded the way the tab slot loads it:
++// fetched with auth headers, then imported from a Blob URL.
++const modules = new Map<string, Promise<PluginToolRendererModule>>();
++
++export function loadToolRendererModule(pluginName: string, entry: string): Promise<PluginToolRendererModule> {
++  const key = `${pluginName}:${entry}`;
++  let pending = modules.get(key);
++  if (!pending) {
++    pending = (async () => {
++      const res = await api.plugins.asset(pluginName, entry);
++      if (!res.ok) throw new Error(`Failed to fetch plugin (HTTP ${res.status})`);
++      const blobUrl = URL.createObjectURL(new Blob([await res.text()], { type: 'application/javascript' }));
++      try {
++        return (await import(/* @vite-ignore */ blobUrl)) as PluginToolRendererModule;
++      } finally {
++        URL.revokeObjectURL(blobUrl);
++      }
++    })();
++    pending.catch(() => modules.delete(key)); // let a later row retry after a failure
++    modules.set(key, pending);
++  }
++  return pending;
++}
+diff --git a/src/modules/plugins/tool-renderers/matchToolRenderer.ts b/src/modules/plugins/tool-renderers/matchToolRenderer.ts
+new file mode 100644
+index 00000000..40897a8a
+--- /dev/null
++++ b/src/modules/plugins/tool-renderers/matchToolRenderer.ts
+@@ -0,0 +1,12 @@
++import type { Plugin } from '@/shared/types';
++
++/** True when a manifest pattern (an exact tool name, or a prefix ending in `*`) covers `toolName`. */
++export function toolPatternMatches(pattern: string, toolName: string): boolean {
++  return pattern.endsWith('*') ? toolName.startsWith(pattern.slice(0, -1)) : pattern === toolName;
++}
++
++/** The first enabled plugin that renders `toolName`, in the host's plugin order. */
++export function findToolRendererPlugin(plugins: Plugin[], toolName: string): Plugin | null {
++  return plugins.find((plugin) => plugin.enabled
++    && (plugin.toolRenderers ?? []).some((pattern) => toolPatternMatches(pattern, toolName))) ?? null;
++}
+diff --git a/src/shared/types.ts b/src/shared/types.ts
+index 997ecfba..86ecb142 100644
+--- a/src/shared/types.ts
++++ b/src/shared/types.ts
+@@ -1337,6 +1337,8 @@ export type Plugin = {
+   entry: string;
+   server: string | null;
+   permissions: string[];
++  /** Tool names, or prefixes ending in `*`, whose chat rows this plugin renders via its module's `renderTool`. */
++  toolRenderers?: string[];
+   enabled: boolean;
+   serverRunning: boolean;
+   dirName: string;
+-- 
+2.53.0
+

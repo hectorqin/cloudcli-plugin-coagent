@@ -1,0 +1,550 @@
+From cc76a24cae823f8099a03d23eba2a22d79bcb0e6 Mon Sep 17 00:00:00 2001
+From: hectorqin <14220132+hectorqin@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:00:04 +0000
+Subject: [PATCH 1/2] feat(sidebar): nest git worktree projects under their
+ repository
+
+Worktree directories (CloudCLI's own <repo>-worktrees/<name> and any linked
+worktree) are registered as separate projects, so every agent or feature
+worktree adds a top-level sidebar row. Projects now carry worktreeOf (the
+main repository path, resolved from the worktree's .git file, or from the
+<repo>-worktrees layout once the directory is removed), and the sidebar
+renders those projects indented under their repository. No session moves
+between projects, so nothing is hidden or lost.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ server/modules/projects/index.ts              |   2 +
+ .../project-worktree-parent.service.ts        |  44 +++++
+ .../projects-with-sessions-fetch.service.ts   |   6 +
+ .../project-worktree-parent.service.test.ts   |  55 ++++++
+ .../session-upsert-broadcast.service.ts       |   6 +-
+ server/shared/types.ts                        |   2 +
+ .../hooks/useProjectsState.ts                 |   2 +
+ src/modules/sidebar/SidebarProjectList.tsx    | 162 ++++++++++--------
+ .../tests/projectWorktreeGroups.test.ts       |  34 ++++
+ .../sidebar/utils/projectWorktreeGroups.ts    |  45 +++++
+ src/shared/types.ts                           |   2 +
+ 11 files changed, 289 insertions(+), 71 deletions(-)
+ create mode 100644 server/modules/projects/services/project-worktree-parent.service.ts
+ create mode 100644 server/modules/projects/tests/project-worktree-parent.service.test.ts
+ create mode 100644 src/modules/sidebar/tests/projectWorktreeGroups.test.ts
+ create mode 100644 src/modules/sidebar/utils/projectWorktreeGroups.ts
+
+diff --git a/server/modules/projects/index.ts b/server/modules/projects/index.ts
+index 33e0c55c..cc55796b 100644
+--- a/server/modules/projects/index.ts
++++ b/server/modules/projects/index.ts
+@@ -9,3 +9,5 @@ export { createProject } from './services/project-management.service.js';
+ export { deleteOrArchiveProject, deleteSessionJsonlFilesForProjectPath } from './services/project-delete.service.js';
+ // restoreArchivedProject: used by the worktrees module to re-activate an archived project when its worktree is reopened.
+ export { restoreArchivedProject } from './services/project-delete.service.js';
++// resolveWorktreeParent: used by the session upsert broadcast so a worktree project announced live nests under its repository.
++export { resolveWorktreeParent } from './services/project-worktree-parent.service.js';
+diff --git a/server/modules/projects/services/project-worktree-parent.service.ts b/server/modules/projects/services/project-worktree-parent.service.ts
+new file mode 100644
+index 00000000..24139faa
+--- /dev/null
++++ b/server/modules/projects/services/project-worktree-parent.service.ts
+@@ -0,0 +1,44 @@
++import fs from 'node:fs';
++import path from 'node:path';
++
++const LINKED_WORKTREE_GITDIR = /^(.*)[\\/]\.git[\\/]worktrees[\\/][^\\/]+[\\/]?$/;
++const CLOUDCLI_WORKTREE_LAYOUT = /^(.*)[\\/]([^\\/]+)-worktrees[\\/][^\\/]+[\\/]?$/;
++
++/**
++ * Returns the main repository a project directory belongs to when that directory is a
++ * linked git worktree, so the sidebar can nest worktree projects under their repository.
++ *
++ * A live worktree is recognised by its `.git` file (`gitdir: <repo>/.git/worktrees/<name>`).
++ * Once a worktree is removed its sessions keep the old path, so a missing directory falls
++ * back to the `<repo>-worktrees/<name>` layout CloudCLI itself creates worktrees in, but only
++ * when `<repo>` is a known project — a guess about an unknown directory is never returned.
++ */
++export function resolveWorktreeParent(projectPath: string, knownProjectPaths: ReadonlySet<string>): string | null {
++  let stat: fs.Stats | null = null;
++  try {
++    stat = fs.statSync(path.join(projectPath, '.git'));
++  } catch {
++    stat = null;
++  }
++
++  if (stat?.isFile()) {
++    try {
++      const match = fs.readFileSync(path.join(projectPath, '.git'), 'utf8').match(/^gitdir:\s*(.+?)\s*$/m);
++      const gitdir = match ? path.resolve(projectPath, match[1]) : null;
++      const repo = gitdir?.match(LINKED_WORKTREE_GITDIR)?.[1];
++      return repo && path.resolve(repo) !== path.resolve(projectPath) ? repo : null;
++    } catch {
++      return null;
++    }
++  }
++  if (stat || fs.existsSync(projectPath)) {
++    return null;
++  }
++
++  const layout = projectPath.match(CLOUDCLI_WORKTREE_LAYOUT);
++  if (!layout) {
++    return null;
++  }
++  const candidate = path.join(layout[1], layout[2]);
++  return knownProjectPaths.has(candidate) ? candidate : null;
++}
+diff --git a/server/modules/projects/services/projects-with-sessions-fetch.service.ts b/server/modules/projects/services/projects-with-sessions-fetch.service.ts
+index 8cd1b6c4..4afa43b9 100644
+--- a/server/modules/projects/services/projects-with-sessions-fetch.service.ts
++++ b/server/modules/projects/services/projects-with-sessions-fetch.service.ts
+@@ -6,6 +6,7 @@ import { sessionSynchronizerService } from '@/modules/providers/index.js';
+ import { WS_OPEN_STATE, connectedClients } from '@/modules/websocket/index.js';
+ import type { RealtimeClientConnection, SessionForkAncestor } from '@/shared/types.js';
+ import { AppError } from '@/shared/utils.js';
++import { resolveWorktreeParent } from '@/modules/projects/services/project-worktree-parent.service.js';
+ 
+ type SessionSummary = {
+   id: string;
+@@ -32,6 +33,8 @@ export type ProjectListItem = {
+   displayName: string;
+   fullPath: string;
+   isStarred: boolean;
++  /** Main repository path when this project is a linked git worktree; the sidebar nests it there. */
++  worktreeOf: string | null;
+   sessions: SessionSummary[];
+   sessionMeta: {
+     hasMore: boolean;
+@@ -196,6 +199,7 @@ export async function getProjectsWithSessions(
+     isStarred?: number;
+   }>;
+   const totalProjects = projectRows.length;
++  const knownProjectPaths = new Set(projectRows.map((row) => row.project_path));
+   const projects: ProjectListItem[] = [];
+   let processedProjects = 0;
+ 
+@@ -228,6 +232,7 @@ export async function getProjectsWithSessions(
+       displayName,
+       fullPath: projectPath,
+       isStarred: Boolean(row.isStarred),
++      worktreeOf: resolveWorktreeParent(projectPath, knownProjectPaths),
+       sessions: sessionsPage.sessions,
+       sessionMeta: {
+         hasMore: sessionsPage.hasMore,
+@@ -280,6 +285,7 @@ export async function getArchivedProjectsWithSessions(
+       displayName,
+       fullPath: row.project_path,
+       isStarred: Boolean(row.isStarred),
++      worktreeOf: null,
+       isArchived: true,
+       sessions: sessionsPage.sessions,
+       sessionMeta: {
+diff --git a/server/modules/projects/tests/project-worktree-parent.service.test.ts b/server/modules/projects/tests/project-worktree-parent.service.test.ts
+new file mode 100644
+index 00000000..e853a18e
+--- /dev/null
++++ b/server/modules/projects/tests/project-worktree-parent.service.test.ts
+@@ -0,0 +1,55 @@
++import assert from 'node:assert/strict';
++import { execFileSync } from 'node:child_process';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import test from 'node:test';
++
++import { resolveWorktreeParent } from '@/modules/projects/services/project-worktree-parent.service.js';
++
++function makeRepoWithWorktree() {
++  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-parent-')));
++  const repo = path.join(root, 'app');
++  fs.mkdirSync(repo);
++  const git = (cwd: string, ...args: string[]) =>
++    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, stdio: 'pipe' });
++  git(repo, 'init', '-q');
++  git(repo, 'commit', '-q', '--allow-empty', '-m', 'init');
++  const worktree = path.join(root, 'app-worktrees', 'feature');
++  git(repo, 'worktree', 'add', '-q', '-b', 'feature', worktree);
++  return { root, repo, worktree, git };
++}
++
++test('a live linked worktree resolves to its main repository', () => {
++  const { root, repo, worktree } = makeRepoWithWorktree();
++  try {
++    assert.equal(resolveWorktreeParent(worktree, new Set()), repo);
++  } finally {
++    fs.rmSync(root, { recursive: true, force: true });
++  }
++});
++
++test('the main repository itself and plain directories have no parent', () => {
++  const { root, repo } = makeRepoWithWorktree();
++  try {
++    assert.equal(resolveWorktreeParent(repo, new Set()), null);
++    assert.equal(resolveWorktreeParent(root, new Set()), null);
++  } finally {
++    fs.rmSync(root, { recursive: true, force: true });
++  }
++});
++
++test('a removed worktree in the <repo>-worktrees layout resolves only to a known project', () => {
++  const { root, repo, worktree, git } = makeRepoWithWorktree();
++  try {
++    git(repo, 'worktree', 'remove', worktree);
++    assert.equal(resolveWorktreeParent(worktree, new Set([repo])), repo);
++    assert.equal(resolveWorktreeParent(worktree, new Set()), null);
++  } finally {
++    fs.rmSync(root, { recursive: true, force: true });
++  }
++});
++
++test('an unrelated missing directory is never guessed', () => {
++  assert.equal(resolveWorktreeParent('/nowhere/at/all', new Set(['/nowhere/at'])), null);
++});
+diff --git a/server/modules/websocket/services/session-upsert-broadcast.service.ts b/server/modules/websocket/services/session-upsert-broadcast.service.ts
+index c08e30c2..10033af2 100644
+--- a/server/modules/websocket/services/session-upsert-broadcast.service.ts
++++ b/server/modules/websocket/services/session-upsert-broadcast.service.ts
+@@ -1,7 +1,7 @@
+ import path from 'node:path';
+ 
+ import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+-import { generateDisplayName } from '@/modules/projects/index.js';
++import { generateDisplayName, resolveWorktreeParent } from '@/modules/projects/index.js';
+ import { broadcastToConnectedClients } from '@/modules/websocket/services/websocket-state.service.js';
+ import type { SessionUpsertedEvent } from '@/shared/types.js';
+ 
+@@ -59,6 +59,10 @@ async function buildSessionUpsertedEvent(
+         fullPath: project.project_path,
+         displayName,
+         isStarred: Boolean(project.isStarred),
++        worktreeOf: resolveWorktreeParent(
++          project.project_path,
++          new Set(projectsDb.getProjectPaths().map((candidate) => candidate.project_path)),
++        ),
+       }
+       : null,
+     timestamp: new Date().toISOString(),
+diff --git a/server/shared/types.ts b/server/shared/types.ts
+index c08759e0..a118c358 100644
+--- a/server/shared/types.ts
++++ b/server/shared/types.ts
+@@ -389,6 +389,8 @@ export type SessionUpsertedProject = {
+   fullPath: string;
+   displayName: string;
+   isStarred: boolean;
++  /** Main repository path when the project is a linked git worktree. */
++  worktreeOf: string | null;
+ };
+ 
+ /**
+diff --git a/src/modules/project-workspace/hooks/useProjectsState.ts b/src/modules/project-workspace/hooks/useProjectsState.ts
+index c6bbeb76..7bc95758 100644
+--- a/src/modules/project-workspace/hooks/useProjectsState.ts
++++ b/src/modules/project-workspace/hooks/useProjectsState.ts
+@@ -40,6 +40,7 @@ type SessionUpsertedEvent = ServerEvent & {
+     fullPath: string;
+     displayName: string;
+     isStarred: boolean;
++    worktreeOf?: string | null;
+   } | null;
+ };
+ 
+@@ -830,6 +831,7 @@ export function useProjectsState({
+             fullPath: upsert.project.fullPath,
+             displayName: upsert.project.displayName,
+             isStarred: upsert.project.isStarred,
++            worktreeOf: upsert.project.worktreeOf ?? null,
+             sessions: [],
+             sessionMeta: { hasMore: false, total: 0 },
+           } as Project;
+diff --git a/src/modules/sidebar/SidebarProjectList.tsx b/src/modules/sidebar/SidebarProjectList.tsx
+index 52430c7b..75c85600 100644
+--- a/src/modules/sidebar/SidebarProjectList.tsx
++++ b/src/modules/sidebar/SidebarProjectList.tsx
+@@ -1,9 +1,10 @@
+-import { useEffect } from 'react';
++import { useEffect, useMemo } from 'react';
+ 
+-import type { SidebarProjectListProps } from '@/shared/types';
++import type { Project, SidebarProjectListProps } from '@/shared/types';
+ import { getPageTitle } from '@/shared/utils';
+ import SidebarProjectItem from '@/modules/sidebar/SidebarProjectItem';
+ import SidebarProjectsState from '@/modules/sidebar/SidebarProjectsState';
++import { groupWorktreeProjects } from '@/modules/sidebar/utils/projectWorktreeGroups';
+ 
+ 
+ /** Rendered by SidebarContent to list the filtered projects, delegating each row to SidebarProjectItem. */
+@@ -69,80 +70,101 @@ export default function SidebarProjectList({
+   }, [pageTitle]);
+ 
+   const showProjects = !isLoading && projects.length > 0 && filteredProjects.length > 0;
++  const groups = useMemo(() => groupWorktreeProjects(filteredProjects), [filteredProjects]);
++
++  const renderProject = (project: Project) => {
++    // Both renames are resolved here rather than inside the row, so
++    // every other row is handed the same scalars on each keystroke and
++    // its memo boundary holds.
++    const renamingProject =
++      activeRename?.target === 'project' && activeRename.id === project.projectId
++        ? activeRename
++        : null;
++    const renamingSession =
++      activeRename?.target === 'session' && activeRename.projectId === project.projectId
++        ? activeRename
++        : null;
++    // Resolved here for the same reason as the renames: only the
++    // project in selection mode sees a set, every other row keeps
++    // being handed the same `null` and its memo holds.
++    const selectedSessionIds =
++      sessionSelection?.projectId === project.projectId ? sessionSelection.sessionIds : null;
++
++    // React key + per-project state lookups all use the DB `projectId`
++    // so they remain stable across renames and session changes.
++    return (
++      <SidebarProjectItem
++        key={project.projectId}
++        project={project}
++        selectedProject={selectedProject}
++        selectedSession={selectedSession}
++        isExpanded={isProjectExpanded(project.projectId)}
++        isDeleting={deletingProjects.has(project.projectId)}
++        isStarred={isProjectStarred(project.projectId)}
++        isEditing={renamingProject !== null}
++        renameDraft={renamingProject?.draft ?? ''}
++      includeOffPagePins={includeOffPagePins}
++        sessions={getProjectSessions(project)}
++        initialSessionsLoaded={initialSessionsLoaded.has(project.projectId)}
++        isLoadingMoreSessions={loadingMoreProjects.has(project.projectId)}
++        currentTime={currentTime}
++        sessionRenameId={renamingSession?.id ?? null}
++        sessionRenameDraft={renamingSession?.draft ?? ''}
++        tasksEnabled={tasksEnabled}
++        mcpServerStatus={mcpServerStatus}
++        onRenameDraftChange={onRenameDraftChange}
++        onToggleProject={onToggleProject}
++        onProjectSelect={onProjectSelect}
++        onToggleStarProject={onToggleStarProject}
++        onStartEditingProject={onStartEditingProject}
++        onCancelEditingProject={onCancelEditingProject}
++        onSaveProjectName={onSaveProjectName}
++        onDeleteProject={onDeleteProject}
++        onSessionSelect={onSessionSelect}
++        onArchiveSession={onArchiveSession}
++        onDeleteSession={onDeleteSession}
++        onForkSession={onForkSession}
++        onLoadMoreSessions={onLoadMoreSessions}
++        activeSessions={activeSessions}
++        backgroundSessionIds={backgroundSessionIds}
++        attentionSessionIds={attentionSessionIds}
++        onNewSession={onNewSession}
++        onStartEditingSession={onStartEditingSession}
++        onCancelEditingSession={onCancelEditingSession}
++        onSaveEditingSession={onSaveEditingSession}
++        selectedSessionIds={selectedSessionIds}
++        onSetSessionSelection={onSetSessionSelection}
++        onToggleSessionSelected={onToggleSessionSelected}
++        onCancelSessionSelection={onCancelSessionSelection}
++        onDeleteSelectedSessions={onDeleteSelectedSessions}
++        t={t}
++      />
++    );
++  };
+ 
+   return (
+       <div className="pb-safe-area-inset-bottom md:space-y-1">
+         {!showProjects
+           ? state
+-          : filteredProjects.map((project) => {
+-              // Both renames are resolved here rather than inside the row, so
+-              // every other row is handed the same scalars on each keystroke and
+-              // its memo boundary holds.
+-              const renamingProject =
+-                activeRename?.target === 'project' && activeRename.id === project.projectId
+-                  ? activeRename
+-                  : null;
+-              const renamingSession =
+-                activeRename?.target === 'session' && activeRename.projectId === project.projectId
+-                  ? activeRename
+-                  : null;
+-              // Resolved here for the same reason as the renames: only the
+-              // project in selection mode sees a set, every other row keeps
+-              // being handed the same `null` and its memo holds.
+-              const selectedSessionIds =
+-                sessionSelection?.projectId === project.projectId ? sessionSelection.sessionIds : null;
+-
+-              // React key + per-project state lookups all use the DB `projectId`
+-              // so they remain stable across renames and session changes.
++          : groups.map(({ project, worktrees }) => {
++              // Worktree projects (CloudCLI or agent worktrees of this repository) sit under their
++              // repository instead of crowding the top level. They show while the repository is
++              // expanded, or whenever one of them is the selected project so the selection never hides.
++              const showWorktrees = worktrees.length > 0 && (
++                isProjectExpanded(project.projectId)
++                || worktrees.some((worktree) => worktree.projectId === selectedProject?.projectId)
++              );
+               return (
+-              <SidebarProjectItem
+-                key={project.projectId}
+-                project={project}
+-                selectedProject={selectedProject}
+-                selectedSession={selectedSession}
+-                isExpanded={isProjectExpanded(project.projectId)}
+-                isDeleting={deletingProjects.has(project.projectId)}
+-                isStarred={isProjectStarred(project.projectId)}
+-                isEditing={renamingProject !== null}
+-                renameDraft={renamingProject?.draft ?? ''}
+-                includeOffPagePins={includeOffPagePins}
+-                sessions={getProjectSessions(project)}
+-                initialSessionsLoaded={initialSessionsLoaded.has(project.projectId)}
+-                isLoadingMoreSessions={loadingMoreProjects.has(project.projectId)}
+-                currentTime={currentTime}
+-                sessionRenameId={renamingSession?.id ?? null}
+-                sessionRenameDraft={renamingSession?.draft ?? ''}
+-                tasksEnabled={tasksEnabled}
+-                mcpServerStatus={mcpServerStatus}
+-                onRenameDraftChange={onRenameDraftChange}
+-                onToggleProject={onToggleProject}
+-                onProjectSelect={onProjectSelect}
+-                onToggleStarProject={onToggleStarProject}
+-                onStartEditingProject={onStartEditingProject}
+-                onCancelEditingProject={onCancelEditingProject}
+-                onSaveProjectName={onSaveProjectName}
+-                onDeleteProject={onDeleteProject}
+-                onSessionSelect={onSessionSelect}
+-                onArchiveSession={onArchiveSession}
+-                onDeleteSession={onDeleteSession}
+-                onForkSession={onForkSession}
+-                onLoadMoreSessions={onLoadMoreSessions}
+-                activeSessions={activeSessions}
+-                backgroundSessionIds={backgroundSessionIds}
+-                attentionSessionIds={attentionSessionIds}
+-                onNewSession={onNewSession}
+-                onStartEditingSession={onStartEditingSession}
+-                onCancelEditingSession={onCancelEditingSession}
+-                onSaveEditingSession={onSaveEditingSession}
+-                selectedSessionIds={selectedSessionIds}
+-                onSetSessionSelection={onSetSessionSelection}
+-                onToggleSessionSelected={onToggleSessionSelected}
+-                onCancelSessionSelection={onCancelSessionSelection}
+-                onDeleteSelectedSessions={onDeleteSelectedSessions}
+-                t={t}
+-              />
+-            );
+-          })}
++                <div key={project.projectId}>
++                  {renderProject(project)}
++                  {showWorktrees && (
++                    <div className="ml-3 border-l border-border/60 pl-1 md:space-y-1" data-testid="sidebar-worktree-projects">
++                      {worktrees.map(renderProject)}
++                    </div>
++                  )}
++                </div>
++              );
++            })}
+     </div>
+   );
+ }
+diff --git a/src/modules/sidebar/tests/projectWorktreeGroups.test.ts b/src/modules/sidebar/tests/projectWorktreeGroups.test.ts
+new file mode 100644
+index 00000000..7104b502
+--- /dev/null
++++ b/src/modules/sidebar/tests/projectWorktreeGroups.test.ts
+@@ -0,0 +1,34 @@
++import assert from 'node:assert/strict';
++
++import { test } from 'vitest';
++
++import type { Project } from '@/shared/types';
++import { groupWorktreeProjects } from '@/modules/sidebar/utils/projectWorktreeGroups';
++
++const project = (id: string, fullPath: string, worktreeOf: string | null = null): Project => ({
++  projectId: id, displayName: id, fullPath, worktreeOf,
++});
++const shape = (projects: Project[]) =>
++  groupWorktreeProjects(projects).map((g) => [g.project.projectId, g.worktrees.map((w) => w.projectId)]);
++
++test('worktree projects nest under their repository, keeping list order', () => {
++  assert.deepEqual(shape([
++    project('wt-b', '/src/app-worktrees/b', '/src/app'),
++    project('other', '/src/other'),
++    project('app', '/src/app'),
++    project('wt-a', '/src/app-worktrees/a', '/src/app/'),
++  ]), [['other', []], ['app', ['wt-b', 'wt-a']]]);
++});
++
++test('a worktree whose repository is not listed stays top-level', () => {
++  assert.deepEqual(shape([project('wt', '/src/app-worktrees/a', '/src/app'), project('x', '/x')]), [['wt', []], ['x', []]]);
++});
++
++test('nesting is one level deep and never self-referential', () => {
++  assert.deepEqual(shape([
++    project('app', '/app'),
++    project('wt', '/wt', '/app'),
++    project('wt-of-wt', '/wt2', '/wt'),
++    project('self', '/self', '/self'),
++  ]), [['app', ['wt']], ['wt-of-wt', []], ['self', []]]);
++});
+diff --git a/src/modules/sidebar/utils/projectWorktreeGroups.ts b/src/modules/sidebar/utils/projectWorktreeGroups.ts
+new file mode 100644
+index 00000000..044449a0
+--- /dev/null
++++ b/src/modules/sidebar/utils/projectWorktreeGroups.ts
+@@ -0,0 +1,45 @@
++import type { Project } from '@/shared/types';
++
++export type ProjectWorktreeGroup = {
++  project: Project;
++  /** Projects that are linked git worktrees of `project`, in list order. */
++  worktrees: Project[];
++};
++
++const normalize = (value: string) => value.replace(/[\\/]+$/, '');
++
++/**
++ * Nests worktree projects under the project of their main repository, keeping the
++ * incoming order of top-level rows. A worktree whose repository is not in the list
++ * (filtered out by search, archived, or never opened) stays a top-level row.
++ */
++export function groupWorktreeProjects(projects: Project[]): ProjectWorktreeGroup[] {
++  const byPath = new Map<string, Project>();
++  for (const project of projects) {
++    byPath.set(normalize(project.fullPath || project.path || ''), project);
++  }
++
++  const parentOf = new Map<string, Project>();
++  for (const project of projects) {
++    const parentPath = typeof project.worktreeOf === 'string' && project.worktreeOf ? normalize(project.worktreeOf) : null;
++    const parent = parentPath ? byPath.get(parentPath) : undefined;
++    // Only one level: a parent that is itself nested keeps its worktrees flat under its own row.
++    if (parent && parent !== project && !(typeof parent.worktreeOf === 'string' && byPath.has(normalize(parent.worktreeOf)))) {
++      parentOf.set(project.projectId, parent);
++    }
++  }
++
++  const groups = new Map<string, ProjectWorktreeGroup>();
++  const ordered: ProjectWorktreeGroup[] = [];
++  for (const project of projects) {
++    if (parentOf.has(project.projectId)) continue;
++    const group = { project, worktrees: [] as Project[] };
++    groups.set(project.projectId, group);
++    ordered.push(group);
++  }
++  for (const project of projects) {
++    const parent = parentOf.get(project.projectId);
++    if (parent) groups.get(parent.projectId)?.worktrees.push(project);
++  }
++  return ordered;
++}
+diff --git a/src/shared/types.ts b/src/shared/types.ts
+index cabac01a..997ecfba 100644
+--- a/src/shared/types.ts
++++ b/src/shared/types.ts
+@@ -134,6 +134,8 @@ export type Project = {
+   fullPath: string;
+   path?: string;
+   isStarred?: boolean;
++  /** Main repository path when this project is a linked git worktree; the sidebar nests it under that project. */
++  worktreeOf?: string | null;
+   sessions?: ProjectSession[];
+   sessionMeta?: ProjectSessionMeta;
+   taskmaster?: ProjectTaskmasterInfo;
+-- 
+2.53.0
+
