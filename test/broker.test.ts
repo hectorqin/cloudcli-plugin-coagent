@@ -619,6 +619,15 @@ describe('merge gate', () => {
     expect(() => broker.recordWorkspaceEvent(run.id, ro.id, 'workspace_archived', 'session')).toThrow(/finished read-only worker/);
   });
 
+  it('endRun removes a merged worker worktree whose post-merge cleanup failed', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    store.updateAgent(w.id, { status: 'merged' }); // merged, but removing the worktree failed: the path is still recorded
+    await broker.endRun(run.id, true);
+    expect(fs.existsSync(w.worktreePath!)).toBe(false);
+    expect(store.agent(w.id)!.worktreePath).toBeNull();
+  });
+
   it('endRun expires pending gates and cancels queued messages', async () => {
     const run = await startApprovedRun();
     const w = await spawn('coder');

@@ -625,7 +625,7 @@ export class Broker {
     const run = store.run(runId) ?? fail(`No run ${runId}`);
     if (removeWorktrees) {
       for (const a of store.agents(run.id)) {
-        if (a.worktreePath && a.status !== 'merged') {
+        if (a.worktreePath) { // includes a merged worker whose post-merge removal failed
           await git.removeWorktree(a.worktreePath).catch((e) => this.log('worktree remove failed', { runId: run.id, agentId: a.id, error: e }));
           store.updateAgent(a.id, { worktreePath: null });
         }
