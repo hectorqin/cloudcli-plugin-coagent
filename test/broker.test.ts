@@ -618,6 +618,20 @@ describe('merge gate', () => {
     (store as unknown as { db: DatabaseSync }).db.prepare('UPDATE agents SET app_session_id = ? WHERE id = ?').run('lead-app', ro.id);
     expect(() => broker.recordWorkspaceEvent(run.id, ro.id, 'workspace_archived', 'session')).toThrow(/finished read-only worker/);
   });
+
+  it('endRun expires pending gates and cancels queued messages', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    await call('request_merge', { worker: w.id });
+    const gate = store.gates(run.id).find((g) => g.kind === 'merge')!;
+    expect(gate.status).toBe('pending');
+    store.addMessage(run.id, null, w.id, 'message', 'never delivered');
+    await broker.endRun(run.id, false);
+    expect(store.gate(gate.id)!.status).toBe('expired');
+    expect(store.events(run.id).some((e) => e.type === 'gate_decided' && e.data.gate === gate.id && e.data.status === 'expired')).toBe(true);
+    expect(store.messages(run.id).filter((m) => m.state === 'queued')).toEqual([]);
+    expect(broker.state(null, null).runs.find((r) => r.id === run.id)!.pendingGates).toBe(0);
+  });
 });
 
 describe('wait_for_agents and batched results', () => {

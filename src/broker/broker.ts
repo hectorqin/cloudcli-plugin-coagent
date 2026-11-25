@@ -631,8 +631,18 @@ export class Broker {
         }
       }
     }
-    store.endRun(run.id);
-    store.addEvent(run.id, null, 'run_ended', { removeWorktrees });
+    store.transaction(() => {
+      // Nothing can decide these gates or deliver these messages once the run has ended.
+      for (const gate of store.gates(run.id).filter((g) => g.status === 'pending')) {
+        store.decideGate(gate.id, 'expired', 'run ended');
+        store.addEvent(run.id, null, 'gate_decided', {
+          gate: gate.id, kind: gate.kind, subject: gate.subjectAgent, status: 'expired', reason: 'the run ended', comment: null,
+        });
+      }
+      for (const a of store.agents(run.id)) store.cancelQueued(a.id);
+      store.endRun(run.id);
+      store.addEvent(run.id, null, 'run_ended', { removeWorktrees });
+    });
   }
 
   /** User-requested cleanup, deliberately separate from endRun: branches are never removed automatically. */
