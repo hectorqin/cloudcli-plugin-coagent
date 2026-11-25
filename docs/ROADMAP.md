@@ -249,3 +249,12 @@
 | 8 | 保留期与隐私 | 推荐：activity/log 有界保留，support bundle 默认脱敏 |
 | 9 | 同 repo 多 run | 推荐：worker 并行，同 target 本地 merge 串行 + SHA 校验 |
 | 10 | 上游 PR 时机 | **v0.3 完成后一起提**（permissionMode、worktree 归组、toolRenderers） |
+
+## 六、进度
+
+- **v0.3 第一波（2026-11-25，run `r-8038eb`）已合并到 main**：
+  - 可靠性 v1：投递状态机、会话感知的重启恢复、`end_agent`、名额修正、run 作用域 id（coder-55f7 / Claude；Codex reviewer 6 项问题已修）
+  - 合并关卡 diff 快照 + SHA 校验 + repo 锁（coder-3fb7 / Codex；Claude reviewer 8 项问题已修）
+  - 安全加固 + 结构化日志 + 诊断面板（coder-efdf / Codex；Claude reviewer 6 项问题已修）
+  - fork patch 3：`/api/agent` `permissionMode`、`GET /api/agent/capabilities`、`GET /api/agent/sessions/:id`（安装包 `1.37.10-coagent.2`）
+- **第二波待做**：插件权限策略开关（消费 patch 3）、token/耗时可见性、真实 UI 验收矩阵、发布（CI、URL 安装）。
