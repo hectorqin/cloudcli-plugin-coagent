@@ -257,4 +257,5 @@
   - 合并关卡 diff 快照 + SHA 校验 + repo 锁（coder-3fb7 / Codex；Claude reviewer 8 项问题已修）
   - 安全加固 + 结构化日志 + 诊断面板（coder-efdf / Codex；Claude reviewer 6 项问题已修）
   - fork patch 3：`/api/agent` `permissionMode`、`GET /api/agent/capabilities`、`GET /api/agent/sessions/:id`（安装包 `1.37.10-coagent.2`）
-- **第二波待做**：插件权限策略开关（消费 patch 3）、token/耗时可见性、真实 UI 验收矩阵、发布（CI、URL 安装）。
+- **决定（2026-11-25）**：插件权限策略**不做**，worker 默认按 CloudCLI Agent API 的 `bypassPermissions` 运行（推翻 §五 第 1 项）。fork patch 3 的 `permissionMode` 保留备用，`sessions/:id` 状态接口继续被重启恢复使用。
+- **第二波**：token/耗时可见性、发布工程（CI、URL 安装、升级/卸载）、端到端验收（脚本 + 浏览器清单）。
