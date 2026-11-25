@@ -32,6 +32,21 @@ const ORPHAN_NOTE = 'Their turn may have partially executed (files half-edited, 
 export const DETACHED_CHECK_MS = 30_000;
 const GONE = new Set(['ended', 'merged']);
 const ACTIVITY_KEEP = 12;
+const repoMutexes = new Map<string, Promise<void>>();
+
+/** Process-wide serialization for operations against the same git common directory. */
+async function withRepoMutex<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = repoMutexes.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => current);
+  repoMutexes.set(key, tail);
+  await previous;
+  try { return await fn(); } finally {
+    release();
+    if (repoMutexes.get(key) === tail) repoMutexes.delete(key);
+  }
+}
 
 /**
  * Appends one activity line. Providers re-send the same tool call as it progresses (Codex: started → completed),
@@ -257,15 +272,19 @@ export class Broker {
         if (!w!.branch || !w!.worktreePath) fail(`${wid} is a read-only role and has nothing to merge.`);
         if (w!.status === 'merged') fail(`${wid} is already merged.`);
         if (w!.status === 'ended') fail(`${wid} was ended.`);
+        if (store.busy.has(wid)) fail(`${wid} is still running; wait for it to finish before requesting a merge.`);
         const existing = store.pendingGate(run.id, 'merge', wid);
         if (existing) return `Merge request for ${wid} is already pending as gate #${existing.id}. END YOUR TURN.`;
         const note = typeof a.note === 'string' && a.note.trim() ? a.note.trim() : (w!.result ?? '(no summary)');
-        const id = store.addGate(run.id, 'merge', agent.id, wid, note);
+        const worktreePath = w!.worktreePath!;
+        await this.d.git.commitAll(worktreePath, `coagent: uncommitted work from ${w!.id}`);
+        const snapshot = await this.d.git.mergeSnapshot(lead.cwd, worktreePath, w!.branch!);
+        const id = store.addGate(run.id, 'merge', agent.id, wid, note, snapshot);
         store.addEvent(run.id, agent.id, 'gate_opened', { gate: id, kind: 'merge', subject: wid });
         return {
           text: `Merge request for ${wid} (${w!.branch} → your checked-out branch) submitted as gate #${id}. `
             + 'END YOUR TURN; the outcome arrives as a new message.',
-          gate: { id, kind: 'merge', title: `Merge ${wid} (${w!.branch}) into ${lead.id}'s branch?`, body: note },
+          gate: { id, kind: 'merge', title: `Merge ${wid} (${w!.branch}) into ${lead.id}'s branch?`, body: note, snapshot },
         };
       }
 
@@ -391,31 +410,46 @@ export class Broker {
         store.addMessage(run.id, null, lead, 'gate', `The user REJECTED merging ${w.id} (gate #${gate.id}).${fb}`, gate.id);
       } else {
         const leadAgent = store.agent(lead)!;
-        if (store.busy.has(w.id)) fail(`${w.id} is still running; wait for it to finish before merging.`);
-        await git.commitAll(w.worktreePath!, `coagent: uncommitted work from ${w.id}`);
-        const res = await git.merge(leadAgent.cwd, w.branch!, `coagent: merge ${w.branch} (${w.role} ${w.id})`);
-        store.decideGate(gate.id, 'approved', comment);
-        store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'approved', comment });
-        store.addEvent(run.id, w.id, 'merge', res.ok
-          ? { ok: true, commit: res.commit, branch: w.branch }
-          : { ok: false, reason: res.reason, conflicts: res.conflicts, branch: w.branch });
-        if (res.ok) {
-          store.transaction(() => {
-            store.updateAgent(w.id, { status: 'merged' });
-            store.cancelQueued(w.id);
-          });
-          await git.removeWorktree(w.worktreePath!).catch((e) => this.log('worktree remove failed', e));
-          store.updateAgent(w.id, { worktreePath: null });
-          store.addMessage(run.id, null, lead, 'gate',
-            `The user approved the merge of ${w.id}; merged ${w.branch} as ${res.commit.slice(0, 10)}. `
-            + `Its worktree was removed; the branch is kept.${fb}`, gate.id);
-        } else {
-          store.addMessage(run.id, null, lead, 'gate',
-            `The user approved merging ${w.id}, but the merge FAILED: ${res.reason}.`
-            + (res.conflicts.length ? `\nConflicting files:\n${res.conflicts.map((f) => `- ${f}`).join('\n')}` : '')
-            + `\nThe merge was aborted; nothing changed. Resolve it (e.g. send ${w.id} rework to rebase onto your branch, `
-            + `or merge ${w.branch} yourself), then request_merge again.${fb}`, gate.id);
-        }
+        const snapshot = gate.snapshot ?? fail(`Merge gate #${gate.id} has no code snapshot; request_merge again.`);
+        const repoKey = await git.commonDir(leadAgent.cwd);
+        await withRepoMutex(repoKey, async () => {
+          // A second concurrent approval can be waiting on this lock; honor the decision that got there first.
+          if (store.gate(gate.id)?.status !== 'pending') return;
+          if (store.busy.has(w.id)) fail(`${w.id} is still running; wait for it to finish before merging.`);
+          const [workerHead, leadHead] = await Promise.all([git.resolve(w.worktreePath!, w.branch!), git.head(leadAgent.cwd)]);
+          const moved = [workerHead !== snapshot.workerHead ? 'worker branch' : '', leadHead !== snapshot.leadHead ? 'lead branch' : ''].filter(Boolean);
+          if (moved.length) {
+            store.decideGate(gate.id, 'expired', comment);
+            store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'expired', moved, comment });
+            store.addMessage(run.id, null, lead, 'gate',
+              `The merge gate for ${w.id} (#${gate.id}) EXPIRED because the ${moved.join(' and ')} moved after review. `
+              + `Nothing was merged; call request_merge again to review the current code.${fb}`, gate.id);
+            return;
+          }
+          const res = await git.merge(leadAgent.cwd, snapshot.workerHead, `coagent: merge ${w.branch} (${w.role} ${w.id})`);
+          store.decideGate(gate.id, 'approved', comment);
+          store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'approved', comment });
+          store.addEvent(run.id, w.id, 'merge', res.ok
+            ? { ok: true, commit: res.commit, branch: w.branch, snapshot: snapshot.workerHead }
+            : { ok: false, reason: res.reason, conflicts: res.conflicts, branch: w.branch, snapshot: snapshot.workerHead });
+          if (res.ok) {
+            store.transaction(() => {
+              store.updateAgent(w.id, { status: 'merged' });
+              store.cancelQueued(w.id);
+            });
+            await git.removeWorktree(w.worktreePath!).catch((e) => this.log('worktree remove failed', e));
+            store.updateAgent(w.id, { worktreePath: null });
+            store.addMessage(run.id, null, lead, 'gate',
+              `The user approved the merge of ${w.id}; merged reviewed commit ${snapshot.workerHead.slice(0, 10)} as ${res.commit.slice(0, 10)}. `
+              + `Its worktree was removed; the branch is kept.${fb}`, gate.id);
+          } else {
+            store.addMessage(run.id, null, lead, 'gate',
+              `The user approved merging ${w.id}, but the merge FAILED: ${res.reason}.`
+              + (res.conflicts.length ? `\nConflicting files:\n${res.conflicts.map((f) => `- ${f}`).join('\n')}` : '')
+              + `\nThe merge was aborted; nothing changed. Resolve it (e.g. send ${w.id} rework to rebase onto your branch, `
+              + `or merge ${w.branch} yourself), then request_merge again.${fb}`, gate.id);
+          }
+        });
       }
     }
     this.kick();

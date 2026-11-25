@@ -14,7 +14,7 @@ const run: RunDetailDTO = {
     agent('reviewer-2', 'reviewer', { provider: 'codex', status: 'reported', result: 'LGTM <ok>' }),
   ],
   messages: [], events: [],
-  gates: [{ id: 7, runId: 'r', kind: 'plan', requestedBy: 'lead', subjectAgent: null, payload: 'p', status: 'pending', comment: null, createdAt: '' }],
+  gates: [{ id: 7, runId: 'r', kind: 'plan', requestedBy: 'lead', subjectAgent: null, payload: 'p', status: 'pending', comment: null, createdAt: '', snapshot: null }],
 };
 const state = { setup: { apiKeyConfigured: true, registration: {} }, me: 'lead', current: run, runs: [] } as StateDTO;
 const ctx = (toolName: string, toolInput: unknown, result: string | null, status: ToolContext['status'] = 'completed'): ToolContext => ({
@@ -55,6 +55,29 @@ describe('tool cards', () => {
     expect(html).toContain('pending');
     expect(html).toContain('answer the form below');
     expect(html).toContain('step 1');
+  });
+
+  it('shows an escaped merge file list and collapsible truncated diff', () => {
+    const merge = {
+      id: 8, runId: 'r', kind: 'merge' as const, requestedBy: 'lead', subjectAgent: 'coder-1', payload: 'ready',
+      status: 'pending' as const, comment: null, createdAt: '', snapshot: {
+        workerHead: '1234567890abcdef', leadHead: 'abcdef', mergeBase: 'aaaa', stat: '', nameStatus: '',
+        files: [
+          { path: '<script>.ts', status: 'M', additions: 2, deletions: 1, binary: false },
+          { path: 'image.bin', status: 'A', additions: null, deletions: null, binary: true },
+        ],
+        diff: '<script>alert(1)</script>', diffTruncated: true,
+      },
+    };
+    const mergeState = { ...state, current: { ...run, gates: [...run.gates, merge] } };
+    const html = cardHtml(ctx('request_merge', { worker: 'coder-1' }, 'Merge request submitted as gate #8.'), mergeState);
+    expect(html).toContain('Reviewed commit 1234567890');
+    expect(html).toContain('&#60;script&#62;.ts');
+    expect(html).toContain('+2');
+    expect(html).toContain('-1');
+    expect(html).toContain('binary');
+    expect(html).toContain('Unified diff (truncated at 200 KB)');
+    expect(html).not.toContain('<script>alert');
   });
 
   it('falls back gracefully without state', () => {

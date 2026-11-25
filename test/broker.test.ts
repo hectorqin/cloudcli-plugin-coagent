@@ -284,21 +284,129 @@ describe('timeline events', () => {
 });
 
 describe('merge gate', () => {
-  it('commits leftovers, merges into the lead branch, removes the worktree and keeps the branch', async () => {
+  it('commits leftovers at request time, records the snapshot, and merges its exact SHA', async () => {
     await startApprovedRun();
     const w = await spawn('coder');
     fs.writeFileSync(path.join(w.worktreePath!, 'hello.txt'), 'hi\n'); // left uncommitted on purpose
     const r = await call('request_merge', { worker: w.id });
     expect(r.ok, r.text).toBe(true);
     const gate = store.gates(w.runId).find((g) => g.kind === 'merge')!;
+    expect(sh(w.worktreePath!, 'status', '--porcelain')).toBe('');
+    expect(gate.snapshot).toMatchObject({
+      workerHead: sh(w.worktreePath!, 'rev-parse', 'HEAD'),
+      leadHead: sh(repo, 'rev-parse', 'HEAD'),
+      mergeBase: sh(repo, 'rev-parse', 'HEAD'),
+      diffTruncated: false,
+      files: [{ path: 'hello.txt', status: 'A', additions: 1, deletions: 0, binary: false }],
+    });
+    expect(gate.snapshot!.stat).toContain('hello.txt');
+    expect(gate.snapshot!.nameStatus).toContain('A\thello.txt');
+    expect(gate.snapshot!.diff).toContain('+hi');
 
     await broker.decideGate(gate.id, true, 'lgtm');
     await broker.settle();
     expect(fs.readFileSync(path.join(repo, 'hello.txt'), 'utf8')).toBe('hi\n');
     expect(fs.existsSync(w.worktreePath!)).toBe(false);
     expect(sh(repo, 'branch', '--list', w.branch!)).toContain(w.branch!);
+    expect(sh(repo, 'rev-parse', 'HEAD^2')).toBe(gate.snapshot!.workerHead);
     expect(store.agent(w.id)!.status).toBe('merged');
     expect(cc.calls.at(-1)!.message).toMatch(/approved the merge[\s\S]*lgtm/);
+    const expectedSnapshot = gate.snapshot;
+    store.close();
+    store = new Store(path.join(tmp, 'db.sqlite')); // migrations are idempotent and the review survives restart
+    expect(store.gate(gate.id)!.snapshot).toEqual(expectedSnapshot);
+  });
+
+  it('refuses to open a merge gate while the worker is busy', async () => {
+    await startApprovedRun();
+    const w = await spawn('coder');
+    store.busy.add(w.id);
+    const r = await call('request_merge', { worker: w.id });
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/still running/);
+    expect(store.gates(w.runId).filter((g) => g.kind === 'merge')).toHaveLength(0);
+    store.busy.delete(w.id);
+  });
+
+  it('expires the gate when the worker HEAD moves after request and merges nothing', async () => {
+    await startApprovedRun();
+    const w = await spawn('coder');
+    fs.writeFileSync(path.join(w.worktreePath!, 'reviewed.txt'), 'reviewed\n');
+    await call('request_merge', { worker: w.id });
+    const gate = store.gates(w.runId).find((g) => g.kind === 'merge')!;
+    fs.writeFileSync(path.join(w.worktreePath!, 'later.txt'), 'later\n');
+    sh(w.worktreePath!, 'add', '-A');
+    sh(w.worktreePath!, 'commit', '-q', '-m', 'later work');
+
+    await broker.decideGate(gate.id, true, null);
+    await broker.settle();
+    expect(store.gate(gate.id)!.status).toBe('expired');
+    expect(fs.existsSync(path.join(repo, 'reviewed.txt'))).toBe(false);
+    expect(sh(repo, 'rev-parse', 'HEAD')).toBe(gate.snapshot!.leadHead);
+    expect(fs.existsSync(w.worktreePath!)).toBe(true);
+    expect(cc.calls.at(-1)!.message).toMatch(/EXPIRED because the worker branch moved[\s\S]*request_merge again/);
+  });
+
+  it('expires the gate when the lead HEAD moves after request', async () => {
+    await startApprovedRun();
+    const w = await spawn('coder');
+    fs.writeFileSync(path.join(w.worktreePath!, 'worker.txt'), 'worker\n');
+    await call('request_merge', { worker: w.id });
+    const gate = store.gates(w.runId).find((g) => g.kind === 'merge')!;
+    fs.writeFileSync(path.join(repo, 'lead.txt'), 'lead\n');
+    sh(repo, 'add', '-A');
+    sh(repo, 'commit', '-q', '-m', 'lead moved');
+
+    await broker.decideGate(gate.id, true, null);
+    await broker.settle();
+    expect(store.gate(gate.id)!.status).toBe('expired');
+    expect(fs.existsSync(path.join(repo, 'worker.txt'))).toBe(false);
+    expect(cc.calls.at(-1)!.message).toMatch(/EXPIRED because the lead branch moved/);
+  });
+
+  it('marks binary files and truncates oversized unified diffs', async () => {
+    await startApprovedRun();
+    const w = await spawn('coder');
+    fs.writeFileSync(path.join(w.worktreePath!, 'image.bin'), Buffer.from([0, 1, 2, 3, 0, 255]));
+    fs.writeFileSync(path.join(w.worktreePath!, 'large.txt'), 'changed line\n'.repeat(30_000));
+    await call('request_merge', { worker: w.id });
+    const snapshot = store.gates(w.runId).find((g) => g.kind === 'merge')!.snapshot!;
+    expect(snapshot.files.find((f) => f.path === 'image.bin')).toMatchObject({ binary: true, additions: null, deletions: null });
+    expect(snapshot.diff).toMatch(/Binary files .*image\.bin.* differ/);
+    expect(snapshot.diffTruncated).toBe(true);
+    expect(Buffer.byteLength(snapshot.diff)).toBeLessThanOrEqual(200 * 1024);
+  });
+
+  it('serializes concurrent approvals in one repo and expires the stale second gate', async () => {
+    await startApprovedRun();
+    const a = await spawn('coder', 'first');
+    const b = await spawn('tester', 'second');
+    fs.writeFileSync(path.join(a.worktreePath!, 'first.txt'), 'first\n');
+    fs.writeFileSync(path.join(b.worktreePath!, 'second.txt'), 'second\n');
+    await call('request_merge', { worker: a.id });
+    await call('request_merge', { worker: b.id });
+    const gates = store.gates(a.runId).filter((g) => g.kind === 'merge');
+
+    let activeMerges = 0;
+    let maxActiveMerges = 0;
+    const instrumented = {
+      ...Git,
+      merge: async (...args: Parameters<typeof Git.merge>) => {
+        activeMerges++;
+        maxActiveMerges = Math.max(maxActiveMerges, activeMerges);
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        try { return await Git.merge(...args); } finally { activeMerges--; }
+      },
+    };
+    broker = new Broker({ store, cloudcli: cc, git: instrumented, prompts: filePrompts(PROMPTS), now: () => clock });
+    await Promise.all(gates.map((g) => broker.decideGate(g.id, true, null)));
+    await broker.settle();
+
+    expect(maxActiveMerges).toBe(1);
+    expect(store.gate(gates[0].id)!.status).toBe('approved');
+    expect(store.gate(gates[1].id)!.status).toBe('expired');
+    expect(fs.readFileSync(path.join(repo, 'first.txt'), 'utf8')).toBe('first\n');
+    expect(fs.existsSync(path.join(repo, 'second.txt'))).toBe(false);
   });
 
   it('aborts on conflict, keeps the worktree and reports the files', async () => {

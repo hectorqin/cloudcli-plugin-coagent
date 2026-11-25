@@ -36,8 +36,10 @@ const CSS = `
 .ca .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.ca .grow{flex:1;min-width:0}
 .ca .badge{display:inline-block;padding:0 7px;border-radius:999px;border:1px solid var(--line);font-size:11px;line-height:18px;white-space:nowrap}
 .ca .t-accent,.ca .b-lead{color:var(--accent);border-color:var(--accent)}.ca .t-warn,.ca .b-running,.ca .b-starting,.ca .b-pending,.ca .b-interrupted{color:var(--warn);border-color:var(--warn)}
-.ca .t-ok,.ca .b-reported,.ca .b-merged,.ca .b-approved{color:var(--ok);border-color:var(--ok)}.ca .t-error,.ca .b-error,.ca .b-rejected{color:var(--bad);border-color:var(--bad)}
+.ca .t-ok,.ca .b-reported,.ca .b-merged,.ca .b-approved{color:var(--ok);border-color:var(--ok)}.ca .t-error,.ca .b-error,.ca .b-rejected,.ca .b-expired{color:var(--bad);border-color:var(--bad)}
 .ca pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:40vh;overflow:auto}
+.ca .files{margin:6px 0;border:1px solid var(--line);border-radius:6px;overflow:hidden}.ca .file{display:flex;gap:8px;padding:3px 7px;border-top:1px solid var(--line);font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}.ca .file:first-child{border-top:0}.ca .file .path{flex:1;min-width:0;overflow-wrap:anywhere}.ca .plus{color:var(--ok)}.ca .minus{color:var(--bad)}
+.ca details>summary{cursor:pointer;color:var(--muted)}
 .ca button{font:inherit;font-size:12px;padding:3px 10px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg);cursor:pointer;white-space:nowrap}
 .ca button.primary{background:var(--accent);border-color:var(--accent);color:#fff}.ca button.danger{color:var(--bad)}
 .ca button:disabled{opacity:.5;cursor:default}
@@ -284,7 +286,11 @@ export function mount(container: HTMLElement, api: PluginAPI) {
         <div class="row" style="margin-top:6px"><button class="primary" data-act="approve" data-id="${g.id}">Approve</button>
         <button class="danger" data-act="reject" data-id="${g.id}">Reject</button></div>`
       : `<div class="sub">Decision: <span class="badge b-${esc(g.status)}">${esc(g.status)}</span>${g.comment ? ` — ${esc(g.comment)}` : ''}</div>`;
-    return `<div class="row"><b class="grow">${title}</b>${close}</div><pre>${esc(g.payload)}</pre>${actions}`;
+    const review = g.snapshot ? `<div class="sub">Reviewed worker ${esc(g.snapshot.workerHead.slice(0, 10))} · base ${esc(g.snapshot.mergeBase.slice(0, 10))}</div>
+      <div class="files">${g.snapshot.files.map((f) => `<div class="file"><span>${esc(f.status)}</span><span class="path">${esc(f.path)}</span>${f.binary
+        ? '<span>binary</span>' : `<span class="plus">+${f.additions ?? 0}</span><span class="minus">-${f.deletions ?? 0}</span>`}</div>`).join('')}</div>
+      <details><summary>Unified diff${g.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary><pre>${esc(g.snapshot.diff)}${g.snapshot.diffTruncated ? '\n\n[diff truncated]' : ''}</pre></details>` : '';
+    return `<div class="row"><b class="grow">${title}</b>${close}</div><pre>${esc(g.payload)}</pre>${review}${actions}`;
   }
 
   function agentDetail(a: AgentDTO, ended: boolean, close: string): string {

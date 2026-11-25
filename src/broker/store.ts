@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import type {
-  AgentDTO, AgentStatus, DeliveryState, EventDTO, EventType, GateDTO, GateKind, GateStatus, MessageDTO, PlanStatus, Provider, RunDTO,
+  AgentDTO, AgentStatus, DeliveryState, EventDTO, EventType, GateDTO, GateKind, GateStatus, MergeSnapshot, MessageDTO,
+  PlanStatus, Provider, RunDTO,
 } from '../shared/protocol.js';
 
 type Row = Record<string, unknown>;
@@ -52,6 +53,14 @@ CREATE TABLE IF NOT EXISTS gates (
   payload TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   comment TEXT,
+  worker_head TEXT,
+  lead_head TEXT,
+  merge_base TEXT,
+  diff_stat TEXT,
+  name_status TEXT,
+  snapshot_files TEXT,
+  unified_diff TEXT,
+  diff_truncated INTEGER,
   created_at TEXT NOT NULL,
   decided_at TEXT
 );
@@ -111,6 +120,14 @@ export class Store {
     if (!cols.includes('lease_until')) this.db.exec('ALTER TABLE messages ADD COLUMN lease_until INTEGER');
     this.db.exec('DROP INDEX IF EXISTS messages_inbox');
     this.db.exec('CREATE INDEX IF NOT EXISTS messages_delivery ON messages(to_agent, delivery_state)');
+    const gateCols = new Set((this.db.prepare('PRAGMA table_info(gates)').all() as Row[]).map((r) => String(r.name)));
+    const gateMigrations: Record<string, string> = {
+      worker_head: 'TEXT', lead_head: 'TEXT', merge_base: 'TEXT', diff_stat: 'TEXT', name_status: 'TEXT',
+      snapshot_files: 'TEXT', unified_diff: 'TEXT', diff_truncated: 'INTEGER',
+    };
+    for (const [name, type] of Object.entries(gateMigrations)) {
+      if (!gateCols.has(name)) this.db.exec(`ALTER TABLE gates ADD COLUMN ${name} ${type}`);
+    }
   }
 
   close() { this.db.close(); }
@@ -277,9 +294,14 @@ export class Store {
   }
 
   // ── gates ─────────────────────────────────────────────────────────
-  addGate(runId: string, kind: GateKind, requestedBy: string, subjectAgent: string | null, payload: string): number {
-    const r = this.db.prepare('INSERT INTO gates (run_id, kind, requested_by, subject_agent, payload, created_at) VALUES (?,?,?,?,?,?)')
-      .run(runId, kind, requestedBy, subjectAgent, payload, this.ts());
+  addGate(runId: string, kind: GateKind, requestedBy: string, subjectAgent: string | null, payload: string,
+    snapshot: MergeSnapshot | null = null): number {
+    const r = this.db.prepare(`INSERT INTO gates (run_id, kind, requested_by, subject_agent, payload, created_at,
+      worker_head, lead_head, merge_base, diff_stat, name_status, snapshot_files, unified_diff, diff_truncated)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      runId, kind, requestedBy, subjectAgent, payload, this.ts(), snapshot?.workerHead ?? null, snapshot?.leadHead ?? null,
+      snapshot?.mergeBase ?? null, snapshot?.stat ?? null, snapshot?.nameStatus ?? null,
+      snapshot ? JSON.stringify(snapshot.files) : null, snapshot?.diff ?? null, snapshot ? Number(snapshot.diffTruncated) : null);
     return Number(r.lastInsertRowid);
   }
   gate(id: number): GateDTO | null {
@@ -345,9 +367,15 @@ function toMessage(r: Row): MessageDTO {
   };
 }
 function toGate(r: Row): GateDTO {
+  const snapshot = r.worker_head == null ? null : {
+    workerHead: String(r.worker_head), leadHead: String(r.lead_head), mergeBase: String(r.merge_base),
+    stat: String(r.diff_stat ?? ''), nameStatus: String(r.name_status ?? ''),
+    files: JSON.parse(String(r.snapshot_files ?? '[]')) as MergeSnapshot['files'], diff: String(r.unified_diff ?? ''),
+    diffTruncated: Boolean(r.diff_truncated),
+  };
   return {
     id: Number(r.id), runId: String(r.run_id), kind: String(r.kind) as GateKind, requestedBy: String(r.requested_by),
     subjectAgent: s(r.subject_agent), payload: String(r.payload), status: String(r.status) as GateStatus,
-    comment: s(r.comment), createdAt: String(r.created_at),
+    comment: s(r.comment), createdAt: String(r.created_at), snapshot,
   };
 }

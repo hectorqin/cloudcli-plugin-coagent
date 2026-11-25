@@ -60,6 +60,7 @@ const CSS = `
 .cat-a b{font-weight:600}.cat-a .m{color:var(--muted);font-size:12px}
 .cat-act{margin:4px 0 0 2px;padding-left:8px;border-left:2px solid var(--line);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
 .cat-act div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cat-files{margin-top:5px;border:1px solid var(--line);border-radius:5px;overflow:hidden}.cat-file{display:flex;gap:7px;padding:2px 6px;border-top:1px solid var(--line);font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}.cat-file:first-child{border-top:0}.cat-file .path{flex:1;min-width:0;overflow-wrap:anywhere}.cat-file .plus{color:var(--ok)}.cat-file .minus{color:var(--bad)}
 .cat pre{white-space:pre-wrap;word-break:break-word;margin:4px 0 0;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:280px;overflow:auto}
 .cat details>summary{cursor:pointer;color:var(--muted);font-size:12px}
 .cat button{font:inherit;font-size:12px;padding:1px 8px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--fg);cursor:pointer;margin-left:auto}
@@ -146,13 +147,17 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null): string {
       const gate = run?.gates.find((g) => g.id === gateId)
         ?? [...(run?.gates ?? [])].reverse().find((g) => g.kind === kind && (kind === 'plan' || g.subjectAgent === args.worker));
       const st = gate?.status ?? (ctx.status === 'running' ? 'pending' : 'unknown');
-      const badge = `<span class="cat-b ${st === 'approved' ? 'ok' : st === 'rejected' ? 'bad' : 'run'}">${st === 'pending' ? '<span class="cat-dot"></span>' : ''}${esc(st)}</span>`;
+      const badge = `<span class="cat-b ${st === 'approved' ? 'ok' : st === 'rejected' || st === 'expired' ? 'bad' : 'run'}">${st === 'pending' ? '<span class="cat-dot"></span>' : ''}${esc(st)}</span>`;
       const title = kind === 'plan' ? 'Plan approval' : `Merge approval · ${String(args.worker ?? '')}`;
       const body = String(kind === 'plan' ? args.plan ?? '' : args.note ?? gate?.payload ?? '');
       const hint = st === 'pending' ? '<div class="cat-a m">Waiting for you: answer the form below, or in the CoAgent tab.</div>' : '';
+      const review = kind === 'merge' && gate?.snapshot ? `<div class="cat-a"><div class="m">Reviewed commit ${esc(gate.snapshot.workerHead.slice(0, 10))}</div>
+        <div class="cat-files">${gate.snapshot.files.map((f) => `<div class="cat-file"><span>${esc(f.status)}</span><span class="path">${esc(f.path)}</span>${f.binary
+          ? '<span>binary</span>' : `<span class="plus">+${f.additions ?? 0}</span><span class="minus">-${f.deletions ?? 0}</span>`}</div>`).join('')}</div>
+        <details><summary>Unified diff${gate.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary><pre>${esc(gate.snapshot.diff)}${gate.snapshot.diffTruncated ? '\n\n[diff truncated]' : ''}</pre></details></div>` : '';
       return head(title, gate?.comment ? `comment: ${gate.comment}` : '', badge)
         + `<div class="cat-a"><details ${st === 'pending' ? 'open' : ''}><summary>${kind === 'plan' ? 'Plan' : 'Note'}</summary><pre>${esc(body)}</pre></details></div>`
-        + hint + resultBlock;
+        + review + hint + resultBlock;
     }
     case 'send_message':
       return head('Message', `→ ${String(args.to ?? '')}: ${clip(String(args.body ?? ''), 120)}`) + resultBlock;

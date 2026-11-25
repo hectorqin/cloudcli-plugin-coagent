@@ -12,7 +12,7 @@ function detail(): RunDetailDTO {
   return {
     run: { id: 'r', leadAgentId: 'lead', projectPath: '/x', status: 'active', planStatus: 'approved', createdAt: t(0) },
     agents: [agent('lead', 'lead', { status: 'lead' }), agent('coder-1', 'coder', { busy: true })],
-    gates: [{ id: 1, runId: 'r', kind: 'plan', requestedBy: 'lead', subjectAgent: null, payload: 'p', status: 'approved', comment: null, createdAt: t(1) }],
+    gates: [{ id: 1, runId: 'r', kind: 'plan', requestedBy: 'lead', subjectAgent: null, payload: 'p', status: 'approved', comment: null, createdAt: t(1), snapshot: null }],
     events: [
       { id: 1, runId: 'r', agentId: 'lead', type: 'run_started', data: {}, createdAt: t(0) },
       { id: 2, runId: 'r', agentId: 'lead', type: 'gate_opened', data: { gate: 1, kind: 'plan' }, createdAt: t(1) },
