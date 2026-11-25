@@ -37,6 +37,11 @@ export interface CloudCli {
   send(input: SendInput, onAppSessionId?: (id: string) => void, onEvent?: (event: Record<string, unknown>) => void): Promise<SendResult>;
   sessionByProviderId(providerSessionId: string): SessionInfo | null;
   sessionByAppId(appSessionId: string): SessionInfo | null;
+  /**
+   * Whether CloudCLI is running a turn in this session right now (app or provider session id).
+   * null = unknown: the host lacks the endpoint, or the query failed.
+   */
+  sessionStatus(sessionId: string): Promise<{ processing: boolean | null }>;
 }
 
 const HOME = os.homedir();
@@ -146,6 +151,32 @@ export class HttpCloudCli implements CloudCli {
       }
     }
     return error ? { status: 'error', error } : { status: 'ok', appSessionId };
+  }
+
+  private sessionStatusSupported: boolean | null = null;
+
+  async sessionStatus(sessionId: string): Promise<{ processing: boolean | null }> {
+    const key = this.apiKey();
+    if (!key) return { processing: null };
+    const doFetch = this.opts.fetchImpl ?? fetch;
+    const headers = { 'x-api-key': key };
+    try {
+      if (this.sessionStatusSupported === null) {
+        const caps = await doFetch(`${this.baseUrl()}/api/agent/capabilities`, { headers });
+        // Only a definite answer is cached; a transient failure is retried next time.
+        if (!caps.ok) return { processing: null };
+        this.sessionStatusSupported = ((await caps.json()) as Record<string, unknown>).sessionStatus === true;
+      }
+      if (!this.sessionStatusSupported) return { processing: null };
+      const res = await doFetch(`${this.baseUrl()}/api/agent/sessions/${encodeURIComponent(sessionId)}`, { headers });
+      // CloudCLI does not know the session, so it cannot be running a turn in it.
+      if (res.status === 404) return { processing: false };
+      if (!res.ok) return { processing: null };
+      const j = (await res.json()) as Record<string, unknown>;
+      return { processing: typeof j.processing === 'boolean' ? j.processing : null };
+    } catch {
+      return { processing: null };
+    }
   }
 
   private query(sql: string, ...params: string[]): SessionInfo | null {

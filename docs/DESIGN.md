@@ -42,7 +42,11 @@
 
 - 状态：插件自有 SQLite（`~/.cloudcli-coagent/coagent.db`）为唯一事实源。原定的 `.coagent/` markdown 导出**未实现**。
 - 派活 / 投递：`POST /api/agent`，鉴权用 API key（存插件 secret）。注意该接口对 worker 强制跳过审批。
-- worktree：写代码角色由 broker 执行 `git worktree add`，路径沿用 CloudCLI 约定 `<repo>-worktrees/coagent-<agent_id>`，作为 `projectPath` 传入（自动注册为项目）。只读角色共享 lead 目录。
+- worktree：写代码角色由 broker 执行 `git worktree add`，路径沿用 CloudCLI 约定 `<repo>-worktrees/coagent-<run_id>-<agent_id>`，分支 `coagent/<run_id>/<agent_id>`（id 为 `<role>-<6 hex>`，跨 run 不碰撞），作为 `projectPath` 传入（自动注册为项目）。只读角色共享 lead 目录。spawn 先建 worktree，再在一个事务里写 agent+spawned 事件+任务消息，失败则回滚并删除 worktree/分支；首轮与普通消息走同一投递路径。
+- 投递状态机：`messages.delivery_state` = `queued → dispatching（attempts+1, lease_until）→ delivered`；`cancelled` 表示收件人已 ended/merged。只有 409 或 CloudCLI 接受 turn 之前的错误才回 `queued`；一旦接受（收到 session-id / turn_start），出错也关闭该投递、worker 置 `error` 并通知 lead，是否重试由 lead 决定。`report_result` 在同一事务里确认该 worker 当前的 dispatch。`delivered_at` 仍表示投递时间。进程内的 turn 每次 tick 续租；租约过期的孤儿投递：worker 的一律关闭（不重发），lead 的回队。
+- 启动恢复（`Broker.recover()`，server 启动时 await，请求和 tick 都等它完成）：对仍标 `starting/running` 的 worker 调 CloudCLI `GET /api/agent/sessions/:id`（fork 新增，`capabilities.sessionStatus`）：`processing=false` → `interrupted`；`true` → 保持 `running` 但不归本进程所有（detached），每 30s 复查，结束且未汇报则置 `idle` 并通知 lead，期间其 `report_result` 照常生效、不推新 turn；未知（宿主无该接口或出错）→ `interrupted`，且 `end_agent remove_worktree` 被拒（该操作只在会话确认空闲时允许）。lead 收到 system 消息（`send_message` 续跑或 `end_agent`），任务从不自动重发；记 `recovered` 事件。
+- **已知限制：lead 的 turn 可能部分重复。** lead 没有 interrupted 状态：broker 在 lead turn 中途崩溃时，该 turn 携带的消息在租约过期后回队并重发一次，若该 turn 已部分执行（例如已 spawn 或发消息），lead 会再看到同一批消息。没有 turns 表/provider run id，无法判断它执行到哪里。
+- 容量：占名额的是正在工作的 worker（starting/running/busy/detached）、`interrupted` 的、有 queued/dispatching 消息的，以及有未合并 worktree 的写角色。给不占名额的 worker 发返工时若已满，消息保持 queued、告知发送方，有空位后才投递。`end_agent`（lead 工具，或 tab 抽屉「End agent」）在任何 await 之前用一个事务置 `ended` 并取消其 queued 消息（停止屏障），之后才清理；清理失败只报告，不会恢复投递。ended/merged 的 agent 除 `list_agents` 外的工具调用一律被拒。`remove_worktree: true` 才删 worktree。
 - 消息：收件箱模型。agent 可主动 `read_inbox`；agent 一轮结束（空闲）时 broker 将未读消息作为下一轮输入自动投递；409（运行中）则排队重试。
 - 关卡：
   - 计划：lead `submit_plan` → pending → tab 中批准/驳回+意见 → 结果经收件箱回到 lead。

@@ -12,6 +12,7 @@ export type ToolName =
   | 'request_merge'
   | 'list_agents'
   | 'wait_for_agents'
+  | 'end_agent'
   // Internal: used by the shim while a lead's tool call blocks on a gate, never exposed to models.
   | 'gate_wait'
   | 'gate_decide';
@@ -44,7 +45,15 @@ export interface ToolResponse {
 
 export type RunStatus = 'active' | 'ended';
 export type PlanStatus = 'none' | 'pending' | 'approved' | 'rejected';
-export type AgentStatus = 'lead' | 'starting' | 'running' | 'idle' | 'reported' | 'merged' | 'error' | 'ended';
+/** `interrupted`: the broker restarted while this worker had a turn open; the lead decides whether to continue or end it. */
+export type AgentStatus = 'lead' | 'starting' | 'running' | 'idle' | 'reported' | 'merged' | 'error' | 'ended' | 'interrupted';
+/**
+ * Delivery state of a message. queued → dispatching (a turn carrying it was sent, under a lease) → delivered;
+ * a 409 or an error before CloudCLI accepted the turn puts it back to queued. `cancelled`: its recipient was
+ * ended or merged before it could be delivered. Messages handed over inside a tool result (read_inbox, waits) go straight
+ * from queued to delivered.
+ */
+export type DeliveryState = 'queued' | 'dispatching' | 'delivered' | 'cancelled';
 export type GateKind = 'plan' | 'merge';
 export type GateStatus = 'pending' | 'approved' | 'rejected';
 
@@ -85,6 +94,9 @@ export interface MessageDTO {
   body: string;
   createdAt: string;
   deliveredAt: string | null;
+  state: DeliveryState;
+  /** How many turns were started to deliver it (a value > 1 means it was retried). */
+  attempts: number;
 }
 
 export interface GateDTO {
@@ -101,7 +113,7 @@ export interface GateDTO {
 
 export type EventType =
   | 'run_started' | 'run_ended' | 'spawned' | 'turn_start' | 'turn_end' | 'gate_opened' | 'gate_decided' | 'merge'
-  | 'wait_start' | 'wait_end';
+  | 'wait_start' | 'wait_end' | 'recovered' | 'agent_ended';
 
 /** Timeline facts that are not messages. `agentId` is the lane the event belongs to (null = the user). */
 export interface EventDTO {

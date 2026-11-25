@@ -14,11 +14,23 @@ export const READONLY_ROLES = new Set(['planner', 'reviewer']);
 export const DEFAULT_ROLE_PROVIDERS: Record<string, Provider> = {
   planner: 'claude', coder: 'claude', reviewer: 'codex', tester: 'claude',
 };
-const ACTIVE_WORKER = new Set(['starting', 'running', 'idle', 'reported']);
 const BACKOFF_MIN = 3_000;
 /** A shim blocked on wait_for_agents/gate_wait polls every few seconds; it holds the lead's inbox while the lease is fresh. */
 const LEASE_MS = 15_000;
-const FINISHED_STATUSES = new Set(['idle', 'reported', 'merged', 'error', 'ended']);
+/**
+ * Lease on a message while a turn carries it. Renewed on every tick while the turn runs in this process, so an
+ * expired lease means the process that dispatched it is gone.
+ */
+export const DISPATCH_LEASE_MS = 120_000;
+const FINISHED_STATUSES = new Set(['idle', 'reported', 'merged', 'error', 'ended', 'interrupted']);
+/** Statuses that never receive pushed turns (an interrupted worker waits for the lead to decide). */
+const NO_DELIVERY = new Set(['merged', 'ended', 'interrupted']);
+const ORPHAN_NOTE = 'Their turn may have partially executed (files half-edited, commands run), so their task was NOT '
+  + 're-sent automatically.';
+
+/** How often a worker whose turn outlived a broker restart is re-checked with CloudCLI. */
+export const DETACHED_CHECK_MS = 30_000;
+const GONE = new Set(['ended', 'merged']);
 const ACTIVITY_KEEP = 12;
 
 /**
@@ -79,6 +91,11 @@ export class Broker {
   /** Leads currently inside wait_for_agents (for the timeline). */
   private waiting = new Set<string>();
   private inflight = new Set<Promise<unknown>>();
+  /** Message ids carried by the turn this process is running for an agent. */
+  private dispatches = new Map<string, number[]>();
+  /** Workers whose turn outlived a broker restart (still processing in CloudCLI) → next status check time. */
+  private detached = new Map<string, number>();
+  private checkingDetached = false;
   private now: () => number;
   private log: (...args: unknown[]) => void;
 
@@ -130,6 +147,9 @@ export class Broker {
     const isLead = agent.id === lead.id;
     const requireLead = () => { if (!isLead) fail(`Only the lead (${lead.id}) can call ${req.tool}.`); };
     const a = req.args;
+    if (GONE.has(agent.status) && req.tool !== 'list_agents') {
+      fail(`You (${agent.id}) are ${agent.status} and no longer take part in run ${run.id}. Stop working and END YOUR TURN.`);
+    }
 
     switch (req.tool) {
       case 'submit_plan': {
@@ -156,27 +176,40 @@ export class Broker {
         const task = str(a.task, 'task');
         const provider = (typeof a.provider === 'string' && a.provider ? a.provider : this.roleProviders()[role] ?? 'claude') as Provider;
         if (!SUPPORTED_PROVIDERS.includes(provider)) fail(`Unsupported provider "${provider}". Use one of: ${SUPPORTED_PROVIDERS.join(', ')}.`);
-        const active = store.agents(run.id).filter((x) => x.id !== lead.id && ACTIVE_WORKER.has(x.status));
-        if (active.length >= MAX_WORKERS) {
-          fail(`Worker limit reached (${MAX_WORKERS} active: ${active.map((x) => x.id).join(', ')}). Merge or end some first.`);
-        }
-        const id = `${role}-${hex(2)}`;
+        const full = () => {
+          const used = this.slotHolders(run.id);
+          if (used.length >= MAX_WORKERS) {
+            fail(`Worker limit reached (${MAX_WORKERS} in use: ${used.map((x) => `${x.id} ${x.status}`).join(', ')}). `
+              + 'Merge the ones that are done, or end_agent the ones you no longer need.');
+          }
+        };
+        full();
+        const id = this.uniqueId(role, (x) => !!store.agent(x));
         let cwd = lead.cwd;
         let branch: string | null = null;
         let worktreePath: string | null = null;
         if (!READONLY_ROLES.has(role)) {
-          ({ worktreePath, branch } = await this.d.git.createWorktree(lead.cwd, id));
-          cwd = worktreePath;
+          try {
+            ({ worktreePath, branch } = await this.d.git.createWorktree(lead.cwd, run.id, id));
+          } catch (e) {
+            fail(`Could not create a worktree for the ${role}: ${(e as Error).message.split('\n')[0]}`);
+          }
+          cwd = worktreePath!;
         }
-        store.createAgent({ id, runId: run.id, role, provider, cwd, branch, worktreePath, status: 'starting', task });
-        store.addEvent(run.id, id, 'spawned', { by: lead.id, role, provider, branch });
-        const msgId = store.addMessage(run.id, lead.id, id, 'message', task);
-        store.markDelivered([msgId], true);
-        const prompt = this.d.prompts.worker(role, {
-          agent_id: id, run_id: run.id, lead_id: lead.id, cwd, task,
-          branch_line: branch ? ` (branch \`${branch}\`)` : ' (shared with the lead; read-only)',
-        });
-        this.track(this.runTurn(store.agent(id)!, prompt));
+        try {
+          // Agent, spawn event and task message land together, before any dispatch: a crash after this point
+          // leaves a queued task that is delivered (or recovered) like any other message.
+          store.transaction(() => {
+            full(); // re-checked: another spawn may have finished while the worktree was created
+            store.createAgent({ id, runId: run.id, role, provider, cwd, branch, worktreePath, status: 'starting', task });
+            store.addEvent(run.id, id, 'spawned', { by: lead.id, role, provider, branch });
+            store.addMessage(run.id, lead.id, id, 'message', task);
+          });
+        } catch (e) {
+          if (worktreePath) await this.d.git.discardWorktree(lead.cwd, worktreePath, branch!);
+          throw e;
+        }
+        this.deliver(id);
         return `Spawned ${id} (role ${role}, provider ${provider}) in ${cwd}${branch ? ` on branch ${branch}` : ''}. `
           + 'Spawn any other workers you need, then call wait_for_agents (mode "all" for independent parallel tasks, '
           + '"any" when later steps depend on earlier results).';
@@ -189,22 +222,29 @@ export class Broker {
         if (!target || target.runId !== run.id) fail(`No agent "${toRaw}" in this run. Use list_agents.`);
         if (target!.status === 'merged' || target!.status === 'ended') fail(`${to} is ${target!.status} and no longer receives messages.`);
         if (to === agent.id) fail('You cannot message yourself.');
+        const wait = this.slotWait(target!);
         store.addMessage(run.id, agent.id, to, 'message', str(a.body, 'body'));
+        this.resume(target!);
         this.kick();
-        return `Message queued for ${to}. It is delivered when ${to} is idle (or when it calls read_inbox).`;
+        return `Message queued for ${to}. ${wait ?? `It is delivered when ${to} is idle (or when it calls read_inbox).`}`;
       }
 
       case 'read_inbox': {
         const msgs = store.undelivered(agent.id);
-        store.markDelivered(msgs.map((m) => m.id), true);
+        store.markDelivered(msgs.map((m) => m.id));
         return msgs.length ? formatInbox(agent.id, msgs) : 'No new messages.';
       }
 
       case 'report_result': {
         if (isLead) fail('The lead reports to the user directly, not via report_result.');
         const summary = str(a.summary, 'summary');
-        store.updateAgent(agent.id, { result: summary, status: 'reported' });
-        store.addMessage(run.id, agent.id, lead.id, 'result', summary);
+        store.transaction(() => {
+          store.updateAgent(agent.id, { result: summary, status: 'reported' });
+          store.addMessage(run.id, agent.id, lead.id, 'result', summary);
+          // The turn that carried its task has done its job: acknowledge it now, so a crash before the stream
+          // closes can never re-send the task.
+          store.completeDispatch(store.dispatching(agent.id).map((m) => m.id));
+        });
         this.kick();
         return `Result sent to ${lead.id}. END YOUR TURN NOW. You may receive rework in this session later.`;
       }
@@ -216,6 +256,7 @@ export class Broker {
         if (!w || w.runId !== run.id) fail(`No worker "${wid}" in this run.`);
         if (!w!.branch || !w!.worktreePath) fail(`${wid} is a read-only role and has nothing to merge.`);
         if (w!.status === 'merged') fail(`${wid} is already merged.`);
+        if (w!.status === 'ended') fail(`${wid} was ended.`);
         const existing = store.pendingGate(run.id, 'merge', wid);
         if (existing) return `Merge request for ${wid} is already pending as gate #${existing.id}. END YOUR TURN.`;
         const note = typeof a.note === 'string' && a.note.trim() ? a.note.trim() : (w!.result ?? '(no summary)');
@@ -231,6 +272,14 @@ export class Broker {
       case 'wait_for_agents':
         requireLead();
         return this.waitForAgents(run.id, lead.id, a);
+
+      case 'end_agent': {
+        requireLead();
+        const wid = str(a.worker, 'worker');
+        const w = store.agent(wid);
+        if (!w || w.runId !== run.id) fail(`No worker "${wid}" in this run.`);
+        return this.endAgent(wid, a.remove_worktree === true, lead.id);
+      }
 
       case 'gate_wait':
       case 'gate_decide': {
@@ -248,7 +297,7 @@ export class Broker {
             ? { text: 'Waiting for the user to decide.', pending: true }
             : `Gate #${gate!.id} is already ${store.gate(gate!.id)!.status}; its decision was delivered earlier.`;
         }
-        store.markDelivered([msg.id], true);
+        store.markDelivered([msg.id]);
         return msg.body;
       }
 
@@ -303,8 +352,8 @@ export class Broker {
     const info = cloudcli.sessionByProviderId(providerSessionId!);
     if (!info) fail('This session is not managed by CloudCLI, so coagent cannot deliver messages to it. Open it in CloudCLI first.');
     const projectPath = info!.projectPath || req.caller.cwd || fail('Cannot determine the project path of this session.');
-    const runId = `r-${hex(3)}`;
-    const leadId = `lead-${hex(2)}`;
+    const runId = this.uniqueId('r', (x) => !!store.run(x));
+    const leadId = this.uniqueId('lead', (x) => !!store.agent(x));
     store.transaction(() => {
       store.createRun(runId, leadId, projectPath);
       store.createAgent({
@@ -351,8 +400,12 @@ export class Broker {
           ? { ok: true, commit: res.commit, branch: w.branch }
           : { ok: false, reason: res.reason, conflicts: res.conflicts, branch: w.branch });
         if (res.ok) {
+          store.transaction(() => {
+            store.updateAgent(w.id, { status: 'merged' });
+            store.cancelQueued(w.id);
+          });
           await git.removeWorktree(w.worktreePath!).catch((e) => this.log('worktree remove failed', e));
-          store.updateAgent(w.id, { status: 'merged', worktreePath: null });
+          store.updateAgent(w.id, { worktreePath: null });
           store.addMessage(run.id, null, lead, 'gate',
             `The user approved the merge of ${w.id}; merged ${w.branch} as ${res.commit.slice(0, 10)}. `
             + `Its worktree was removed; the branch is kept.${fb}`, gate.id);
@@ -373,8 +426,121 @@ export class Broker {
     const { store } = this.d;
     const a = store.agent(agentId) ?? fail(`No agent ${agentId}`);
     if (store.run(a.runId)?.status !== 'active') fail('This run has ended.');
+    if (a.status === 'merged' || a.status === 'ended') fail(`${a.id} is ${a.status} and no longer receives messages.`);
+    const wait = this.slotWait(a);
     store.addMessage(a.runId, null, a.id, 'message', str(body, 'body'));
+    this.resume(a);
     this.kick();
+    return wait;
+  }
+
+  // ── worker slots ──────────────────────────────────────────────────
+  /**
+   * Whether a worker takes one of the MAX_WORKERS slots: it is working (or its turn outlived a restart), it is
+   * interrupted, it has work queued or in flight, or it is a writer whose unmerged worktree could still be merged.
+   * Finished read-only workers without pending messages, and ended/merged workers, hold none.
+   */
+  private holdsSlot(a: AgentDTO, countPending = true): boolean {
+    if (a.role === 'lead' || GONE.has(a.status)) return false;
+    if (a.busy || this.detached.has(a.id) || ['starting', 'running', 'interrupted'].includes(a.status)) return true;
+    if (a.branch && a.worktreePath) return true;
+    return countPending && this.d.store.pendingCount(a.id) > 0;
+  }
+  private slotHolders(runId: string, except?: string): AgentDTO[] {
+    return this.d.store.agents(runId).filter((x) => x.id !== except && this.holdsSlot(x));
+  }
+  /** Rework for a worker that holds no slot needs a free one; null when it can be delivered as usual. */
+  private slotWait(a: AgentDTO): string | null {
+    if (a.role === 'lead' || this.holdsSlot(a, false)) return null;
+    const used = this.slotHolders(a.runId, a.id);
+    if (used.length < MAX_WORKERS) return null;
+    return `All ${MAX_WORKERS} worker slots are in use (${used.map((x) => x.id).join(', ')}), so ${a.id} only starts on it `
+      + 'once one frees up (merge or end_agent a worker). The message stays queued until then.';
+  }
+
+  /** A message to an interrupted worker is the decision to continue it in its session. */
+  private resume(a: AgentDTO) {
+    if (a.status !== 'interrupted') return;
+    this.d.store.updateAgent(a.id, { status: 'idle' });
+    this.d.store.addEvent(a.runId, a.id, 'recovered', { status: 'resumed' });
+  }
+
+  /**
+   * Ends one worker (lead tool `end_agent`, or the user from the tab): it stops receiving messages and frees its
+   * slot. Its worktree is only deleted when asked; its branch is always kept. `by` null = the user.
+   */
+  async endAgent(agentId: string, removeWorktree: boolean, by: string | null): Promise<string> {
+    const { store, git } = this.d;
+    const check = () => {
+      const w = store.agent(agentId) ?? fail(`No agent ${agentId}`);
+      const run = store.run(w.runId)!;
+      if (run.status !== 'active') fail('This run has ended.');
+      if (w.id === run.leadAgentId) fail('The lead cannot be ended this way; end the run instead.');
+      if (GONE.has(w.status)) fail(`${w.id} is already ${w.status}.`);
+      if (store.busy.has(w.id)) fail(`${w.id} is in the middle of a turn; wait for it to finish, then end it.`);
+      return { w, run };
+    };
+    let { w } = check();
+    if (removeWorktree && w.worktreePath) {
+      // Never delete a worktree a session may still be writing to (e.g. a turn that outlived a broker restart).
+      const processing = await this.processing(w);
+      if (processing !== false) {
+        fail(`Cannot delete the worktree of ${w.id}: ${processing ? 'its session is still running a turn in CloudCLI'
+          : 'CloudCLI cannot confirm that its session is idle'}. End it without remove_worktree, or retry later.`);
+      }
+    }
+    // Stop barrier: from here on (no await until it is persisted) nothing can start a new turn for it.
+    const checked = check();
+    w = checked.w;
+    const { run } = checked;
+    let cancelled = 0;
+    store.transaction(() => {
+      const gate = store.pendingGate(run.id, 'merge', w.id);
+      if (gate) {
+        store.decideGate(gate.id, 'rejected', `${w.id} was ended`);
+        store.addEvent(run.id, by, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'rejected', comment: 'worker ended' });
+      }
+      store.updateAgent(w.id, { status: 'ended' });
+      cancelled = store.cancelQueued(w.id);
+      store.addEvent(run.id, w.id, 'agent_ended', { by: by ?? 'user', removeWorktree, cancelled });
+      if (by === null) {
+        store.addMessage(run.id, null, run.leadAgentId, 'system',
+          `The user ended ${w.id}. It no longer receives messages and no longer counts as a worker.`);
+      }
+    });
+    this.detached.delete(w.id);
+    if (by === null) this.kick();
+
+    let cleanup = '';
+    if (removeWorktree && w.worktreePath) {
+      try {
+        await git.removeWorktree(w.worktreePath);
+        store.updateAgent(w.id, { worktreePath: null });
+        cleanup = ` Deleted its worktree; branch ${w.branch} is kept.`;
+      } catch (e) {
+        this.log('worktree remove failed', w.id, e);
+        cleanup = ` It is ended, but deleting its worktree ${w.worktreePath} failed: ${(e as Error).message.split('\n')[0]}.`;
+      }
+    } else if (w.worktreePath) {
+      cleanup = ` Its worktree ${w.worktreePath} and branch ${w.branch} are kept (not merged).`;
+    }
+    const dropped = cancelled ? ` ${cancelled} undelivered message(s) to it were cancelled.` : '';
+    return `Ended ${w.id}; its worker slot is free.${dropped}${cleanup}`;
+  }
+
+  /** Whether the agent's CloudCLI session is running a turn. false also when it never had a session or a turn. */
+  private async processing(a: AgentDTO): Promise<boolean | null> {
+    const sid = a.appSessionId ?? a.providerSessionId;
+    if (!sid) return this.d.store.everDispatched(a.id) ? null : false;
+    return (await this.d.cloudcli.sessionStatus(sid)).processing;
+  }
+
+  private uniqueId(prefix: string, taken: (id: string) => boolean): string {
+    for (let i = 0; i < 20; i++) {
+      const id = `${prefix}-${hex(3)}`;
+      if (!taken(id)) return id;
+    }
+    return fail(`could not allocate a unique id for ${prefix}`);
   }
 
   async endRun(runId: string, removeWorktrees: boolean) {
@@ -431,22 +597,169 @@ export class Broker {
       const lead = store.agent(leadId);
       if (lead) store.addEvent(lead.runId, leadId, 'wait_end', { reason: 'abandoned' });
     }
-    for (const id of store.agentsWithUndelivered()) {
-      if (store.busy.has(id)) continue;
-      const b = this.backoff.get(id);
-      if (b && b.until > this.now()) continue;
-      if (this.leased(id)) continue; // its blocked tool call will hand these over
-      const agent = store.agent(id);
-      if (!agent || agent.status === 'merged' || agent.status === 'ended') continue;
-      const msgs = store.undelivered(id);
-      if (!msgs.length) continue;
-      // Results wake the lead once, when no worker is still working. Anything needing a reaction
-      // (user messages, gate decisions, failures, worker questions) goes out at once.
-      if (agent.role === 'lead' && msgs.every((m) => m.kind === 'result') && this.activeWorkers(agent.runId).length) continue;
-      store.markDelivered(msgs.map((m) => m.id), true);
-      this.track(this.runTurn(agent, formatInbox(agent.id, msgs)).then((ok) => {
-        if (!ok) store.markDelivered(msgs.map((m) => m.id), false);
-      }));
+    // Keep the leases of turns this process is carrying fresh; anything else past its lease is orphaned.
+    const until = this.now() + DISPATCH_LEASE_MS;
+    for (const ids of this.dispatches.values()) store.renewDispatch(ids, until);
+    this.sweepOrphans();
+    await this.checkDetached();
+    for (const id of store.agentsWithUndelivered()) this.deliver(id);
+  }
+
+  /** Pushes an agent's queued messages as one turn if it can take one now (queued → dispatching). */
+  private deliver(id: string) {
+    const { store } = this.d;
+    if (store.busy.has(id) || this.dispatches.has(id) || this.detached.has(id)) return;
+    const b = this.backoff.get(id);
+    if (b && b.until > this.now()) return;
+    if (this.leased(id)) return; // its blocked tool call will hand these over
+    const agent = store.agent(id);
+    if (!agent || NO_DELIVERY.has(agent.status)) return;
+    if (store.run(agent.runId)?.status !== 'active') return;
+    const msgs = store.undelivered(id);
+    if (!msgs.length) return;
+    // Results wake the lead once, when no worker is still working. Anything needing a reaction
+    // (user messages, gate decisions, failures, worker questions) goes out at once.
+    if (agent.role === 'lead' && msgs.every((m) => m.kind === 'result') && this.activeWorkers(agent.runId).length) return;
+    // Rework for a worker that held no slot waits for a free one.
+    if (agent.role !== 'lead' && !this.holdsSlot(agent, false) && this.slotHolders(agent.runId, agent.id).length >= MAX_WORKERS) return;
+    const claimed = new Set(store.claimForDispatch(msgs.map((m) => m.id), this.now() + DISPATCH_LEASE_MS));
+    const batch = msgs.filter((m) => claimed.has(m.id));
+    if (!batch.length) return;
+    this.track(this.runTurn(agent, this.turnPrompt(agent, batch), batch.map((m) => m.id)));
+  }
+
+  /** A worker's first turn carries its task inside the rendered worker prompt; later turns are inbox batches. */
+  private turnPrompt(agent: AgentDTO, batch: MessageDTO[]): string {
+    const { store, prompts } = this.d;
+    if (agent.role === 'lead' || batch[0].id !== store.firstMessageId(agent.id)) return formatInbox(agent.id, batch);
+    const run = store.run(agent.runId)!;
+    const prompt = prompts.worker(agent.role, {
+      agent_id: agent.id, run_id: run.id, lead_id: run.leadAgentId, cwd: agent.cwd, task: agent.task ?? batch[0].body,
+      branch_line: agent.branch ? ` (branch \`${agent.branch}\`)` : ' (shared with the lead; read-only)',
+    });
+    const rest = batch.slice(1);
+    return rest.length ? `${prompt}\n\n---\n\n${formatInbox(agent.id, rest)}` : prompt;
+  }
+
+  /**
+   * Messages left in `dispatching` by a process that is gone (lease expired, not carried by this process).
+   * A worker's are closed, never re-sent: the turn that carried them may have acted on them, so retrying is the
+   * lead's call. A lead's go back to the queue (known limitation: a lead turn cut off mid-way may repeat).
+   */
+  private sweepOrphans(): { requeued: MessageDTO[]; closed: MessageDTO[] } {
+    const { store } = this.d;
+    const mine = new Set([...this.dispatches.values()].flat());
+    const orphans = store.expiredDispatches(this.now()).filter((m) => !mine.has(m.id));
+    const leads = new Set(store.runs().map((r) => r.leadAgentId));
+    const requeued = orphans.filter((m) => leads.has(m.to));
+    const closed = orphans.filter((m) => !leads.has(m.to));
+    store.markDelivered(closed.map((m) => m.id));
+    store.requeue(requeued.map((m) => m.id));
+    for (const [runId, ms] of groupBy(requeued, (m) => m.runId)) {
+      store.addEvent(runId, null, 'recovered', { requeued: ms.map((m) => m.id) });
+    }
+    if (requeued.length || closed.length) this.log('recovered orphaned dispatches', { requeued: requeued.length, closed: closed.length });
+    return { requeued, closed };
+  }
+
+  /**
+   * Startup recovery (awaited by server.ts before serving). Nothing is in flight in this fresh process, so for each
+   * worker still marked starting/running CloudCLI is asked whether its session is still processing:
+   *  - false → `interrupted`: the lead decides (continue via send_message, or end_agent);
+   *  - true  → stays `running`, detached from us: re-checked every DETACHED_CHECK_MS; its report_result still counts;
+   *  - null (unknown) → `interrupted`, and end_agent refuses to delete its worktree until CloudCLI says idle.
+   * Its in-flight messages are closed either way (never re-sent automatically). Orphaned lead dispatches whose
+   * lease expired go back to the queue; younger ones are swept by later ticks.
+   */
+  async recover(): Promise<{ interrupted: string[]; detached: string[]; requeued: number[] }> {
+    const { store } = this.d;
+    const interrupted: { a: AgentDTO; known: boolean }[] = [];
+    const detached: AgentDTO[] = [];
+    for (const a of store.activeRunAgents()) {
+      if (a.role === 'lead' || store.busy.has(a.id) || this.dispatches.has(a.id)) continue;
+      const inFlight = store.dispatching(a.id);
+      if (a.status !== 'starting' && a.status !== 'running') {
+        store.markDelivered(inFlight.map((m) => m.id)); // e.g. reported before the stream closed
+        continue;
+      }
+      // Spawned, but its first turn was never dispatched: nothing ran, so it is simply delivered later.
+      if (a.status === 'starting' && !inFlight.length && !store.everDispatched(a.id)) continue;
+      const processing = await this.processing(a);
+      const now = store.agent(a.id)!;
+      if (now.status !== a.status || store.busy.has(a.id)) continue; // changed while we asked
+      const ids = inFlight.map((m) => m.id);
+      if (processing === true) {
+        store.transaction(() => {
+          store.markDelivered(ids);
+          if (a.status === 'starting') store.updateAgent(a.id, { status: 'running' });
+          store.addEvent(a.runId, a.id, 'recovered', { status: 'detached', previous: a.status, messages: ids });
+        });
+        this.detached.set(a.id, this.now() + DETACHED_CHECK_MS);
+        detached.push(a);
+        continue;
+      }
+      store.transaction(() => {
+        store.updateAgent(a.id, { status: 'interrupted' });
+        store.markDelivered(ids);
+        store.addEvent(a.runId, a.id, 'recovered', { status: 'interrupted', previous: a.status, messages: ids, sessionState: processing === false ? 'idle' : 'unknown' });
+      });
+      interrupted.push({ a, known: processing === false });
+    }
+    const runs = new Set([...interrupted.map((x) => x.a.runId), ...detached.map((a) => a.runId)]);
+    for (const runId of runs) {
+      const lead = store.run(runId)!.leadAgentId;
+      const line = (a: AgentDTO, extra = '') =>
+        `- ${a.id} (${a.role}, was ${a.status})${a.branch ? ` — branch ${a.branch}, worktree ${a.worktreePath}` : ''}${extra}`;
+      const ints = interrupted.filter((x) => x.a.runId === runId);
+      const dets = detached.filter((a) => a.runId === runId);
+      const parts = ['The coagent broker restarted while these workers were in the middle of a turn.'];
+      if (ints.length) {
+        parts.push(`Interrupted (their session is no longer running a turn, or CloudCLI could not tell):\n${
+          ints.map((x) => line(x.a, x.known ? '' : ' — session state unknown: its worktree cannot be deleted for now')).join('\n')}\n\n`
+          + `${ORPHAN_NOTE} For each one, decide:\n`
+          + '- continue or retry it in the same session: send_message it (e.g. "You were interrupted; check the state of '
+          + 'your work and continue the task"), or\n'
+          + '- stop it: end_agent it (add remove_worktree: true to also delete its unmerged worktree). This frees its slot.');
+      }
+      if (dets.length) {
+        parts.push(`Still running in CloudCLI (the broker lost track of the turn but it continues):\n${dets.map((a) => line(a)).join('\n')}\n`
+          + 'Their report_result still reaches you. If one ends without reporting, you will be told.');
+      }
+      store.addMessage(runId, null, lead, 'system', parts.join('\n\n'));
+    }
+    const { requeued } = this.sweepOrphans();
+    if (interrupted.length || detached.length) {
+      this.log('recovery', { interrupted: interrupted.map((x) => x.a.id), detached: detached.map((a) => a.id) });
+    }
+    this.kick();
+    return { interrupted: interrupted.map((x) => x.a.id), detached: detached.map((a) => a.id), requeued: requeued.map((m) => m.id) };
+  }
+
+  /** Follows workers whose turn outlived a restart until CloudCLI reports their session idle. */
+  private async checkDetached() {
+    if (this.checkingDetached || !this.detached.size) return;
+    this.checkingDetached = true;
+    try {
+      const { store } = this.d;
+      for (const [id, due] of [...this.detached]) {
+        if (due > this.now()) continue;
+        const a = store.agent(id);
+        if (!a || a.status !== 'running' || store.run(a.runId)?.status !== 'active') { this.detached.delete(id); continue; }
+        const processing = await this.processing(a);
+        if (processing !== false) { this.detached.set(id, this.now() + DETACHED_CHECK_MS); continue; }
+        this.detached.delete(id);
+        const now = store.agent(id)!;
+        if (now.status !== 'running') continue; // it reported (or was ended) meanwhile
+        store.transaction(() => {
+          store.updateAgent(id, { status: 'idle' });
+          store.addEvent(a.runId, id, 'recovered', { status: 'finished' });
+          store.addMessage(a.runId, null, store.run(a.runId)!.leadAgentId, 'system',
+            `${id}'s turn (still running when the broker restarted) has finished without report_result. `
+            + `Check its work, then send_message it to continue or end_agent it.`);
+        });
+      }
+    } finally {
+      this.checkingDetached = false;
     }
   }
 
@@ -492,7 +805,7 @@ export class Broker {
     this.waiting.delete(leadId);
     this.leases.delete(leadId);
     store.addEvent(runId, leadId, 'wait_end', { mode, reason: a.give_up ? 'timeout' : urgent ? 'urgent' : 'done' });
-    store.markDelivered(inbox.map((m) => m.id), true);
+    store.markDelivered(inbox.map((m) => m.id));
     const still = targets.filter((t) => !finished(t)).map((t) => t.id);
     const tail = still.length
       ? `\n\nStill working: ${still.join(', ')}. Call wait_for_agents again to keep waiting.`
@@ -512,11 +825,15 @@ export class Broker {
     void p.finally(() => this.inflight.delete(p));
   }
 
-  /** Sends one turn to an agent's session through CloudCLI. Resolves true when the turn was accepted and finished. */
-  private async runTurn(agent: AgentDTO, message: string): Promise<boolean> {
+  /**
+   * Sends one turn carrying the claimed (dispatching) messages `msgIds` to an agent's session through CloudCLI.
+   * They become delivered when the turn was accepted and finished, and go back to the queue otherwise.
+   */
+  private async runTurn(agent: AgentDTO, message: string, msgIds: number[]): Promise<boolean> {
     const { store, cloudcli } = this.d;
-    if (store.busy.has(agent.id)) return false;
+    if (store.busy.has(agent.id)) { store.requeue(msgIds); return false; }
     store.busy.add(agent.id);
+    this.dispatches.set(agent.id, msgIds);
     const isLead = agent.role === 'lead';
     if (!isLead) store.updateAgent(agent.id, { status: 'running' });
     let res;
@@ -536,9 +853,16 @@ export class Broker {
           store.activity.set(agent.id, pushActivity(store.activity.get(agent.id) ?? [], event, text, new Date(this.now()).toISOString()));
         },
       );
+    } catch (e) {
+      res = { status: 'error' as const, error: (e as Error).message };
     } finally {
       store.busy.delete(agent.id);
+      this.dispatches.delete(agent.id);
     }
+    // Once CloudCLI accepted the turn the agent has seen the messages and may have acted on them: never re-send
+    // them automatically. Only a 409 or an error before acceptance puts them back in the queue.
+    if (res.status === 'ok' || started) store.completeDispatch(msgIds);
+    else store.requeue(msgIds);
     if (started || res.status === 'ok') {
       store.addEvent(agent.runId, agent.id, 'turn_end', res.status === 'error' ? { ok: false, error: res.error } : { ok: true });
     }
@@ -556,7 +880,8 @@ export class Broker {
       const prev = this.backoff.get(agent.id)?.ms ?? 0;
       const ms = Math.min(BACKOFF_MAX, prev ? prev * 2 : BACKOFF_MIN);
       this.backoff.set(agent.id, { until: this.now() + ms, ms });
-      store.updateAgent(agent.id, { lastError: res.error, ...(isLead ? {} : { status: 'error' }) });
+      const keep = isLead || now.status === 'ended' || now.status === 'interrupted';
+      store.updateAgent(agent.id, { lastError: res.error, ...(keep ? {} : { status: 'error' }) });
       if (!isLead) {
         store.addMessage(agent.runId, null, store.run(agent.runId)!.leadAgentId, 'system', `${agent.id} failed: ${res.error}`);
       }
@@ -575,6 +900,12 @@ export class Broker {
     this.kick();
     return true;
   }
+}
+
+function groupBy<T>(xs: T[], key: (x: T) => string): Map<string, T[]> {
+  const m = new Map<string, T[]>();
+  for (const x of xs) m.set(key(x), [...(m.get(key(x)) ?? []), x]);
+  return m;
 }
 
 export function formatInbox(agentId: string, msgs: MessageDTO[]): string {
