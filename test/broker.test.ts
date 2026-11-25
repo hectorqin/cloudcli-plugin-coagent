@@ -305,6 +305,7 @@ describe('merge gate', () => {
     expect(JSON.stringify(gate)).not.toContain('+hi');
     expect(store.gatePatch(gate.id)).toMatchObject({ stat: expect.stringContaining('hello.txt'), nameStatus: 'A\thello.txt', diff: expect.stringContaining('+hi') });
     expect(broker.gateDiff(gate.id)).toMatchObject({ gate: gate.id, diff: expect.stringContaining('+hi'), truncated: false });
+    const queuedId = store.addMessage(w.runId, store.run(w.runId)!.leadAgentId, w.id, 'message', 'obsolete after merge');
 
     await broker.decideGate(gate.id, true, 'lgtm');
     await broker.settle();
@@ -313,6 +314,7 @@ describe('merge gate', () => {
     expect(sh(repo, 'branch', '--list', w.branch!)).toContain(w.branch!);
     expect(sh(repo, 'rev-parse', 'HEAD^2')).toBe(gate.snapshot!.workerHead);
     expect(store.agent(w.id)!.status).toBe('merged');
+    expect(store.messages(w.runId).find((m) => m.id === queuedId)!.state).toBe('cancelled');
     expect(cc.calls.at(-1)!.message).toMatch(/approved the merge[\s\S]*lgtm/);
     const expectedSnapshot = gate.snapshot;
     store.close();
@@ -389,6 +391,8 @@ describe('merge gate', () => {
     expect(fs.readFileSync(path.join(w.worktreePath!, 'uncommitted.txt'), 'utf8')).toBe('must survive\n');
     expect(fs.existsSync(path.join(repo, 'reviewed.txt'))).toBe(false);
     expect(cc.calls.at(-1)!.message).toMatch(/EXPIRED because worker has uncommitted changes/);
+    await broker.endAgent(w.id, false, null);
+    expect(store.gate(gate.id)!.status).toBe('expired'); // already decided: endAgent must not rewrite it
   });
 
   it('marks binary files and truncates oversized unified diffs', async () => {
@@ -936,6 +940,9 @@ describe('review fixes (rework)', () => {
     expect(a).toMatchObject({ status: 'running', busy: false });
     expect(cc.calls.find((c) => c.sessionId === 'lead-app')!.message).toMatch(/Still running in CloudCLI/);
     expect((await call('wait_for_agents', {})).pending).toBe(true); // still counts as working
+    const merge = await call('request_merge', { worker: w.id });
+    expect(merge.ok).toBe(false);
+    expect(merge.text).toMatch(/still running/); // detached turns count as in-flight even though store.busy is false
     // A rework message is held while the detached turn runs.
     await call('send_message', { to: w.id, body: 'also do y' });
     expect(toWorker(w.id)).toHaveLength(0);
