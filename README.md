@@ -48,3 +48,8 @@ becomes the lead. Approve the plan in the tab; workers appear there; approve mer
   until a session submits a plan).
 
 See `docs/DESIGN.md` for the full design and the verified assumptions behind it.
+
+## License
+
+MIT for the plugin. The files in `patches/` modify CloudCLI and are AGPL-3.0 like CloudCLI itself; see `LICENSE`.
+The patched CloudCLI build lives in the fork: https://github.com/hectorqin/claudecodeui (branch `coagent/v1.37.10-coagent.2`).
