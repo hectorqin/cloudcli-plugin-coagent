@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ToolError, type Broker } from '../src/broker/broker.js';
 import { HttpCloudCli } from '../src/broker/cloudcli.js';
@@ -22,6 +23,10 @@ const fakeBroker = {
   state: () => ({}),
   handleTool: async () => ({ ok: true, text: 'ok' }),
   decideGate: () => { throw new ToolError('Gate #3 is already approved.', 409); },
+  gateDiff: (id: number) => {
+    if (id === 9) throw new ToolError('Gate #9 has no code snapshot.');
+    return { gate: id, diff: 'diff --git a/a b/a', truncated: false };
+  },
   userMessage: () => 'Waiting for a worker slot.',
   endAgent: async (id: string, removeWorktree: boolean) => `Ended ${id}; remove=${removeWorktree}.`,
 } as unknown as Broker;
@@ -98,6 +103,17 @@ describe('broker HTTP hardening and diagnostics', () => {
     expect(result).toMatchObject({ status: 409, body: { error: 'Gate #3 is already approved.' } });
   });
 
+  it('serves gate diffs only to an authorized tab and maps missing snapshots to 4xx', async () => {
+    expect((await request('GET', '/gates/3/diff')).status).toBe(401);
+    const headers = { 'x-plugin-secret-apikey': 'tab-key' };
+    expect(await request('GET', '/gates/3/diff', { headers })).toMatchObject({
+      status: 200, body: { gate: 3, diff: 'diff --git a/a b/a', truncated: false },
+    });
+    expect(await request('GET', '/gates/9/diff', { headers })).toMatchObject({
+      status: 400, body: { error: 'Gate #9 has no code snapshot.' },
+    });
+  });
+
   it('preserves reliability worker message notes and the end-agent route', async () => {
     const headers = { 'x-plugin-secret-apikey': 'tab-key' };
     expect(await request('POST', '/agents/coder-1/messages', { headers, body: '{"body":"continue"}' }))
@@ -129,6 +145,13 @@ describe('broker HTTP hardening and diagnostics', () => {
       db: { path: path.join(tmp, 'coagent.db'), schema: { ok: true }, counts: { runs: {}, agents: {} }, undelivered: { total: 0 } },
       registration: { claude: 'registered', codex: 'registered' }, cloudcli: { ok: true, status: 200 },
     });
+  });
+
+  it('diagnoses a missing merge-snapshot schema column', async () => {
+    const db = (store as unknown as { db: DatabaseSync }).db;
+    db.exec('ALTER TABLE gates DROP COLUMN unified_diff');
+    const result = await request('GET', '/diagnostics', { headers: { 'x-plugin-secret-apikey': 'tab-key' } });
+    expect(result.body).toMatchObject({ db: { schema: { ok: false, missingColumns: { gates: ['unified_diff'] } } } });
   });
 });
 
