@@ -18,7 +18,12 @@ const sh = (cwd: string, ...args: string[]) =>
 class FakeCloudCli implements CloudCli {
   sessions = new Map<string, SessionInfo>(); // by provider id
   calls: SendInput[] = [];
-  next: (SendResult['status'] | 'hold')[] = [];
+  /** 'accepted-error': CloudCLI accepts the turn (session-id announced), then the run fails. */
+  next: (SendResult['status'] | 'hold' | 'accepted-error')[] = [];
+  /** App session ids CloudCLI is running a turn in (held turns). */
+  live = new Set<string>();
+  /** Overrides sessionStatus (e.g. null = host without the endpoint). */
+  status: ((id: string) => boolean | null) | null = null;
   /** Releases for turns started with 'hold' (a worker that keeps working until released). */
   holds: (() => void)[] = [];
   private n = 0;
@@ -36,10 +41,11 @@ class FakeCloudCli implements CloudCli {
         this.sessions.set(`prov-${this.n}`, { appSessionId: app0, providerSessionId: `prov-${this.n}`, provider: input.provider, projectPath: input.projectPath });
       }
       onApp?.(app0);
+      this.live.add(app0);
       await new Promise<void>((r) => this.holds.push(r));
+      this.live.delete(app0);
       return { status: 'ok', appSessionId: app0 };
     }
-    st = st as SendResult['status'];
     if (st === 'error') return { status: 'error', error: 'boom' };
     let app = input.sessionId ?? null;
     if (!app) {
@@ -47,7 +53,11 @@ class FakeCloudCli implements CloudCli {
       this.sessions.set(`prov-${this.n}`, { appSessionId: app, providerSessionId: `prov-${this.n}`, provider: input.provider, projectPath: input.projectPath });
     }
     onApp?.(app);
+    if (st === 'accepted-error') return { status: 'error', error: 'died mid-turn' };
     return { status: 'ok', appSessionId: app };
+  }
+  async sessionStatus(id: string) {
+    return { processing: this.status ? this.status(id) : this.live.has(id) };
   }
   sessionByProviderId(id: string) { return this.sessions.get(id) ?? null; }
   sessionByAppId(app: string) { return [...this.sessions.values()].find((s) => s.appSessionId === app) ?? null; }
@@ -535,7 +545,7 @@ describe('crash recovery', () => {
     store.close();
     clock += advanceMs;
     store = new Store(dbFile());
-    cc = Object.assign(new FakeCloudCli(), { sessions: cc.sessions });
+    cc = Object.assign(new FakeCloudCli(), { sessions: cc.sessions, live: cc.live }); // CloudCLI outlives the broker
     broker = new Broker({ store, cloudcli: cc, git: Git, prompts: filePrompts(PROMPTS), now: () => clock });
     return broker;
   }
@@ -550,7 +560,7 @@ describe('crash recovery', () => {
     expect(m).toMatchObject({ state: 'dispatching', attempts: 1, deliveredAt: null });
 
     // Restart before the lease runs out: not touched yet (another process might still own it).
-    restart(1_000).recover();
+    await restart(1_000).recover();
     await broker.settle();
     expect(store.messages(run.id).find((x) => x.id === m.id)!.state).toBe('dispatching');
     expect(cc.calls).toHaveLength(0);
@@ -572,7 +582,7 @@ describe('crash recovery', () => {
     cc.next.push('hold');
     await broker.decideGate(store.gates(run.id)[0].id, false, 'no');
     await new Promise((r) => setTimeout(r, 0));
-    const res = restart(10 * 60_000).recover();
+    const res = await restart(10 * 60_000).recover();
     expect(res.requeued).toHaveLength(1);
     await broker.settle();
     expect(cc.calls.filter((c) => /REJECTED your plan/.test(c.message))).toHaveLength(1);
@@ -587,7 +597,8 @@ describe('crash recovery', () => {
     await new Promise((x) => setTimeout(x, 0));
     expect(store.agent(id)!.status).toBe('running');
 
-    const res = restart(10 * 60_000).recover();
+    cc.live.clear(); // its CloudCLI turn died too
+    const res = await restart(10 * 60_000).recover();
     await broker.settle();
     expect(res.interrupted).toEqual([id]);
     expect(store.agent(id)!.status).toBe('interrupted');
@@ -618,7 +629,8 @@ describe('crash recovery', () => {
     const r = await broker.handleTool({ tool: 'spawn_agent', args: { role: 'planner', task: 't' }, caller: LEAD });
     const id = r.text.match(/Spawned (\S+)/)![1];
     await new Promise((x) => setTimeout(x, 0));
-    restart(10 * 60_000).recover();
+    cc.live.clear(); // its CloudCLI turn died too
+    await restart(10 * 60_000).recover();
     await broker.settle();
     expect((await call('end_agent', { worker: id })).ok).toBe(true);
     expect(store.agent(id)!.status).toBe('ended');
@@ -629,7 +641,7 @@ describe('crash recovery', () => {
     // Persisted but not dispatched (crash right after the spawn transaction).
     store.createAgent({ id: 'coder-aaaaaa', runId: run.id, role: 'planner', provider: 'claude', cwd: repo, status: 'starting', task: 'plan it' });
     store.addMessage(run.id, run.leadAgentId, 'coder-aaaaaa', 'message', 'plan it');
-    const res = restart().recover();
+    const res = await restart().recover();
     await broker.settle();
     expect(res.interrupted).toEqual([]);
     const first = cc.calls.find((c) => c.message.includes('agent id: coder-aaaaaa'))!;
@@ -659,5 +671,240 @@ describe('crash recovery', () => {
       store.close();
     }
     store = new Store(dbFile());
+  });
+});
+
+describe('review fixes (rework)', () => {
+  const dbFile = () => path.join(tmp, 'db.sqlite');
+  function restart(advanceMs = 0) {
+    store.close();
+    clock += advanceMs;
+    store = new Store(dbFile());
+    cc = Object.assign(new FakeCloudCli(), { sessions: cc.sessions, live: cc.live });
+    broker = new Broker({ store, cloudcli: cc, git: Git, prompts: filePrompts(PROMPTS), now: () => clock });
+    return broker;
+  }
+  async function spawnHeld(role: string, task = 't') {
+    cc.next.push('hold');
+    const r = await broker.handleTool({ tool: 'spawn_agent', args: { role, task }, caller: LEAD });
+    expect(r.ok, r.text).toBe(true);
+    await new Promise((x) => setTimeout(x, 0));
+    return store.agent(r.text.match(/Spawned (\S+)/)![1])!;
+  }
+  const provOf = (id: string) => cc.sessionByAppId(store.agent(id)!.appSessionId!)!.providerSessionId!;
+  const toWorker = (id: string) => cc.calls.filter((c) => c.projectPath === store.agent(id)!.cwd && c.sessionId !== 'lead-app');
+
+  // 1
+  it('report_result acknowledges the dispatch: a crash before the stream closes never re-runs the task', async () => {
+    await startApprovedRun();
+    const w = await spawnHeld('coder', 'write x');
+    const task = store.messages(w.runId).find((m) => m.to === w.id)!;
+    expect(task.state).toBe('dispatching');
+    await broker.handleTool({ tool: 'report_result', args: { summary: 'done', agent_id: w.id }, caller: workerCaller(provOf(w.id)) });
+    expect(store.messages(w.runId).find((m) => m.id === task.id)!.state).toBe('delivered');
+
+    cc.live.clear();
+    const res = await restart(10 * 60_000).recover();
+    await broker.tick(); await broker.settle();
+    clock += 10 * 60_000;
+    await broker.tick(); await broker.settle();
+    expect(res.interrupted).toEqual([]);
+    expect(toWorker(w.id)).toHaveLength(0);
+    expect(store.agent(w.id)!.status).toBe('reported');
+  });
+
+  it('a worker orphan dispatch is closed, never re-queued, even if its status is not running', async () => {
+    await startApprovedRun();
+    const w = await spawnHeld('planner');
+    // Simulate a status change that did not acknowledge the dispatch (older code path).
+    store.updateAgent(w.id, { status: 'reported' });
+    cc.live.clear();
+    await restart(10 * 60_000).recover();
+    clock += 10 * 60_000;
+    await broker.tick(); await broker.settle();
+    expect(toWorker(w.id)).toHaveLength(0);
+    expect(store.dispatching(w.id)).toHaveLength(0);
+    expect(store.undelivered(w.id)).toHaveLength(0);
+  });
+
+  // 2
+  it('a worker still processing in CloudCLI stays running (detached), is followed, and its report still counts', async () => {
+    await startApprovedRun();
+    const w = await spawnHeld('coder');
+    const res = await restart(10 * 60_000).recover(); // live: CloudCLI is still running its turn
+    await broker.settle();
+    expect(res).toMatchObject({ interrupted: [], detached: [w.id] });
+    const a = store.agent(w.id)!;
+    expect(a).toMatchObject({ status: 'running', busy: false });
+    expect(cc.calls.find((c) => c.sessionId === 'lead-app')!.message).toMatch(/Still running in CloudCLI/);
+    expect((await call('wait_for_agents', {})).pending).toBe(true); // still counts as working
+    // A rework message is held while the detached turn runs.
+    await call('send_message', { to: w.id, body: 'also do y' });
+    expect(toWorker(w.id)).toHaveLength(0);
+    // remove_worktree is refused while it is processing.
+    const refused = await call('end_agent', { worker: w.id, remove_worktree: true });
+    expect(refused.ok).toBe(false);
+    expect(refused.text).toMatch(/still running a turn/);
+    expect(fs.existsSync(w.worktreePath!)).toBe(true);
+
+    await broker.handleTool({ tool: 'report_result', args: { summary: 'late result', agent_id: w.id }, caller: workerCaller(provOf(w.id)) });
+    cc.live.clear();
+    clock += 31_000;
+    await broker.tick(); await broker.settle();
+    expect(store.agent(w.id)!.status).not.toBe('interrupted');
+    expect(toWorker(w.id).map((c) => c.message).join()).toMatch(/also do y/); // delivered once the session is free
+  });
+
+  it('a detached turn that ends without reporting moves to idle and the lead is told', async () => {
+    await startApprovedRun();
+    const w = await spawnHeld('planner');
+    await restart(10 * 60_000).recover();
+    await broker.settle();
+    await broker.tick(); await broker.settle();
+    expect(store.agent(w.id)!.status).toBe('running'); // not re-checked before DETACHED_CHECK_MS
+    cc.live.clear();
+    clock += 31_000;
+    await broker.tick(); await broker.settle();
+    expect(store.agent(w.id)!.status).toBe('idle');
+    expect(cc.calls.at(-1)!.message).toMatch(/finished without report_result/);
+  });
+
+  it('unknown session state → interrupted, and its worktree cannot be deleted', async () => {
+    await startApprovedRun();
+    const w = await spawnHeld('coder');
+    restart(10 * 60_000);
+    cc.status = () => null; // host without the session-status endpoint
+    const res = await broker.recover();
+    await broker.settle();
+    expect(res.interrupted).toEqual([w.id]);
+    expect(cc.calls.find((c) => c.sessionId === 'lead-app')!.message).toMatch(/session state unknown/);
+    const r = await call('end_agent', { worker: w.id, remove_worktree: true });
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/cannot confirm/);
+    expect(store.agent(w.id)!.status).toBe('interrupted');
+    expect((await call('end_agent', { worker: w.id })).ok).toBe(true);
+    expect(fs.existsSync(w.worktreePath!)).toBe(true);
+  });
+
+  it('end_agent remove_worktree refuses when CloudCLI says the session is processing', async () => {
+    await startApprovedRun();
+    const w = await spawn('coder');
+    cc.status = () => true; // e.g. the user is typing in its session
+    expect((await call('end_agent', { worker: w.id, remove_worktree: true })).ok).toBe(false);
+    expect(store.agent(w.id)!.status).toBe('idle');
+    cc.status = () => false;
+    expect((await call('end_agent', { worker: w.id, remove_worktree: true })).ok).toBe(true);
+    expect(fs.existsSync(w.worktreePath!)).toBe(false);
+  });
+
+  // 3
+  it('an error after CloudCLI accepted the turn closes the dispatch: no automatic retry', async () => {
+    await startApprovedRun();
+    cc.next.push('accepted-error');
+    const r = await call('spawn_agent', { role: 'planner', task: 'once only' });
+    const id = r.text.match(/Spawned (\S+)/)![1];
+    expect(store.agent(id)).toMatchObject({ status: 'error', lastError: 'died mid-turn' });
+    expect(store.messages(store.agent(id)!.runId).find((m) => m.to === id)!.state).toBe('delivered');
+    expect(cc.calls.at(-1)!.message).toMatch(/failed: died mid-turn/);
+    clock += 10 * 60_000;
+    await broker.tick(); await broker.settle();
+    expect(toWorker(id).filter((c) => /once only/.test(c.message))).toHaveLength(1);
+  });
+
+  it('an error before acceptance still re-queues and retries', async () => {
+    await startApprovedRun();
+    cc.next.push('error');
+    const r = await call('spawn_agent', { role: 'planner', task: 'retry me' });
+    const id = r.text.match(/Spawned (\S+)/)![1];
+    expect(store.undelivered(id)).toHaveLength(1);
+    clock += 10_000;
+    await broker.tick(); await broker.settle();
+    expect(toWorker(id).filter((c) => /retry me/.test(c.message))).toHaveLength(2);
+  });
+
+  // 4
+  it('end_agent is a stop barrier: nothing can start a turn while its worktree is being removed', async () => {
+    await startApprovedRun();
+    const w = await spawn('coder');
+    await call('send_message', { to: w.id, body: 'queued rework' }); // delivered at once (idle)
+    let release!: () => void;
+    const removing = new Promise<void>((r) => { release = r; });
+    broker = new Broker({
+      store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock,
+      git: { ...Git, removeWorktree: async (p: string) => { await removing; return Git.removeWorktree(p); } },
+    });
+    cc.status = () => false;
+    store.addMessage(w.runId, null, w.id, 'message', 'late user message');
+    const ending = broker.endAgent(w.id, true, store.runs()[0].leadAgentId);
+    await new Promise((x) => setTimeout(x, 0));
+    expect(store.agent(w.id)!.status).toBe('ended'); // persisted before the cleanup await
+    const before = toWorker(w.id).length;
+    await broker.tick();
+    expect(() => broker.userMessage(w.id, 'x')).toThrow(/ended/);
+    expect((await broker.handleTool({ tool: 'send_message', args: { to: w.id, body: 'y' }, caller: LEAD })).ok).toBe(false);
+    release();
+    expect(await ending).toMatch(/1 undelivered message\(s\) to it were cancelled[\s\S]*Deleted its worktree/);
+    await broker.settle();
+    expect(toWorker(w.id)).toHaveLength(before);
+    expect(store.messages(w.runId).find((m) => m.body === 'late user message')!.state).toBe('cancelled');
+  });
+
+  it('a failed worktree cleanup is reported but the agent stays ended', async () => {
+    await startApprovedRun();
+    const w = await spawn('coder');
+    broker = new Broker({
+      store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock,
+      git: { ...Git, removeWorktree: async () => { throw new Error('permission denied'); } },
+    });
+    const text = await broker.endAgent(w.id, true, null);
+    expect(text).toMatch(/deleting its worktree .* failed: permission denied/);
+    expect(store.agent(w.id)).toMatchObject({ status: 'ended', worktreePath: w.worktreePath });
+  });
+
+  // 5
+  it('rework for a slot-less worker waits for a free slot; interrupted and pending workers hold one', async () => {
+    await startApprovedRun();
+    const rv = await spawn('reviewer');
+    await call('report_result', { summary: 'lgtm' }, workerCaller(rv.providerSessionId!));
+    const coders = [];
+    for (let i = 0; i < MAX_WORKERS; i++) coders.push(await spawn('coder'));
+    const before = toWorker(rv.id).length;
+    const r = await call('send_message', { to: rv.id, body: 'review again' });
+    expect(r.ok).toBe(true);
+    expect(r.text).toMatch(/worker slots are in use[\s\S]*stays queued/);
+    expect(toWorker(rv.id)).toHaveLength(before);
+    expect((await call('spawn_agent', { role: 'planner', task: 't' })).text).toMatch(/Worker limit/);
+
+    await call('end_agent', { worker: coders[0].id });
+    await broker.tick(); await broker.settle();
+    expect(toWorker(rv.id).map((c) => c.message).join()).toMatch(/review again/);
+  });
+
+  it('an interrupted read-only worker holds its slot', async () => {
+    await startApprovedRun();
+    const p = await spawnHeld('planner');
+    cc.live.clear();
+    await restart(10 * 60_000).recover();
+    await broker.settle();
+    expect(store.agent(p.id)!.status).toBe('interrupted');
+    for (let i = 0; i < MAX_WORKERS - 1; i++) await spawn('coder');
+    expect((await call('spawn_agent', { role: 'coder', task: 't' })).text).toMatch(/Worker limit/);
+  });
+
+  // 6
+  it('an ended worker cannot read its inbox or report, and its queued messages are cancelled', async () => {
+    await startApprovedRun();
+    const w = await spawn('planner');
+    const caller = workerCaller(w.providerSessionId!);
+    store.addMessage(w.runId, null, w.id, 'message', 'never delivered'); // queued, not yet ticked
+    await call('end_agent', { worker: w.id });
+    expect(store.agentsWithUndelivered()).not.toContain(w.id);
+    expect(store.messages(w.runId).find((m) => m.body === 'never delivered')!.state).toBe('cancelled');
+    const inbox = await call('read_inbox', {}, caller);
+    expect(inbox.ok).toBe(false);
+    expect(inbox.text).toMatch(/no longer take part/);
+    expect((await call('report_result', { summary: 'sneaky' }, caller)).ok).toBe(false);
+    expect((await call('send_message', { to: 'lead', body: 'hi' }, caller)).ok).toBe(false);
+    expect(store.agent(w.id)!.status).toBe('ended');
   });
 });

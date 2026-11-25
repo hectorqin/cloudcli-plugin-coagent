@@ -68,6 +68,8 @@ export function buildTimeline(d: RunDetailDTO): Timeline {
       case 'recovered': {
         const label = e.data.status === 'interrupted' ? 'interrupted (broker restart)'
           : e.data.status === 'resumed' ? 'resumed'
+            : e.data.status === 'detached' ? 'still running after broker restart'
+              : e.data.status === 'finished' ? 'turn finished (after restart)'
             : `re-queued ${Array.isArray(e.data.requeued) ? e.data.requeued.length : 0} message(s) after restart`;
         row = { kind: 'node', ts: e.createdAt, lane, label, tone: e.data.status === 'resumed' ? 'accent' : 'warn', shape: 'dot', ref };
         break;
@@ -122,7 +124,7 @@ function messageRow(m: MessageDTO, laneOf: (id: string | null) => number): Row {
   }
   const tone: Tone = m.kind === 'result' ? 'ok' : m.kind === 'gate' ? (/REJECTED|FAILED/.test(m.body) ? 'error' : 'accent') : 'neutral';
   const label = m.kind === 'gate' ? gateLabel(m.body) : firstLine(m.body);
-  return { kind: 'arrow', ts: m.createdAt, from: laneOf(m.from), to: laneOf(m.to), label, tone, pending: !m.deliveredAt, ref };
+  return { kind: 'arrow', ts: m.createdAt, from: laneOf(m.from), to: laneOf(m.to), label, tone, pending: m.state ? m.state === 'queued' || m.state === 'dispatching' : !m.deliveredAt, ref };
 }
 
 function gateLabel(body: string): string {

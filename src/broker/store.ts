@@ -246,6 +246,21 @@ export class Store {
     return (this.db.prepare(`SELECT * FROM messages WHERE delivery_state = 'dispatching' AND (lease_until IS NULL OR lease_until < ?)
       ORDER BY id`).all(now) as Row[]).map(toMessage);
   }
+  /** queued → cancelled for every message still waiting for an agent that will never take a turn again. */
+  cancelQueued(agentId: string): number {
+    return Number(this.db.prepare("UPDATE messages SET delivery_state = 'cancelled' WHERE to_agent = ? AND delivery_state = 'queued'")
+      .run(agentId).changes);
+  }
+  /** Messages waiting for or carried by a turn (they need a worker slot). */
+  pendingCount(agentId: string): number {
+    const r = this.db.prepare("SELECT COUNT(*) AS n FROM messages WHERE to_agent = ? AND delivery_state IN ('queued', 'dispatching')")
+      .get(agentId) as Row;
+    return Number(r.n);
+  }
+  /** Whether a turn was ever started to deliver something to this agent. */
+  everDispatched(agentId: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM messages WHERE to_agent = ? AND attempts > 0 LIMIT 1').get(agentId);
+  }
   /** Messages currently carried by a turn, for one agent. */
   dispatching(agentId: string): MessageDTO[] {
     return (this.db.prepare("SELECT * FROM messages WHERE to_agent = ? AND delivery_state = 'dispatching' ORDER BY id").all(agentId) as Row[])

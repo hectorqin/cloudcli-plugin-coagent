@@ -49,10 +49,11 @@ export type PlanStatus = 'none' | 'pending' | 'approved' | 'rejected';
 export type AgentStatus = 'lead' | 'starting' | 'running' | 'idle' | 'reported' | 'merged' | 'error' | 'ended' | 'interrupted';
 /**
  * Delivery state of a message. queued → dispatching (a turn carrying it was sent, under a lease) → delivered;
- * a 409/error puts it back to queued. Messages handed over inside a tool result (read_inbox, waits) go straight
+ * a 409 or an error before CloudCLI accepted the turn puts it back to queued. `cancelled`: its recipient was
+ * ended or merged before it could be delivered. Messages handed over inside a tool result (read_inbox, waits) go straight
  * from queued to delivered.
  */
-export type DeliveryState = 'queued' | 'dispatching' | 'delivered';
+export type DeliveryState = 'queued' | 'dispatching' | 'delivered' | 'cancelled';
 export type GateKind = 'plan' | 'merge';
 export type GateStatus = 'pending' | 'approved' | 'rejected';
 

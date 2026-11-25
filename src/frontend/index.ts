@@ -269,7 +269,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       const m = d.messages.find((x) => x.id === selected!.id);
       if (!m) return '';
       return `<div class="drawer"><div class="row"><b class="grow">${esc(m.from ?? 'You')} → ${esc(m.to)} · ${esc(m.kind)}</b>
-        <span class="sub">${esc(new Date(m.createdAt).toLocaleString())}${m.deliveredAt ? ` · delivered ${esc(hms(m.deliveredAt))}` : m.state === 'dispatching' ? ' · delivering' : ' · queued'}${m.attempts > 1 ? ` · ${m.attempts} attempts` : ''}</span>${close}</div>
+        <span class="sub">${esc(new Date(m.createdAt).toLocaleString())}${m.deliveredAt ? ` · delivered ${esc(hms(m.deliveredAt))}` : m.state === 'dispatching' ? ' · delivering' : m.state === 'cancelled' ? ' · cancelled' : ' · queued'}${m.attempts > 1 ? ` · ${m.attempts} attempts` : ''}</span>${close}</div>
         <pre>${esc(m.body)}</pre></div>`;
     }
     const e = d.events.find((x) => x.id === selected!.id);
@@ -328,7 +328,10 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       case 'msg': {
         const body = (drafts.get(`msg-${id}`) ?? '').trim();
         if (!body) return;
-        void act(() => api.rpc('POST', `agents/${id}/messages`, { body })).then(() => drafts.delete(`msg-${id}`));
+        void act(async () => {
+          const r = (await api.rpc('POST', `agents/${id}/messages`, { body })) as { note?: string };
+          if (r?.note) error = r.note; // shown in the error banner: queued, waiting for a worker slot
+        }).then(() => drafts.delete(`msg-${id}`));
         break;
       }
       case 'end': {

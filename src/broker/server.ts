@@ -32,10 +32,11 @@ const broker = new Broker({
   setupInfo: () => registration,
 });
 // Before serving: settle what a previous process left mid-flight (orphaned dispatches, workers cut off mid-turn).
-try {
-  const r = broker.recover();
-  if (r.interrupted.length || r.requeued.length) log('startup recovery', r);
-} catch (e) { log('startup recovery failed', e); }
+// Requests wait for it, so no tool call or delivery pass sees half-recovered state.
+const recovered: Promise<void> = broker.recover().then(
+  (r) => { if (r.interrupted.length || r.detached.length || r.requeued.length) log('startup recovery', r); },
+  (e) => log('startup recovery failed', e),
+);
 const token = crypto.randomBytes(24).toString('hex');
 
 class HttpError extends Error { constructor(public code: number, msg: string) { super(msg); } }
@@ -59,6 +60,7 @@ function config() {
 }
 
 async function route(req: http.IncomingMessage, url: URL): Promise<unknown> {
+  await recovered;
   const m = req.method ?? 'GET';
   const p = url.pathname.replace(/\/+$/, '') || '/';
 
@@ -98,8 +100,8 @@ async function route(req: http.IncomingMessage, url: URL): Promise<unknown> {
   }
   if ((mm = p.match(/^\/agents\/([\w-]+)\/messages$/)) && m === 'POST') {
     const b = await readJson(req);
-    broker.userMessage(mm[1], String(b.body ?? ''));
-    return { ok: true };
+    const note = broker.userMessage(mm[1], String(b.body ?? ''));
+    return { ok: true, ...(note ? { note } : {}) };
   }
   if ((mm = p.match(/^\/agents\/([\w-]+)\/end$/)) && m === 'POST') {
     const b = await readJson(req);
@@ -139,7 +141,7 @@ server.listen(0, '127.0.0.1', () => {
   } else {
     registration = { claude: 'auto-register disabled', codex: 'auto-register disabled' };
   }
-  setInterval(() => { void broker.tick(); }, 3000).unref();
+  void recovered.then(() => setInterval(() => { void broker.tick(); }, 3000).unref());
 });
 
 function shutdown() {
