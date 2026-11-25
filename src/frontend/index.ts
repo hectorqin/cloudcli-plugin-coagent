@@ -1,6 +1,7 @@
 /** CoAgent tab. Bundled into one ES module (the host imports it from a Blob URL). */
 import type { AgentDTO, GateDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
 import { buildTimeline, type Ref, type Row, type Timeline, type Tone, USER_LANE } from './timeline.js';
+import { drawerUsageHtml, laneUsageHtml, runUsageHtml, runUsageText } from './usage.js';
 
 interface PluginContext {
   theme: 'dark' | 'light';
@@ -160,7 +161,8 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     return `${header()}${errHtml}<div class="pad" style="padding-top:0">${intro}${runs.length ? `<h3>Runs</h3>${runs.map((r) => `<div class="card row">
       <div class="grow"><b>${esc(r.id)}</b> <span class="badge b-${esc(r.status)}">${esc(r.status)}</span>
         <span class="badge b-${esc(r.planStatus)}">plan ${esc(r.planStatus)}</span>${r.pendingGates ? ` <span class="badge b-pending">${r.pendingGates} waiting for you</span>` : ''}
-        <div class="sub">${esc(r.projectPath)} · ${r.agentCount} agents · ${esc(new Date(r.createdAt).toLocaleString())}</div></div>
+        <div class="sub">${esc(r.projectPath)} · ${r.agentCount} agents · ${esc(new Date(r.createdAt).toLocaleString())}</div>
+        ${r.usage ? `<div class="sub">${esc(runUsageText(r.usage))}</div>` : ''}</div>
       <button data-act="open-run" data-id="${esc(r.id)}">View</button></div>`).join('')}` : ''}</div>`;
   }
 
@@ -170,7 +172,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     const pending = d.gates.filter((g) => g.status === 'pending');
     const top = `<div class="top">${header(`${selectedRun ? '<button data-act="back">All runs</button>' : ''}
         ${ended ? '<span class="badge">ended</span>' : `<button class="danger" data-act="end" data-id="${esc(d.run.id)}">End run</button>`}`)}
-      <div class="sub" style="padding:0 16px 8px">Run <b>${esc(d.run.id)}</b> · ${esc(d.run.projectPath)}</div>
+      <div class="sub" style="padding:0 16px 8px">Run <b>${esc(d.run.id)}</b> · ${esc(d.run.projectPath)}${runUsageHtml(d.run.usage)}</div>
       ${pending.map((g) => `<div class="pending"><span class="grow">Waiting for you: <b>${g.kind === 'plan'
         ? `plan #${g.id} from ${esc(g.requestedBy)}` : `merge ${esc(g.subjectAgent)} (#${g.id})`}</b></span>
         <button class="primary" data-act="select" data-type="gate" data-id="${g.id}">Review</button></div>`).join('')}
@@ -196,7 +198,8 @@ export function mount(container: HTMLElement, api: PluginAPI) {
         ${l.id === USER_LANE ? '' : `data-act="select" data-type="agent" data-id="${esc(l.id)}"`}>
         <b style="color:${LANE_COLORS[i % LANE_COLORS.length]}">${esc(l.label)}${state!.me === l.id ? ' · this session' : ''}</b>
         <div class="sub">${esc(l.sub)}</div>
-        ${a ? `<span class="badge b-${esc(a.status)}">${a.busy ? '<span class="spin"></span> ' : ''}${esc(a.status)}</span>` : ''}</div>`;
+        ${a ? `<span class="badge b-${esc(a.status)}">${a.busy ? '<span class="spin"></span> ' : ''}${esc(a.status)}</span>` : ''}
+        ${a ? laneUsageHtml(a.usage) : ''}</div>`;
     }).join('');
 
     const parts: string[] = [];
@@ -309,6 +312,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
         ${a.appSessionId ? `<button data-act="go" data-id="${esc(a.appSessionId)}">Go to session</button>
           <button data-act="newtab" data-id="${esc(a.appSessionId)}">Open ↗</button>` : ''}${close}</div>
       <div class="sub">${esc(a.cwd)}${a.branch ? ` · ${esc(a.branch)}` : ''}</div>
+      ${drawerUsageHtml(a.usage)}
       ${a.lastError ? `<div class="err sub">${esc(a.lastError)}</div>` : ''}
       ${a.task ? `<h3>Task</h3><pre>${esc(a.task)}</pre>` : ''}
       ${a.result ? `<h3>Result</h3><pre>${esc(a.result)}</pre>` : ''}

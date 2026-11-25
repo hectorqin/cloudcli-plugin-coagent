@@ -24,6 +24,8 @@ export interface SendInput {
 export type SendResult =
   | { status: 'ok'; appSessionId: string | null }
   | { status: 'busy' }
+  /** The user aborted the run in CloudCLI after it was accepted (not a failure; nothing to retry). */
+  | { status: 'aborted'; appSessionId: string | null }
   | { status: 'error'; error: string };
 
 /** Everything the broker needs from CloudCLI. Faked in tests. */
@@ -149,7 +151,11 @@ export class HttpCloudCli implements CloudCli {
 
     let appSessionId: string | null = null;
     let error: string | null = null;
+    let aborted = false;
     for await (const event of sseEvents(res.body)) {
+      // A tab aborted the run: the terminal `complete` says so (createCompleteMessage, shared/utils.ts:535-553), and
+      // the route adds { type: 'status', message: 'Run aborted', aborted: true } (agent.routes.ts:834, :1165-1167).
+      if (event.aborted === true && (event.kind === 'complete' || event.type === 'status')) aborted = true;
       if (event.type === 'session-id' && typeof event.sessionId === 'string') {
         appSessionId = event.sessionId;
         onAppSessionId?.(appSessionId);
@@ -159,6 +165,7 @@ export class HttpCloudCli implements CloudCli {
         onEvent?.(event);
       }
     }
+    if (aborted) return { status: 'aborted', appSessionId };
     return error ? { status: 'error', error } : { status: 'ok', appSessionId };
   }
 

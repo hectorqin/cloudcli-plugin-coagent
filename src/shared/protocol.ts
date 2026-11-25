@@ -89,6 +89,40 @@ export interface RunDTO {
   status: RunStatus;
   planStatus: PlanStatus;
   createdAt: string;
+  /** Totals over every turn the broker ran in this run (lead and workers). */
+  usage: RunUsageDTO;
+}
+
+/**
+ * How a turn ended. Rows exist only for turns CloudCLI accepted: a 409 (busy) or an error before acceptance never
+ * started a turn and writes none. `aborted`: the user stopped it in CloudCLI. `interrupted`: the broker restarted while it
+ * was open. null = still running.
+ */
+export type TurnOutcome = 'ok' | 'error' | 'aborted' | 'interrupted';
+
+/**
+ * Usage of the turns the broker ran for one agent (turns the user drives in the UI are not seen). null = unknown.
+ * Token sums only include turns whose usage is a per-turn bill (Codex); Claude reports context snapshots, which are
+ * never summed (see src/broker/usage.ts).
+ */
+export interface AgentUsageDTO {
+  turns: number;
+  /** Duration of finished turns plus the elapsed time of the running one. */
+  totalMs: number | null;
+  /** Elapsed time of the turn running now, null when none is. */
+  currentTurnMs: number | null;
+  /** Context-window occupancy at the latest snapshot, and the window it is measured against. */
+  lastContextTokens: number | null;
+  contextWindow: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+}
+
+export interface RunUsageDTO {
+  turns: number;
+  totalMs: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
 }
 
 export interface AgentDTO {
@@ -108,6 +142,7 @@ export interface AgentDTO {
   busy: boolean;
   /** Most recent things the agent did in turns the broker ran (newest last; in memory only). */
   activity: { ts: string; text: string }[];
+  usage: AgentUsageDTO;
 }
 
 export interface MessageDTO {

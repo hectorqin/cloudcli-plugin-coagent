@@ -4,10 +4,12 @@ import type { AgentDTO, RunDetailDTO, StateDTO } from '../src/shared/protocol.js
 
 const agent = (id: string, role: string, extra: Partial<AgentDTO> = {}): AgentDTO => ({
   id, runId: 'r', role, provider: 'claude', providerSessionId: null, appSessionId: `app-${id}`, cwd: '/x', branch: null,
-  worktreePath: null, status: 'idle', task: null, result: null, lastError: null, busy: false, activity: [], ...extra,
+  worktreePath: null, status: 'idle', task: null, result: null, lastError: null, busy: false, activity: [],
+  usage: { turns: 0, totalMs: null, currentTurnMs: null, lastContextTokens: null, contextWindow: null, inputTokens: null, outputTokens: null },
+  ...extra,
 });
 const run: RunDetailDTO = {
-  run: { id: 'r', leadAgentId: 'lead', projectPath: '/x', status: 'active', planStatus: 'approved', createdAt: '' },
+  run: { id: 'r', leadAgentId: 'lead', projectPath: '/x', status: 'active', planStatus: 'approved', createdAt: '', usage: { turns: 0, totalMs: null, inputTokens: null, outputTokens: null } },
   agents: [
     agent('lead', 'lead', { status: 'lead' }),
     agent('coder-1', 'coder', { busy: true, status: 'running', activity: [{ ts: '', text: 'Edit: src/a.ts' }, { ts: '', text: 'Bash: npm test' }] }),
