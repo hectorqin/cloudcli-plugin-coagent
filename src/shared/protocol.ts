@@ -59,6 +59,7 @@ export type GateStatus = 'pending' | 'approved' | 'rejected' | 'expired';
 
 export interface MergeSnapshotFile {
   path: string;
+  oldPath: string | null;
   status: string;
   additions: number | null;
   deletions: number | null;
@@ -70,11 +71,15 @@ export interface MergeSnapshot {
   workerHead: string;
   leadHead: string;
   mergeBase: string;
+  files: MergeSnapshotFile[];
+  diffTruncated: boolean;
+}
+
+/** Stored by the broker, but never included in the ordinary state/tool payloads. */
+export interface MergeSnapshotData extends MergeSnapshot {
   stat: string;
   nameStatus: string;
-  files: MergeSnapshotFile[];
   diff: string;
-  diffTruncated: boolean;
 }
 
 export interface RunDTO {

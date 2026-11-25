@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import type {
-  AgentDTO, AgentStatus, DeliveryState, EventDTO, EventType, GateDTO, GateKind, GateStatus, MergeSnapshot, MessageDTO,
-  PlanStatus, Provider, RunDTO,
+  AgentDTO, AgentStatus, DeliveryState, EventDTO, EventType, GateDTO, GateKind, GateStatus, MergeSnapshot,
+  MergeSnapshotData, MessageDTO, PlanStatus, Provider, RunDTO,
 } from '../shared/protocol.js';
 
 type Row = Record<string, unknown>;
@@ -295,7 +295,7 @@ export class Store {
 
   // ── gates ─────────────────────────────────────────────────────────
   addGate(runId: string, kind: GateKind, requestedBy: string, subjectAgent: string | null, payload: string,
-    snapshot: MergeSnapshot | null = null): number {
+    snapshot: MergeSnapshotData | null = null): number {
     const r = this.db.prepare(`INSERT INTO gates (run_id, kind, requested_by, subject_agent, payload, created_at,
       worker_head, lead_head, merge_base, diff_stat, name_status, snapshot_files, unified_diff, diff_truncated)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
@@ -307,6 +307,11 @@ export class Store {
   gate(id: number): GateDTO | null {
     const r = this.db.prepare('SELECT * FROM gates WHERE id = ?').get(id) as Row | undefined;
     return r ? toGate(r) : null;
+  }
+  gatePatch(id: number): Pick<MergeSnapshotData, 'stat' | 'nameStatus' | 'diff' | 'diffTruncated'> | null {
+    const r = this.db.prepare('SELECT diff_stat, name_status, unified_diff, diff_truncated FROM gates WHERE id = ? AND worker_head IS NOT NULL')
+      .get(id) as Row | undefined;
+    return r ? { stat: String(r.diff_stat ?? ''), nameStatus: String(r.name_status ?? ''), diff: String(r.unified_diff ?? ''), diffTruncated: Boolean(r.diff_truncated) } : null;
   }
   gates(runId: string): GateDTO[] {
     return (this.db.prepare('SELECT * FROM gates WHERE run_id = ? ORDER BY id').all(runId) as Row[]).map(toGate);
@@ -369,8 +374,7 @@ function toMessage(r: Row): MessageDTO {
 function toGate(r: Row): GateDTO {
   const snapshot = r.worker_head == null ? null : {
     workerHead: String(r.worker_head), leadHead: String(r.lead_head), mergeBase: String(r.merge_base),
-    stat: String(r.diff_stat ?? ''), nameStatus: String(r.name_status ?? ''),
-    files: JSON.parse(String(r.snapshot_files ?? '[]')) as MergeSnapshot['files'], diff: String(r.unified_diff ?? ''),
+    files: JSON.parse(String(r.snapshot_files ?? '[]')) as MergeSnapshot['files'],
     diffTruncated: Boolean(r.diff_truncated),
   };
   return {

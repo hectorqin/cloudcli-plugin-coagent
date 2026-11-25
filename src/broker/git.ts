@@ -1,8 +1,8 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import type { MergeSnapshot, MergeSnapshotFile } from '../shared/protocol.js';
+import type { MergeSnapshotData, MergeSnapshotFile } from '../shared/protocol.js';
 
 const exec = promisify(execFile);
 export const MAX_UNIFIED_DIFF_BYTES = 200 * 1024;
@@ -20,21 +20,62 @@ function limitedUtf8(text: string, maxBytes: number): { text: string; truncated:
   return { text: bytes.subarray(0, end).toString('utf8'), truncated: true };
 }
 
-function snapshotFiles(nameStatus: string, numstat: string): MergeSnapshotFile[] {
-  // Both git outputs use diff order, including one row per rename. Pairing by position also handles
-  // numstat's compact "old => new" rename path, which differs from name-status's two path columns.
-  const counts = numstat.split('\n').filter(Boolean).map((line) => {
-    const [a, d] = line.split('\t');
-    return { additions: a === '-' ? null : Number(a), deletions: d === '-' ? null : Number(d), binary: a === '-' || d === '-' };
-  });
-  return nameStatus.split('\n').filter(Boolean).map((line, i) => {
-    const [status, ...paths] = line.split('\t');
-    const filePath = paths.at(-1) ?? '';
-    return { path: filePath, status, ...(counts[i] ?? { additions: 0, deletions: 0, binary: false }) };
+/** Runs git while retaining at most maxBytes + one truncation sentinel byte. */
+async function boundedGit(cwd: string, maxBytes: number, ...args: string[]): Promise<{ text: string; truncated: boolean }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    let kept = 0;
+    let truncated = false;
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (kept < maxBytes + 1) {
+        const part = chunk.subarray(0, maxBytes + 1 - kept);
+        chunks.push(part);
+        kept += part.length;
+      }
+      if (kept > maxBytes) { truncated = true; child.kill(); }
+    });
+    child.stderr.on('data', (chunk: Buffer) => errors.push(chunk));
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0 && !truncated) return reject(new Error(Buffer.concat(errors).toString('utf8').trim() || `git exited ${code}`));
+      const limited = limitedUtf8(Buffer.concat(chunks).toString('utf8'), maxBytes);
+      resolve({ text: limited.text.trim(), truncated: truncated || limited.truncated });
+    });
   });
 }
 
-export type MergeResult = { ok: true; commit: string } | { ok: false; reason: string; conflicts: string[] };
+function nulTokens(raw: string): string[] {
+  const out = raw.split('\0');
+  if (out.at(-1) === '') out.pop();
+  return out;
+}
+
+function snapshotFiles(nameStatus: string, numstat: string): MergeSnapshotFile[] {
+  const countTokens = nulTokens(numstat);
+  const counts: { additions: number | null; deletions: number | null; binary: boolean }[] = [];
+  for (let i = 0; i < countTokens.length;) {
+    const header = countTokens[i++];
+    const [a, d, filePath] = header.split('\t');
+    counts.push({ additions: a === '-' ? null : Number(a), deletions: d === '-' ? null : Number(d), binary: a === '-' || d === '-' });
+    // With -z, a rename has an empty path in the header followed by old and new path tokens.
+    if (filePath === '') i += 2;
+  }
+  const files: MergeSnapshotFile[] = [];
+  const names = nulTokens(nameStatus);
+  for (let i = 0; i < names.length;) {
+    const status = names[i++];
+    const renamed = status.startsWith('R') || status.startsWith('C');
+    const oldPath = renamed ? names[i++] : null;
+    const filePath = names[i++];
+    files.push({ path: filePath, oldPath, status, ...(counts[files.length] ?? { additions: 0, deletions: 0, binary: false }) });
+  }
+  return files;
+}
+
+export type MergeResult = { ok: true; commit: string; actualBase: string; baseMoved: boolean }
+  | { ok: false; reason: string; conflicts: string[] };
 
 export const Git = {
   async repoRoot(cwd: string): Promise<string | null> {
@@ -45,25 +86,32 @@ export const Git = {
 
   async head(cwd: string): Promise<string> { return Git.resolve(cwd, 'HEAD'); },
 
+  async status(cwd: string): Promise<string> { return git(cwd, 'status', '--porcelain'); },
+
+  async isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
+    try { await git(cwd, 'merge-base', '--is-ancestor', ancestor, descendant); return true; } catch { return false; }
+  },
+
   /** Canonical identity shared by every worktree of a repository. */
   async commonDir(cwd: string): Promise<string> {
     const common = await git(cwd, 'rev-parse', '--path-format=absolute', '--git-common-dir');
     return fs.promises.realpath(common);
   },
 
-  async mergeSnapshot(leadCwd: string, workerCwd: string, workerRef = 'HEAD'): Promise<MergeSnapshot> {
+  async mergeSnapshot(leadCwd: string, workerCwd: string, workerRef = 'HEAD'): Promise<MergeSnapshotData> {
     const workerHead = await Git.resolve(workerCwd, workerRef);
     const leadHead = await Git.head(leadCwd);
     const mergeBase = await git(leadCwd, 'merge-base', leadHead, workerHead);
     const range = `${mergeBase}..${workerHead}`;
-    const [stat, nameStatus, numstat, fullDiff] = await Promise.all([
+    const [stat, rawNameStatus, numstat, fullDiff] = await Promise.all([
       git(workerCwd, 'diff', '--stat', range),
-      git(workerCwd, 'diff', '--name-status', '--find-renames', range),
-      git(workerCwd, 'diff', '--numstat', '--find-renames', range),
-      git(workerCwd, 'diff', '--no-color', '--no-ext-diff', '--find-renames', range),
+      git(workerCwd, 'diff', '--name-status', '-z', '--find-renames', range),
+      git(workerCwd, 'diff', '--numstat', '-z', '--find-renames', range),
+      boundedGit(workerCwd, MAX_UNIFIED_DIFF_BYTES, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '--find-renames', range),
     ]);
-    const limited = limitedUtf8(fullDiff, MAX_UNIFIED_DIFF_BYTES);
-    return { workerHead, leadHead, mergeBase, stat, nameStatus, files: snapshotFiles(nameStatus, numstat), diff: limited.text, diffTruncated: limited.truncated };
+    const files = snapshotFiles(rawNameStatus, numstat);
+    const nameStatus = files.map((f) => `${f.status}\t${f.oldPath ? `${f.oldPath}\t` : ''}${f.path}`).join('\n');
+    return { workerHead, leadHead, mergeBase, stat, nameStatus, files, diff: fullDiff.text, diffTruncated: fullDiff.truncated };
   },
 
   /**
@@ -106,13 +154,15 @@ export const Git = {
   },
 
   /** Merges an exact commit into whatever the lead has checked out. Aborts cleanly on conflict. */
-  async merge(leadCwd: string, commit: string, message: string): Promise<MergeResult> {
+  async merge(leadCwd: string, commit: string, message: string, expectedHead: string): Promise<MergeResult> {
     if (await git(leadCwd, 'status', '--porcelain', '--untracked-files=no')) {
       return { ok: false, reason: 'the lead working tree has uncommitted changes to tracked files', conflicts: [] };
     }
     try {
       await git(leadCwd, '-c', 'user.name=coagent', '-c', 'user.email=coagent@localhost', 'merge', '--no-ff', '-m', message, commit);
-      return { ok: true, commit: await git(leadCwd, 'rev-parse', 'HEAD') };
+      const merged = await Git.head(leadCwd);
+      const actualBase = await Git.resolve(leadCwd, `${merged}^1`);
+      return { ok: true, commit: merged, actualBase, baseMoved: actualBase !== expectedHead };
     } catch (e) {
       const conflicts = (await git(leadCwd, 'diff', '--name-only', '--diff-filter=U').catch(() => '')).split('\n').filter(Boolean);
       await git(leadCwd, 'merge', '--abort').catch(() => undefined);
@@ -124,7 +174,7 @@ export const Git = {
     const root = await Git.repoRoot(worktreePath);
     if (!root) return;
     const common = await git(worktreePath, 'rev-parse', '--path-format=absolute', '--git-common-dir');
-    await git(path.dirname(common), 'worktree', 'remove', '--force', worktreePath);
+    await git(path.dirname(common), 'worktree', 'remove', worktreePath);
   },
 };
 

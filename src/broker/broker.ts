@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type {
-  AgentDTO, GateDTO, MessageDTO, Provider, RunDetailDTO, StateDTO, ToolRequest, ToolResponse,
+  AgentDTO, GateDTO, MergeSnapshot, MergeSnapshotData, MessageDTO, Provider, RunDetailDTO, StateDTO, ToolRequest, ToolResponse,
 } from '../shared/protocol.js';
 import { SUPPORTED_PROVIDERS } from '../shared/protocol.js';
 import type { CloudCli } from './cloudcli.js';
@@ -98,6 +98,9 @@ const str = (v: unknown, name: string): string => {
   if (typeof v !== 'string' || !v.trim()) fail(`"${name}" is required`);
   return (v as string).trim();
 };
+const snapshotSummary = (s: MergeSnapshotData): MergeSnapshot => ({
+  workerHead: s.workerHead, leadHead: s.leadHead, mergeBase: s.mergeBase, files: s.files, diffTruncated: s.diffTruncated,
+});
 
 export class Broker {
   private backoff = new Map<string, { until: number; ms: number }>();
@@ -272,7 +275,8 @@ export class Broker {
         if (!w!.branch || !w!.worktreePath) fail(`${wid} is a read-only role and has nothing to merge.`);
         if (w!.status === 'merged') fail(`${wid} is already merged.`);
         if (w!.status === 'ended') fail(`${wid} was ended.`);
-        if (store.busy.has(wid)) fail(`${wid} is still running; wait for it to finish before requesting a merge.`);
+        if (w!.status === 'interrupted') fail(`${wid} is interrupted; resume or rework it before requesting a merge.`);
+        if (this.workerInFlight(wid)) fail(`${wid} is still running; wait for it to finish before requesting a merge.`);
         const existing = store.pendingGate(run.id, 'merge', wid);
         if (existing) return `Merge request for ${wid} is already pending as gate #${existing.id}. END YOUR TURN.`;
         const note = typeof a.note === 'string' && a.note.trim() ? a.note.trim() : (w!.result ?? '(no summary)');
@@ -284,7 +288,7 @@ export class Broker {
         return {
           text: `Merge request for ${wid} (${w!.branch} → your checked-out branch) submitted as gate #${id}. `
             + 'END YOUR TURN; the outcome arrives as a new message.',
-          gate: { id, kind: 'merge', title: `Merge ${wid} (${w!.branch}) into ${lead.id}'s branch?`, body: note, snapshot },
+          gate: { id, kind: 'merge', title: `Merge ${wid} (${w!.branch}) into ${lead.id}'s branch?`, body: note, snapshot: snapshotSummary(snapshot) },
         };
       }
 
@@ -403,45 +407,63 @@ export class Broker {
         ? `The user APPROVED your plan (gate #${gate.id}).${fb}\n\nProceed: spawn_agent for each sub-task, then wait_for_agents.`
         : `The user REJECTED your plan (gate #${gate.id}).${fb}\n\nRevise it and call submit_plan again.`, gate.id);
     } else {
-      const w = store.agent(gate.subjectAgent!)!;
+      const workerId = gate.subjectAgent!;
+      const w = store.agent(workerId);
       if (!approve) {
         store.decideGate(gate.id, 'rejected', comment);
-        store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'rejected', comment });
-        store.addMessage(run.id, null, lead, 'gate', `The user REJECTED merging ${w.id} (gate #${gate.id}).${fb}`, gate.id);
+        store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: workerId, status: 'rejected', comment });
+        store.addMessage(run.id, null, lead, 'gate', `The user REJECTED merging ${workerId} (gate #${gate.id}).${fb}`, gate.id);
       } else {
         const leadAgent = store.agent(lead)!;
-        const snapshot = gate.snapshot ?? fail(`Merge gate #${gate.id} has no code snapshot; request_merge again.`);
+        const expire = (reason: string) => {
+          store.decideGate(gate.id, 'expired', comment);
+          store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: workerId, status: 'expired', reason, comment });
+          store.addMessage(run.id, null, lead, 'gate',
+            `The merge gate for ${workerId} (#${gate.id}) EXPIRED because ${reason}. `
+            + `Nothing was merged; call request_merge again to review the current code.${fb}`, gate.id);
+        };
+        const snapshot = gate.snapshot;
+        if (!snapshot) {
+          expire('it was created before code snapshots were recorded');
+          this.kick();
+          return store.gate(gate.id)!;
+        }
         const repoKey = await git.commonDir(leadAgent.cwd);
         await withRepoMutex(repoKey, async () => {
           // A second concurrent approval can be waiting on this lock; honor the decision that got there first.
           if (store.gate(gate.id)?.status !== 'pending') return;
-          if (store.busy.has(w.id)) fail(`${w.id} is still running; wait for it to finish before merging.`);
-          const [workerHead, leadHead] = await Promise.all([git.resolve(w.worktreePath!, w.branch!), git.head(leadAgent.cwd)]);
-          const moved = [workerHead !== snapshot.workerHead ? 'worker branch' : '', leadHead !== snapshot.leadHead ? 'lead branch' : ''].filter(Boolean);
-          if (moved.length) {
-            store.decideGate(gate.id, 'expired', comment);
-            store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'expired', moved, comment });
-            store.addMessage(run.id, null, lead, 'gate',
-              `The merge gate for ${w.id} (#${gate.id}) EXPIRED because the ${moved.join(' and ')} moved after review. `
-              + `Nothing was merged; call request_merge again to review the current code.${fb}`, gate.id);
-            return;
+          if (!w?.branch || !w.worktreePath) { expire('the worker branch or worktree is missing'); return; }
+          if (this.workerInFlight(w.id)) fail(`${w.id} is still running; wait for it to finish before merging.`);
+          let dirty: string;
+          try { dirty = await git.status(w.worktreePath); } catch { expire('the worker branch or worktree is missing'); return; }
+          if (dirty) { expire('worker has uncommitted changes'); return; }
+          let workerHead: string;
+          try { workerHead = await git.resolve(leadAgent.cwd, w.branch); } catch { expire('the worker branch or worktree is missing'); return; }
+          const leadHead = await git.head(leadAgent.cwd);
+          if (workerHead !== snapshot.workerHead) { expire('the worker branch moved after review'); return; }
+          if (!(await git.isAncestor(leadAgent.cwd, snapshot.leadHead, leadHead))) {
+            expire('the lead branch diverged from the reviewed head'); return;
           }
-          const res = await git.merge(leadAgent.cwd, snapshot.workerHead, `coagent: merge ${w.branch} (${w.role} ${w.id})`);
+          const res = await git.merge(leadAgent.cwd, snapshot.workerHead, `coagent: merge ${w.branch} (${w.role} ${w.id})`, leadHead);
           store.decideGate(gate.id, 'approved', comment);
           store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'approved', comment });
           store.addEvent(run.id, w.id, 'merge', res.ok
-            ? { ok: true, commit: res.commit, branch: w.branch, snapshot: snapshot.workerHead }
+            ? { ok: true, commit: res.commit, branch: w.branch, snapshot: snapshot.workerHead, baseMoved: res.baseMoved, actualBase: res.actualBase }
             : { ok: false, reason: res.reason, conflicts: res.conflicts, branch: w.branch, snapshot: snapshot.workerHead });
           if (res.ok) {
+            let removed = true;
             store.transaction(() => {
               store.updateAgent(w.id, { status: 'merged' });
               store.cancelQueued(w.id);
             });
-            await git.removeWorktree(w.worktreePath!).catch((e) => this.log('worktree remove failed', e));
-            store.updateAgent(w.id, { worktreePath: null });
+            await git.removeWorktree(w.worktreePath).catch((e) => { removed = false; this.log('worktree remove failed', e); });
+            if (removed) store.updateAgent(w.id, { worktreePath: null });
+            const raceWarning = res.baseMoved
+              ? ` WARNING: the lead HEAD changed during merge (expected ${leadHead.slice(0, 10)}, actual base ${res.actualBase.slice(0, 10)}); inspect the merge before continuing.`
+              : '';
             store.addMessage(run.id, null, lead, 'gate',
               `The user approved the merge of ${w.id}; merged reviewed commit ${snapshot.workerHead.slice(0, 10)} as ${res.commit.slice(0, 10)}. `
-              + `Its worktree was removed; the branch is kept.${fb}`, gate.id);
+              + `${removed ? 'Its worktree was removed' : 'Its worktree was kept because cleanup failed'}; the branch is kept.${raceWarning}${fb}`, gate.id);
           } else {
             store.addMessage(run.id, null, lead, 'gate',
               `The user approved merging ${w.id}, but the merge FAILED: ${res.reason}.`
@@ -454,6 +476,12 @@ export class Broker {
     }
     this.kick();
     return store.gate(gate.id)!;
+  }
+
+  gateDiff(gateId: number) {
+    const gate = this.d.store.gate(gateId) ?? fail(`No gate #${gateId}`);
+    const patch = this.d.store.gatePatch(gateId) ?? fail(`Gate #${gateId} has no code snapshot.`);
+    return { gate: gate.id, diff: patch.diff, truncated: patch.diffTruncated };
   }
 
   userMessage(agentId: string, body: string) {
@@ -469,6 +497,11 @@ export class Broker {
   }
 
   // ── worker slots ──────────────────────────────────────────────────
+  /** Includes turns owned by this process and turns found running after recovery. */
+  private workerInFlight(agentId: string): boolean {
+    return this.d.store.busy.has(agentId) || this.dispatches.has(agentId) || this.detached.has(agentId);
+  }
+
   /**
    * Whether a worker takes one of the MAX_WORKERS slots: it is working (or its turn outlived a restart), it is
    * interrupted, it has work queued or in flight, or it is a writer whose unmerged worktree could still be merged.

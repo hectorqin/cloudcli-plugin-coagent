@@ -61,12 +61,12 @@ describe('tool cards', () => {
     const merge = {
       id: 8, runId: 'r', kind: 'merge' as const, requestedBy: 'lead', subjectAgent: 'coder-1', payload: 'ready',
       status: 'pending' as const, comment: null, createdAt: '', snapshot: {
-        workerHead: '1234567890abcdef', leadHead: 'abcdef', mergeBase: 'aaaa', stat: '', nameStatus: '',
+        workerHead: '1234567890abcdef', leadHead: 'abcdef', mergeBase: 'aaaa',
         files: [
-          { path: '<script>.ts', status: 'M', additions: 2, deletions: 1, binary: false },
-          { path: 'image.bin', status: 'A', additions: null, deletions: null, binary: true },
+          { path: '<script>.ts', oldPath: null, status: 'M', additions: 2, deletions: 1, binary: false },
+          { path: 'image.bin', oldPath: null, status: 'A', additions: null, deletions: null, binary: true },
         ],
-        diff: '<script>alert(1)</script>', diffTruncated: true,
+        diffTruncated: true,
       },
     };
     const mergeState = { ...state, current: { ...run, gates: [...run.gates, merge] } };
@@ -77,7 +77,7 @@ describe('tool cards', () => {
     expect(html).toContain('-1');
     expect(html).toContain('binary');
     expect(html).toContain('Unified diff (truncated at 200 KB)');
-    expect(html).not.toContain('<script>alert');
+    expect(html).toContain('data-diff="8"');
   });
 
   it('falls back gracefully without state', () => {

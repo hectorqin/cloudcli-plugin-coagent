@@ -152,9 +152,9 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null): string {
       const body = String(kind === 'plan' ? args.plan ?? '' : args.note ?? gate?.payload ?? '');
       const hint = st === 'pending' ? '<div class="cat-a m">Waiting for you: answer the form below, or in the CoAgent tab.</div>' : '';
       const review = kind === 'merge' && gate?.snapshot ? `<div class="cat-a"><div class="m">Reviewed commit ${esc(gate.snapshot.workerHead.slice(0, 10))}</div>
-        <div class="cat-files">${gate.snapshot.files.map((f) => `<div class="cat-file"><span>${esc(f.status)}</span><span class="path">${esc(f.path)}</span>${f.binary
+        <div class="cat-files">${gate.snapshot.files.map((f) => `<div class="cat-file"><span>${esc(f.status)}</span><span class="path">${f.oldPath ? `${esc(f.oldPath)} → ` : ''}${esc(f.path)}</span>${f.binary
           ? '<span>binary</span>' : `<span class="plus">+${f.additions ?? 0}</span><span class="minus">-${f.deletions ?? 0}</span>`}</div>`).join('')}</div>
-        <details><summary>Unified diff${gate.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary><pre>${esc(gate.snapshot.diff)}${gate.snapshot.diffTruncated ? '\n\n[diff truncated]' : ''}</pre></details></div>` : '';
+        <details data-diff="${gate.id}"><summary>Unified diff${gate.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details></div>` : '';
       return head(title, gate?.comment ? `comment: ${gate.comment}` : '', badge)
         + `<div class="cat-a"><details ${st === 'pending' ? 'open' : ''}><summary>${kind === 'plan' ? 'Plan' : 'Note'}</summary><pre>${esc(body)}</pre></details></div>`
         + review + hint + resultBlock;
@@ -198,6 +198,19 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
     const btn = (ev.target as Element).closest<HTMLElement>('[data-open]');
     if (btn) host.openSession(btn.dataset.open!);
   });
+  root.addEventListener('toggle', (ev) => {
+    const el = ev.target as HTMLDetailsElement;
+    if (!el.matches('details[data-diff]') || !el.open || el.dataset.loaded) return;
+    el.dataset.loaded = 'loading';
+    const pre = document.createElement('pre');
+    pre.textContent = 'Loading diff…';
+    el.append(pre);
+    void host.rpc('GET', `gates/${el.dataset.diff}/diff`).then((raw) => {
+      const data = raw as { diff: string; truncated: boolean };
+      pre.textContent = data.diff + (data.truncated ? '\n\n[diff truncated]' : '');
+      el.dataset.loaded = 'true';
+    }, (e) => { pre.textContent = `Could not load diff: ${(e as Error).message}`; delete el.dataset.loaded; });
+  }, true);
 
   draw();
   void refresh(true);

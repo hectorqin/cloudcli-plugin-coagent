@@ -108,7 +108,7 @@ async function decideInline(server: McpServer, opened: ToolResponse, caller: Cal
   const files = gate.snapshot?.files ?? [];
   const fileSummary = files.length ? `\n\nFiles (${files.length}):\n${files.slice(0, 30).map((f) => {
     const counts = f.binary ? 'binary' : `+${f.additions ?? 0} -${f.deletions ?? 0}`;
-    return `- ${f.status} ${f.path} (${counts})`;
+    return `- ${f.status} ${f.oldPath ? `${f.oldPath} -> ` : ''}${f.path} (${counts})`;
   }).join('\n')}${files.length > 30 ? `\n- … and ${files.length - 30} more` : ''}\n\nFull diff in the CoAgent tab.` : '';
   // On promotion the broker prepends the lead protocol; keep it in whatever we return.
   const sep = '\n\n---\n\n';
