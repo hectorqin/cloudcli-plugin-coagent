@@ -139,7 +139,7 @@ export class Broker {
       const out = await this.dispatchTool(req);
       return typeof out === 'string' ? { ok: true, text: out } : { ok: true, ...out };
     } catch (e) {
-      if (!(e instanceof ToolError)) this.log('tool error', req.tool, e);
+      if (!(e instanceof ToolError)) this.log('tool error', { tool: req.tool, error: e });
       return { ok: false, text: e instanceof ToolError ? e.message : `internal error: ${(e as Error).message}` };
     }
   }
@@ -385,7 +385,7 @@ export class Broker {
       });
     });
     store.addEvent(runId, leadId, 'run_started', { provider });
-    this.log('run started', runId, 'lead', leadId);
+    this.log('run started', { runId, agentId: leadId });
     return store.agent(leadId)!;
   }
 
@@ -456,7 +456,10 @@ export class Broker {
               store.updateAgent(w.id, { status: 'merged' });
               store.cancelQueued(w.id);
             });
-            await git.removeWorktree(w.worktreePath).catch((e) => { removed = false; this.log('worktree remove failed', e); });
+            await git.removeWorktree(w.worktreePath).catch((e) => {
+              removed = false;
+              this.log('worktree remove failed', { runId: run.id, agentId: w.id, error: e });
+            });
             if (removed) store.updateAgent(w.id, { worktreePath: null });
             const raceWarning = res.baseMoved
               ? ` WARNING: the lead HEAD changed during merge (expected ${leadHead.slice(0, 10)}, actual base ${res.actualBase.slice(0, 10)}); inspect the merge before continuing.`
@@ -585,7 +588,7 @@ export class Broker {
         store.updateAgent(w.id, { worktreePath: null });
         cleanup = ` Deleted its worktree; branch ${w.branch} is kept.`;
       } catch (e) {
-        this.log('worktree remove failed', w.id, e);
+        this.log('worktree remove failed', { runId: run.id, agentId: w.id, error: e });
         cleanup = ` It is ended, but deleting its worktree ${w.worktreePath} failed: ${(e as Error).message.split('\n')[0]}.`;
       }
     } else if (w.worktreePath) {
@@ -616,7 +619,7 @@ export class Broker {
     if (removeWorktrees) {
       for (const a of store.agents(run.id)) {
         if (a.worktreePath && a.status !== 'merged') {
-          await git.removeWorktree(a.worktreePath).catch((e) => this.log('worktree remove failed', e));
+          await git.removeWorktree(a.worktreePath).catch((e) => this.log('worktree remove failed', { runId: run.id, agentId: a.id, error: e }));
           store.updateAgent(a.id, { worktreePath: null });
         }
       }
@@ -900,6 +903,7 @@ export class Broker {
     const { store, cloudcli } = this.d;
     if (store.busy.has(agent.id)) { store.requeue(msgIds); return false; }
     store.busy.add(agent.id);
+    store.busySince.set(agent.id, this.now());
     this.dispatches.set(agent.id, msgIds);
     const isLead = agent.role === 'lead';
     if (!isLead) store.updateAgent(agent.id, { status: 'running' });
@@ -924,6 +928,7 @@ export class Broker {
       res = { status: 'error' as const, error: (e as Error).message };
     } finally {
       store.busy.delete(agent.id);
+      store.busySince.delete(agent.id);
       this.dispatches.delete(agent.id);
     }
     // Once CloudCLI accepted the turn the agent has seen the messages and may have acted on them: never re-send
@@ -943,7 +948,7 @@ export class Broker {
       return false;
     }
     if (res.status === 'error') {
-      this.log('turn failed', agent.id, res.error);
+      this.log('turn failed', { runId: agent.runId, agentId: agent.id, error: res.error });
       const prev = this.backoff.get(agent.id)?.ms ?? 0;
       const ms = Math.min(BACKOFF_MAX, prev ? prev * 2 : BACKOFF_MIN);
       this.backoff.set(agent.id, { until: this.now() + ms, ms });

@@ -78,6 +78,8 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   let selectedRun: string | null = null;
   let selected: Ref | { type: 'agent'; id: string } | null = null;
   let firstPaint = true;
+  let diagnosticsOpen = false;
+  let diagnostics: unknown = null;
   const drafts = new Map<string, string>();
 
   const applyTheme = () => root.classList.toggle('dark', api.context.theme === 'dark');
@@ -141,7 +143,14 @@ export function mount(container: HTMLElement, api: PluginAPI) {
 
   function header(extra = '') {
     const reg = Object.entries(state!.setup.registration).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(' · ') || 'pending';
-    return `<div class="row pad" style="padding-bottom:8px"><div class="grow"><h2>CoAgent</h2><div class="sub">MCP: ${reg}</div></div>${extra}</div>`;
+    return `<div class="row pad" style="padding-bottom:8px"><div class="grow"><h2>CoAgent</h2><div class="sub">MCP: ${reg}</div></div>
+      <button data-act="diagnostics">${diagnosticsOpen ? 'Hide diagnostics' : 'Diagnostics'}</button>${extra}</div>${diagnosticsView()}`;
+  }
+
+  function diagnosticsView() {
+    if (!diagnosticsOpen) return '';
+    return `<div class="pad" style="padding-top:0"><div class="card"><b>Diagnostics</b>
+      ${diagnostics === null ? '<div class="sub">Loading…</div>' : `<pre>${esc(JSON.stringify(diagnostics, null, 2))}</pre>`}</div></div>`;
   }
 
   function runsView(errHtml: string): string {
@@ -355,9 +364,18 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       case 'setup': {
         const apiKey = (drafts.get('apikey') ?? '').trim();
         if (!apiKey) return;
-        void act(() => api.rpc('POST', 'setup', { apiKey })).then(() => drafts.delete('apikey'));
+        void act(async () => {
+          const proof = await api.rpc('GET', 'setup/nonce') as { nonce?: string };
+          await api.rpc('POST', 'setup', { apiKey, nonce: proof.nonce });
+        }).then(() => drafts.delete('apikey'));
         break;
       }
+      case 'diagnostics':
+        diagnosticsOpen = !diagnosticsOpen;
+        diagnostics = null;
+        render();
+        if (diagnosticsOpen) void api.rpc('GET', 'diagnostics').then((value) => { diagnostics = value; render(); }, (e) => { error = (e as Error).message; render(); });
+        break;
       case 'newtab': window.open(`/session/${encodeURIComponent(id)}`, '_blank', 'noopener'); break;
       case 'go':
         // Navigates the host SPA (React Router listens to popstate).
