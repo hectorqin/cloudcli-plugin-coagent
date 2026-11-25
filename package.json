@@ -1,6 +1,6 @@
 {
   "name": "cloudcli-coagent",
-  "version": "0.3.0-dev",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -10,6 +10,7 @@
   "scripts": {
     "build": "node build.mjs",
     "dev": "node build.mjs --watch",
+    "check:release": "node scripts/check-release.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

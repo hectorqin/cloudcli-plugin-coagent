@@ -1,4 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
+import fs from 'node:fs';
+import path from 'node:path';
 import type {
   AgentDTO, AgentStatus, DeliveryState, EventDTO, EventType, GateDTO, GateKind, GateStatus, MergeSnapshot,
   AgentUsageDTO, MergeSnapshotData, MessageDTO, PlanStatus, Provider, RunDTO, RunUsageDTO, TurnOutcome,
@@ -192,9 +194,50 @@ export class Store {
 
   constructor(file: string, private now: () => Date = () => new Date()) {
     this.db = new DatabaseSync(file);
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
-    this.db.exec(SCHEMA);
-    this.migrate();
+    try {
+      if (this.needsMigration()) this.backupBeforeMigration(file);
+      this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+      this.db.exec(SCHEMA);
+      this.migrate();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
+  }
+
+  /** Whether opening this existing coagent database will apply any schema change. */
+  private needsMigration() {
+    const tables = new Set((this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Row[])
+      .map((row) => String(row.name)).filter((name) => !name.startsWith('sqlite_')));
+    if (tables.size === 0) return false; // A new/empty database has no user state to preserve.
+    if (['runs', 'agents', 'messages', 'gates', 'events', 'kv'].some((table) => !tables.has(table))) return true;
+    const hasColumns = (table: string, required: string[]) => {
+      const columns = new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).map((row) => String(row.name)));
+      return required.every((column) => columns.has(column));
+    };
+    const indexes = new Set((this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Row[])
+      .map((row) => String(row.name)));
+    return !hasColumns('messages', ['gate_id', 'delivery_state', 'attempts', 'lease_until'])
+      || !hasColumns('gates', ['worker_head', 'lead_head', 'merge_base', 'diff_stat', 'name_status',
+        'snapshot_files', 'unified_diff', 'diff_truncated'])
+      || indexes.has('messages_inbox') || !indexes.has('messages_delivery');
+  }
+
+  /** VACUUM INTO includes committed WAL contents in one consistent, standalone SQLite file. */
+  private backupBeforeMigration(file: string) {
+    const dir = path.join(path.dirname(file), 'backups');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const stamp = this.now().toISOString().replace(/[-:.]/g, '');
+    let backup = path.join(dir, `coagent-${stamp}.db`);
+    for (let suffix = 1; fs.existsSync(backup); suffix++) backup = path.join(dir, `coagent-${stamp}-${suffix}.db`);
+    this.db.prepare('VACUUM INTO ?').run(backup);
+    fs.chmodSync(backup, 0o600);
+
+    const backups = fs.readdirSync(dir).filter((name) => /^coagent-.*\.db$/.test(name)).map((name) => {
+      const filename = path.join(dir, name);
+      return { filename, name, mtime: fs.statSync(filename).mtimeMs };
+    }).sort((a, b) => b.mtime - a.mtime || b.name.localeCompare(a.name));
+    for (const old of backups.slice(5)) fs.rmSync(old.filename);
   }
 
   /** Idempotent: safe on fresh and on any older database. Driven by MIGRATIONS. */
