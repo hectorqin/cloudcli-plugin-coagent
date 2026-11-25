@@ -22,6 +22,8 @@ const fakeBroker = {
   state: () => ({}),
   handleTool: async () => ({ ok: true, text: 'ok' }),
   decideGate: () => { throw new ToolError('Gate #3 is already approved.', 409); },
+  userMessage: () => 'Waiting for a worker slot.',
+  endAgent: async (id: string, removeWorktree: boolean) => `Ended ${id}; remove=${removeWorktree}.`,
 } as unknown as Broker;
 
 describe('broker HTTP hardening and diagnostics', () => {
@@ -94,6 +96,14 @@ describe('broker HTTP hardening and diagnostics', () => {
       headers: { 'x-plugin-secret-apikey': 'tab-key' }, body: '{"approve":true}',
     });
     expect(result).toMatchObject({ status: 409, body: { error: 'Gate #3 is already approved.' } });
+  });
+
+  it('preserves reliability worker message notes and the end-agent route', async () => {
+    const headers = { 'x-plugin-secret-apikey': 'tab-key' };
+    expect(await request('POST', '/agents/coder-1/messages', { headers, body: '{"body":"continue"}' }))
+      .toMatchObject({ status: 200, body: { ok: true, note: 'Waiting for a worker slot.' } });
+    expect(await request('POST', '/agents/coder-1/end', { headers, body: '{"removeWorktree":true}' }))
+      .toMatchObject({ status: 200, body: { ok: true, text: 'Ended coder-1; remove=true.' } });
   });
 
   it('requires a fresh, unexpired, one-time setup nonce', async () => {
