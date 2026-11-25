@@ -12,12 +12,18 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import type { Caller, ToolName, ToolResponse } from '../shared/protocol.js';
 import { RUNTIME_FILE } from '../broker/paths.js';
-import { VERSION } from '../shared/version.js';
+import { PROTOCOL_VERSION, VERSION } from '../shared/version.js';
 
 const POLL_MS = 2500;
 const WAIT_LIMIT_MS = 30 * 60 * 1000;
 const GATE_LIMIT_MS = 100 * 60 * 1000;
 const HEARTBEAT_MS = 60 * 1000;
+
+export function protocolMismatch(protocol: number | undefined): string | null {
+  const actual = protocol ?? PROTOCOL_VERSION; // pre-versioning runtimes speak protocol 1
+  return actual === PROTOCOL_VERSION ? null
+    : `CoAgent protocol mismatch: shim uses ${PROTOCOL_VERSION}, broker runtime uses ${actual}. Restart this session to update the coagent tools.`;
+}
 
 export function callerFrom(env: NodeJS.ProcessEnv, meta: Record<string, unknown> | undefined, cwd: string): Caller {
   // Codex metadata is per request, so it wins over an env var that could have leaked in from an outer Claude session.
@@ -33,16 +39,18 @@ export function callerFrom(env: NodeJS.ProcessEnv, meta: Record<string, unknown>
 }
 
 async function call(tool: ToolName, args: Record<string, unknown>, caller: Caller): Promise<ToolResponse> {
-  let rt: { port: number; token: string };
+  let rt: { port: number; token: string; protocol?: number; instance?: string };
   try {
     rt = JSON.parse(fs.readFileSync(RUNTIME_FILE, 'utf8'));
   } catch {
     return { ok: false, text: 'CoAgent broker is not running. Enable the CoAgent plugin in CloudCLI.' };
   }
+  const mismatch = protocolMismatch(rt.protocol);
+  if (mismatch) return { ok: false, text: mismatch };
   try {
     const res = await fetch(`http://127.0.0.1:${rt.port}/mcp/tool`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-coagent-token': rt.token },
+      headers: { 'content-type': 'application/json', 'x-coagent-token': rt.token, 'x-coagent-protocol': String(PROTOCOL_VERSION) },
       body: JSON.stringify({ tool, args, caller }),
     });
     const body = (await res.json()) as ToolResponse | { error: string };

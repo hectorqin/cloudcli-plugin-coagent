@@ -67,6 +67,15 @@ export class HttpCloudCli implements CloudCli {
     return process.env.COAGENT_CLOUDCLI_URL ?? 'http://127.0.0.1:3001';
   }
 
+  async health(timeoutMs = 2000): Promise<{ ok: boolean; status?: number; error?: string }> {
+    try {
+      const res = await (this.opts.fetchImpl ?? fetch)(`${this.baseUrl()}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+      return { ok: res.ok, status: res.status };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  }
+
   /** The API key lives in CloudCLI's plugin secrets; read it fresh each time so edits in Settings apply immediately. */
   private apiKey(): string | null {
     if (process.env.COAGENT_API_KEY) return process.env.COAGENT_API_KEY;

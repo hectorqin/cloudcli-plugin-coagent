@@ -95,6 +95,7 @@ export class Store {
   private db: DatabaseSync;
   /** In-flight dispatches are process-local and intentionally not persisted. */
   readonly busy = new Set<string>();
+  readonly busySince = new Map<string, number>();
   /** Recent activity per agent, captured from the run streams (process-local, like `busy`). */
   readonly activity = new Map<string, { ts: string; text: string; key?: string }[]>();
 
@@ -131,6 +132,43 @@ export class Store {
   }
 
   close() { this.db.close(); }
+
+  diagnostics(now = Date.now()) {
+    const expected: Record<string, string[]> = {
+      runs: ['id', 'lead_agent_id', 'project_path', 'status', 'plan_status', 'created_at', 'ended_at'],
+      agents: ['id', 'run_id', 'role', 'provider', 'status', 'created_at'],
+      messages: ['id', 'run_id', 'to_agent', 'kind', 'body', 'created_at', 'delivered_at', 'gate_id',
+        'delivery_state', 'attempts', 'lease_until'],
+      gates: ['id', 'run_id', 'kind', 'status', 'created_at', 'worker_head', 'lead_head', 'merge_base',
+        'diff_stat', 'name_status', 'snapshot_files', 'unified_diff', 'diff_truncated'],
+      events: ['id', 'run_id', 'type', 'data', 'created_at'],
+      kv: ['k', 'v'],
+    };
+    const missingColumns: Record<string, string[]> = {};
+    const actualColumns: Record<string, string[]> = {};
+    for (const [table, columns] of Object.entries(expected)) {
+      const names = (this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).map((r) => String(r.name));
+      actualColumns[table] = names;
+      const actual = new Set(names);
+      const missing = columns.filter((c) => !actual.has(c));
+      if (missing.length) missingColumns[table] = missing;
+    }
+    const countBy = (table: 'runs' | 'agents') => Object.fromEntries(
+      (this.db.prepare(`SELECT status, COUNT(*) AS count FROM ${table} GROUP BY status`).all() as Row[])
+        .map((r) => [String(r.status), Number(r.count)]),
+    );
+    const undelivered = this.db.prepare('SELECT COUNT(*) AS count FROM messages WHERE delivered_at IS NULL').get() as Row;
+    const undeliveredByAgent = Object.fromEntries((this.db.prepare(
+      'SELECT to_agent, COUNT(*) AS count FROM messages WHERE delivered_at IS NULL GROUP BY to_agent',
+    ).all() as Row[]).map((r) => [String(r.to_agent), Number(r.count)]));
+    return {
+      schema: { ok: Object.keys(missingColumns).length === 0, columns: actualColumns, missingColumns },
+      counts: { runs: countBy('runs'), agents: countBy('agents') },
+      stuckBusy: [...this.busySince.entries()].filter(([, since]) => now - since > 30 * 60_000)
+        .map(([agentId, since]) => ({ agentId, since: new Date(since).toISOString() })),
+      undelivered: { total: Number(undelivered.count), byAgent: undeliveredByAgent },
+    };
+  }
   private ts() { return this.now().toISOString(); }
 
   private txDepth = 0;
