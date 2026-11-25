@@ -196,7 +196,7 @@ export interface RunDetailDTO {
 
 /** Response of GET /state for the tab. */
 export interface StateDTO {
-  setup: { apiKeyConfigured: boolean; registration: Record<string, string> };
+  setup: { apiKeyConfigured: boolean; registration: Record<string, string>; autoRegister: boolean };
   /** Agent id of the session the user is currently viewing, if it belongs to a run. */
   me: string | null;
   current: RunDetailDTO | null;

@@ -1,7 +1,7 @@
 {
   "name": "coagent",
   "displayName": "CoAgent",
-  "version": "0.3.0",
+  "version": "0.3.0-dev",
   "description": "Multi-agent collaboration for CloudCLI: a lead session spawns Claude/Codex workers in git worktrees, with plan and merge gates.",
   "author": "hectorq",
   "icon": "icon.svg",

@@ -1,6 +1,6 @@
 {
   "name": "cloudcli-coagent",
-  "version": "0.3.0",
+  "version": "0.3.0-dev",
   "private": true,
   "type": "module",
   "license": "MIT",

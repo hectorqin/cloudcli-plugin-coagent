@@ -144,7 +144,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
 
   function header(extra = '') {
     const reg = Object.entries(state!.setup.registration).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(' · ') || 'pending';
-    return `<div class="row pad" style="padding-bottom:8px"><div class="grow"><h2>CoAgent</h2><div class="sub">MCP: ${reg}</div></div>
+    return `<div class="row pad" style="padding-bottom:8px"><div class="grow"><h2>CoAgent</h2><div class="sub">MCP: ${reg} · automatic registration ${state!.setup.autoRegister ? 'on' : 'off'}</div></div>
       <button data-act="register">Register MCP</button><button class="danger" data-act="unregister">Unregister MCP</button>
       <button data-act="diagnostics">${diagnosticsOpen ? 'Hide diagnostics' : 'Diagnostics'}</button>${extra}</div>${diagnosticsView()}`;
   }

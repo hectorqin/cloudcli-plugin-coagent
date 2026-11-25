@@ -132,6 +132,15 @@ describe('broker HTTP hardening and diagnostics', () => {
     });
     expect(result).toMatchObject({ status: 200, body: { claude: 'unregister', codex: 'unregister' } });
     expect(registrationAction).toBe('unregister');
+    expect(store.getJson('autoRegister', true)).toBe(false);
+
+    await request('POST', '/registration', {
+      headers: { 'x-plugin-secret-apikey': 'tab-key' }, body: '{"action":"register"}',
+    });
+    expect(store.getJson('autoRegister', false)).toBe(true);
+    expect((await request('POST', '/registration', {
+      headers: { 'x-plugin-secret-apikey': 'tab-key' }, body: '{"action":"invalid"}',
+    })).status).toBe(400);
   });
 
   it('requires a fresh, unexpired, one-time setup nonce', async () => {

@@ -104,7 +104,10 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
 
     const authorized = tabAuthorized(req);
     if (!authorized && !d.cloudcli.apiKeyConfigured()) {
-      if (p === '/state' && method === 'GET') return { setup: { apiKeyConfigured: false, registration: d.registration() }, me: null, current: null, runs: [] };
+      if (p === '/state' && method === 'GET') return {
+        setup: { apiKeyConfigured: false, registration: d.registration(), autoRegister: d.store.getJson('autoRegister', true) },
+        me: null, current: null, runs: [],
+      };
       if (p === '/setup/nonce' && method === 'GET') {
         for (const [value, expires] of nonces) if (expires <= now()) nonces.delete(value);
         while (nonces.size >= MAX_NONCES) nonces.delete(nonces.keys().next().value!);
@@ -142,7 +145,13 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
       if (typeof body.autoRegister === 'boolean') d.store.setJson('autoRegister', body.autoRegister);
       return config();
     }
-    if (p === '/registration' && method === 'POST') return d.register((await readJson(req)).action);
+    if (p === '/registration' && method === 'POST') {
+      const action = (await readJson(req)).action;
+      if (action !== 'register' && action !== 'unregister') throw new HttpError(400, 'action must be "register" or "unregister"');
+      // Persist the user's intent first, so a failed unregister still stops the next startup from re-registering.
+      d.store.setJson('autoRegister', action === 'register');
+      return d.register(action);
+    }
     let match: RegExpMatchArray | null;
     if ((match = p.match(/^\/gates\/(\d+)\/diff$/)) && method === 'GET') return d.broker.gateDiff(Number(match[1]));
     if ((match = p.match(/^\/gates\/(\d+)$/)) && method === 'POST') {

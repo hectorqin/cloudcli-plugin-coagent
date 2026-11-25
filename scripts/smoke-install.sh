@@ -9,10 +9,16 @@ TMP="$(mktemp -d)"
 SERVER_PID=""
 cleanup() {
   if [[ -n "$SERVER_PID" ]]; then
-    kill "$SERVER_PID" 2>/dev/null || true
+    # The broker runs in its own process group (setsid), so this also reaches anything it spawned.
+    kill -TERM -- "-$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
+    for _ in $(seq 1 50); do kill -0 -- "-$SERVER_PID" 2>/dev/null || break; sleep 0.1; done
+    kill -KILL -- "-$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
   fi
-  rm -rf "$TMP"
+  cd "$ROOT"
+  rm -rf -- "$TMP"
+  [[ ! -e "$TMP" ]] || { echo "failed to remove smoke directory: $TMP" >&2; return 1; }
 }
 trap cleanup EXIT
 
@@ -29,9 +35,29 @@ for artifact in dist/index.js dist/server.js dist/mcp-shim.js; do
   [[ -s "$artifact" ]] || { echo "missing build artifact: $artifact" >&2; exit 1; }
 done
 
-mkdir -p "$TMP/home" "$TMP/data"
-HOME="$TMP/home" COAGENT_DATA_DIR="$TMP/data" node dist/server.js >"$TMP/server.out" 2>"$TMP/server.err" &
+mkdir -p "$TMP/home" "$TMP/data" "$TMP/bin"
+# Stub CLIs first on PATH: if auto-registration ran anyway, it would record a call here instead of touching real config.
+for cli in claude codex; do
+  printf '#!/bin/sh\necho "%s $*" >>"%s/stub-calls"\n' "$cli" "$TMP" >"$TMP/bin/$cli"
+  chmod +x "$TMP/bin/$cli"
+done
+BROKER_ENV=(env -i PATH="$TMP/bin:$PATH" HOME="$TMP/home" NODE_ENV=production COAGENT_DATA_DIR="$TMP/data")
+
+# Disable auto-registration with kv autoRegister=false. This partial pre-migration database is intentional: it also
+# exercises the upgrade path (backup, then migration) on startup.
+"${BROKER_ENV[@]}" node -e '
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(process.argv[1]);
+  db.exec("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
+  db.prepare("INSERT INTO kv (k, v) VALUES (?, ?)").run("autoRegister", "false");
+  db.close();
+' "$TMP/data/coagent.db"
+
+# Launch exactly as CloudCLI does: a scrubbed environment, in a new process group so cleanup can kill all of it.
+setsid "${BROKER_ENV[@]}" node dist/server.js >"$TMP/server.out" 2>"$TMP/server.err" &
 SERVER_PID=$!
+[[ "$(ps -o pgid= -p "$SERVER_PID" | tr -d ' ')" == "$SERVER_PID" ]] \
+  || { echo "broker is not its own process group leader" >&2; exit 1; }
 
 ready=""
 for _ in $(seq 1 100); do
@@ -48,4 +74,15 @@ for _ in $(seq 1 100); do
 done
 [[ -n "$ready" ]] || { cat "$TMP/server.err" >&2; echo "broker did not become ready within 10 seconds" >&2; exit 1; }
 
+# Registration starts right after readiness; give it a moment to (wrongly) happen before checking.
+sleep 1
+[[ ! -e "$TMP/stub-calls" ]] || { cat "$TMP/stub-calls" >&2; echo "broker ran registration despite autoRegister=false" >&2; exit 1; }
+backups=("$TMP"/data/backups/coagent-*.db)
+[[ ${#backups[@]} -eq 1 && -s "${backups[0]}" ]] || { echo "expected one pre-migration backup" >&2; exit 1; }
+
+pgid="$SERVER_PID"
+cleanup
+trap - EXIT
+! kill -0 -- "-$pgid" 2>/dev/null || { echo "broker process group still alive after cleanup" >&2; exit 1; }
+[[ ! -e "$TMP" ]] || { echo "smoke directory still exists: $TMP" >&2; exit 1; }
 echo "CloudCLI URL install smoke passed"

@@ -35,10 +35,20 @@ To install, open CloudCLI **Settings → Plugins**, choose the git URL option, a
 clones the repository into `~/.claude-code-ui/plugins/`, runs `npm install`, and then runs `npm run build`. Open the new
 CoAgent tab, create an API key under **Settings → API Keys**, paste it into the tab, and save it. The broker registers
 the MCP shim automatically; the tab also has explicit **Register MCP** and **Unregister MCP** actions.
+**Unregister MCP** also turns automatic registration off, so a restart does not re-register; **Register MCP** turns it
+back on. The tab header shows the current setting.
 
-To upgrade, use the plugin update/reinstall action in **Settings → Plugins** with the same URL and desired tag. CoAgent
-backs up an older database immediately before schema migration and keeps the five newest snapshots under
-`~/.cloudcli-coagent/backups/`. Its state directory is outside the cloned plugin, so reinstalling does not erase runs.
+To upgrade, use the plugin update action in **Settings → Plugins**. CloudCLI fast-forwards its shallow clone of the
+repository's default branch; its URL installer does not select tags. CoAgent backs up an older database immediately
+before schema migration and keeps the five newest snapshots under `~/.cloudcli-coagent/backups/`. Its state directory
+is outside the cloned plugin, so reinstalling does not erase runs.
+
+The backup runs before the broker reports ready, and CloudCLI stops a plugin that is not ready within 10 seconds. Each
+backup's duration and size are logged. If the database is larger than 512 MiB the broker refuses to start rather than
+risk being killed mid-copy, and the error says what to do: copy `~/.cloudcli-coagent/coagent.db` somewhere safe, then
+`touch ~/.cloudcli-coagent/skip-next-backup` and restart the plugin. That marker skips the backup once and is deleted
+when used. (`COAGENT_SKIP_BACKUP=1` does the same when you start `dist/server.js` yourself; CloudCLI does not pass
+custom environment variables to plugins.)
 
 CoAgent writes the following user-level state:
 
@@ -48,9 +58,10 @@ CoAgent writes the following user-level state:
 
 To uninstall safely, first click **Unregister MCP** in the CoAgent tab. Then remove the plugin in **Settings → Plugins**.
 If the tab is no longer available, run `claude mcp remove -s user coagent` and remove only the
-`[mcp_servers.coagent]` section from `~/.codex/config.toml`. Finally, after preserving anything you need, delete
-`~/.cloudcli-coagent/` to remove all run data and backups. Restart existing Claude and Codex sessions so their tool
-lists are refreshed.
+`[mcp_servers.coagent]` section from `~/.codex/config.toml`. You can also delete the one-time
+`~/.codex/config.toml.coagent.bak` after confirming the remaining config is correct. Finally, after preserving anything
+you need, delete `~/.cloudcli-coagent/` to remove all run data and backups. Restart existing Claude and Codex sessions
+so their tool lists are refreshed.
 
 For development, run `npm install && npm test && ./scripts/dev-install.sh`. CloudCLI ignores symlinked plugin folders,
 so the script copies the build into `~/.claude-code-ui/plugins/cloudcli-coagent` and restarts the broker.

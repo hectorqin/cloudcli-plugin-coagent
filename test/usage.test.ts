@@ -110,7 +110,7 @@ describe('usage on chat cards', () => {
     ],
     messages: [], events: [], gates: [],
   };
-  const state = { setup: { apiKeyConfigured: true, registration: {} }, me: 'lead', current: run, runs: [] } as StateDTO;
+  const state = { setup: { apiKeyConfigured: true, registration: {}, autoRegister: true }, me: 'lead', current: run, runs: [] } as StateDTO;
   const ctx = (toolName: string, toolInput: unknown, result: string | null, status: ToolContext['status'] = 'running'): ToolContext => ({
     toolName: `mcp__coagent__${toolName}`, toolId: 't', toolInput, status, theme: 'dark', project: null, sessionId: 'app-lead',
     toolResult: result === null ? null : { content: [{ type: 'text', text: result }], isError: false },
