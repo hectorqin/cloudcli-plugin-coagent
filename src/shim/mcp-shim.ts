@@ -105,6 +105,11 @@ const DECISION_SCHEMA = {
  */
 async function decideInline(server: McpServer, opened: ToolResponse, caller: Caller, extra: Extra) {
   const gate = opened.gate!;
+  const files = gate.snapshot?.files ?? [];
+  const fileSummary = files.length ? `\n\nFiles (${files.length}):\n${files.slice(0, 30).map((f) => {
+    const counts = f.binary ? 'binary' : `+${f.additions ?? 0} -${f.deletions ?? 0}`;
+    return `- ${f.status} ${f.oldPath ? `${f.oldPath} -> ` : ''}${f.path} (${counts})`;
+  }).join('\n')}${files.length > 30 ? `\n- … and ${files.length - 30} more` : ''}\n\nFull diff in the CoAgent tab.` : '';
   // On promotion the broker prepends the lead protocol; keep it in whatever we return.
   const sep = '\n\n---\n\n';
   const prefix = opened.text.includes(sep) ? `${opened.text.split(sep)[0]}${sep}` : '';
@@ -113,7 +118,7 @@ async function decideInline(server: McpServer, opened: ToolResponse, caller: Cal
   extra.signal.addEventListener('abort', () => { formAbort.abort(); watchAbort.abort(); }, { once: true });
 
   const form = server.server.elicitInput(
-    { message: `${gate.title}\n\n${gate.body}`, requestedSchema: DECISION_SCHEMA },
+    { message: `${gate.title}\n\n${gate.body}${fileSummary}`, requestedSchema: DECISION_SCHEMA },
     { signal: formAbort.signal, timeout: GATE_LIMIT_MS },
   ).then((r) => ({ from: 'form' as const, r }), () => ({ from: 'form' as const, r: null }));
   const watch = pollUntilDone('gate_wait', { gate: gate.id }, caller, extra, GATE_LIMIT_MS, watchAbort.signal)

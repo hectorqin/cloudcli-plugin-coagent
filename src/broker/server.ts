@@ -94,6 +94,7 @@ async function route(req: http.IncomingMessage, url: URL): Promise<unknown> {
     return registration;
   }
   let mm: RegExpMatchArray | null;
+  if ((mm = p.match(/^\/gates\/(\d+)\/diff$/)) && m === 'GET') return broker.gateDiff(Number(mm[1]));
   if ((mm = p.match(/^\/gates\/(\d+)$/)) && m === 'POST') {
     const b = await readJson(req);
     return broker.decideGate(Number(mm[1]), b.approve === true, typeof b.comment === 'string' && b.comment.trim() ? b.comment.trim() : null);

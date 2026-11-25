@@ -40,7 +40,7 @@ export interface ToolResponse {
   /** Short status for MCP progress notifications while pending. */
   progress?: string;
   /** A gate was opened; the shim may ask the user inline (MCP elicitation) instead of returning `text`. */
-  gate?: { id: number; kind: GateKind; title: string; body: string };
+  gate?: { id: number; kind: GateKind; title: string; body: string; snapshot?: MergeSnapshot | null };
 }
 
 export type RunStatus = 'active' | 'ended';
@@ -55,7 +55,32 @@ export type AgentStatus = 'lead' | 'starting' | 'running' | 'idle' | 'reported' 
  */
 export type DeliveryState = 'queued' | 'dispatching' | 'delivered' | 'cancelled';
 export type GateKind = 'plan' | 'merge';
-export type GateStatus = 'pending' | 'approved' | 'rejected';
+export type GateStatus = 'pending' | 'approved' | 'rejected' | 'expired';
+
+export interface MergeSnapshotFile {
+  path: string;
+  oldPath: string | null;
+  status: string;
+  additions: number | null;
+  deletions: number | null;
+  binary: boolean;
+}
+
+/** Immutable review material captured when a merge gate is opened. */
+export interface MergeSnapshot {
+  workerHead: string;
+  leadHead: string;
+  mergeBase: string;
+  files: MergeSnapshotFile[];
+  diffTruncated: boolean;
+}
+
+/** Stored by the broker, but never included in the ordinary state/tool payloads. */
+export interface MergeSnapshotData extends MergeSnapshot {
+  stat: string;
+  nameStatus: string;
+  diff: string;
+}
 
 export interface RunDTO {
   id: string;
@@ -109,6 +134,7 @@ export interface GateDTO {
   status: GateStatus;
   comment: string | null;
   createdAt: string;
+  snapshot: MergeSnapshot | null;
 }
 
 export type EventType =
