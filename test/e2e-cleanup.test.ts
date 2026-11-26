@@ -197,6 +197,40 @@ describe('e2e cleanup', () => {
     expect(fs.readFileSync(codexTarget, 'utf8')).toBe('precious');
   });
 
+  it.each([
+    ['a symlinked transcript', (dir: string) => {
+      const target = write(path.join(base, 'outside', 'x.jsonl'));
+      fs.symlinkSync(target, path.join(dir, 'bad.jsonl'));
+      return path.join(dir, 'bad.jsonl');
+    }],
+    ['a dangling symlinked transcript', (dir: string) => {
+      fs.symlinkSync(path.join(base, 'nowhere.jsonl'), path.join(dir, 'bad.jsonl'));
+      return path.join(dir, 'bad.jsonl');
+    }],
+    ['a transcript outside the Claude/Codex roots', () => write(path.join(base, 'elsewhere', 'bad.jsonl'))],
+    ['a symlinked artifact dir', (dir: string) => {
+      fs.symlinkSync(path.join(base, 'outside-dir'), path.join(dir, 'bad'));
+      return write(path.join(dir, 'bad.jsonl'));
+    }],
+  ])('preflight: %s means nothing at all is deleted', async (_name, bad) => {
+    const dir = path.join(claudeRoot, claudeProjectDirName(repo));
+    const safe = write(path.join(dir, 'lead-sess.jsonl'));
+    addSession('lead-sess', repo, safe);
+    const codex = write(path.join(codexRoot, 'rollout-ok.jsonl'));
+    addSession('coder-codex', path.join(tempRoot, 'repo-worktrees', 'wt'), codex);
+    addSession('bad-sess', repo, bad(dir));
+    const res = await cleanupTempRoot(opts(fakeBroker().broker));
+    expect(res.ok).toBe(false);
+    expect(res.removed).toEqual([]);
+    expect(res.problems.length).toBeGreaterThan(0);
+    expect(count('sessions')).toBe(3);
+    expect(count('projects')).toBe(3);
+    expect(fs.existsSync(safe)).toBe(true);
+    expect(fs.existsSync(codex)).toBe(true);
+    expect(fs.existsSync(tempRoot)).toBe(true);
+    expect(res.manual.length).toBeGreaterThan(0);
+  });
+
   it('safeExisting rejects paths outside the root or through a symlink', () => {
     const inside = write(path.join(claudeRoot, 'd', 'f.jsonl'));
     expect(safeExisting(claudeRoot, inside)).toBe(fs.realpathSync(inside));

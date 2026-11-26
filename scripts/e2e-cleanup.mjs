@@ -193,43 +193,73 @@ export async function cleanupTempRoot({
     return { ok: false, endedRuns, rows: {}, removed, kept, problems, manual: manualSteps(tempRoot, runs, rows) };
   }
 
-  // 3. Delete exactly what belongs to the root.
+  // 3. Preflight: validate every deletion target before deleting anything.
+  const plan = planDeletions({ rows, agents, tempRoot, tmpDir, claudeRoot, codexRoot });
+  if (plan.problems.length) {
+    return {
+      ok: false, endedRuns, rows: {}, removed, kept: [...plan.kept, tempRoot], problems: plan.problems,
+      manual: manualSteps(tempRoot, runs, rows),
+    };
+  }
+
+  // 4. Delete exactly the planned targets.
   const counts = deleteDbRows(dbPath, rows);
-  const projectDirs = new Set();
+  for (const file of plan.files) { fs.rmSync(file); removed.push(file); }
+  for (const dir of [...plan.artifactDirs, ...plan.projectDirs]) { fs.rmSync(dir, { recursive: true }); removed.push(dir); }
+  if (plan.root) { fs.rmSync(plan.root, { recursive: true, force: true }); removed.push(plan.root); }
+  return { ok: true, endedRuns, rows: counts, removed, kept: plan.kept, problems: [], manual: [] };
+}
+
+/**
+ * Everything cleanup would delete, all validated up front: transcript files, Claude per-session artifact dirs,
+ * Claude project dirs that would be left without files, and the root. Any invalid target is a problem, and then
+ * nothing at all is deleted. A project dir that still holds someone else's files is merely kept.
+ */
+function planDeletions({ rows, agents, tempRoot, tmpDir, claudeRoot, codexRoot }) {
+  const problems = [];
+  const kept = [];
+  const files = [];
+  const artifactDirs = [];
+  const projectDirs = new Map(); // dir → names planned for deletion inside it
   for (const file of transcriptCandidates(rows, agents, tempRoot, claudeRoot)) {
     const inClaude = isInside(claudeRoot, file);
     const root = inClaude ? claudeRoot : isInside(codexRoot, file) ? codexRoot : null;
-    if (!root || !file.endsWith('.jsonl')) { kept.push(file); problems.push(`not a transcript under the Claude/Codex roots: ${file}`); continue; }
-    if (!fs.existsSync(file)) continue;
-    if (!safeExisting(root, file) || !fs.lstatSync(file).isFile()) { kept.push(file); problems.push(`refusing to follow a symlink: ${file}`); continue; }
-    fs.rmSync(file);
-    removed.push(file);
-    if (inClaude) {
-      // Claude keeps per-session artifacts in a sibling dir named after the session id.
-      const artifacts = file.slice(0, -'.jsonl'.length);
-      if (fs.existsSync(artifacts)) {
-        if (safeExisting(claudeRoot, artifacts) && fs.lstatSync(artifacts).isDirectory()) {
-          fs.rmSync(artifacts, { recursive: true, force: true });
-          removed.push(artifacts);
-        } else { kept.push(artifacts); problems.push(`refusing to follow a symlink: ${artifacts}`); }
-      }
-      if (path.dirname(path.dirname(file)) === path.resolve(claudeRoot)) projectDirs.add(path.dirname(file));
+    if (!root || !file.endsWith('.jsonl')) { problems.push(`not a transcript under the Claude/Codex roots: ${file}`); continue; }
+    if (!fs.existsSync(file) && !isSymlink(file)) continue;
+    if (!safeExisting(root, file) || !fs.lstatSync(file).isFile()) { problems.push(`refusing to follow a symlink: ${file}`); continue; }
+    files.push(file);
+    if (!inClaude) continue;
+    const dir = path.dirname(file);
+    const planned = projectDirs.get(dir) ?? new Set();
+    planned.add(path.basename(file));
+    // Claude keeps per-session artifacts in a sibling dir named after the session id.
+    const artifacts = file.slice(0, -'.jsonl'.length);
+    if (fs.existsSync(artifacts) || isSymlink(artifacts)) {
+      if (safeExisting(claudeRoot, artifacts) && fs.lstatSync(artifacts).isDirectory()) {
+        artifactDirs.push(artifacts);
+        planned.add(path.basename(artifacts));
+      } else problems.push(`refusing to follow a symlink: ${artifacts}`);
     }
+    if (path.dirname(dir) === path.resolve(claudeRoot)) projectDirs.set(dir, planned);
   }
-  // A Claude project dir goes only when no file is left in it (another project may share the lossy name).
+  // A Claude project dir goes only when no file would be left in it (another project may share the lossy name).
   // Claude Code also creates empty folders there (e.g. memory/), which go with it.
-  for (const dir of projectDirs) {
-    if (!fs.existsSync(dir) || !safeExisting(claudeRoot, dir)) continue;
-    if (!onlyEmptyDirs(dir)) { kept.push(dir); continue; }
-    fs.rmSync(dir, { recursive: true });
-    removed.push(dir);
+  const removableDirs = [];
+  for (const [dir, planned] of projectDirs) {
+    if (!safeExisting(claudeRoot, dir)) { problems.push(`refusing to follow a symlink: ${dir}`); continue; }
+    const leftover = fs.readdirSync(dir, { withFileTypes: true })
+      .filter((e) => !planned.has(e.name) && !(e.isDirectory() && onlyEmptyDirs(path.join(dir, e.name))));
+    if (leftover.length) kept.push(dir); else removableDirs.push(dir);
   }
-  if (fs.existsSync(tempRoot)) {
-    assertCleanupRoot(tempRoot, tmpDir);
-    fs.rmSync(tempRoot, { recursive: true, force: true });
-    removed.push(tempRoot);
+  let root = null;
+  if (fs.existsSync(tempRoot) || isSymlink(tempRoot)) {
+    try { assertCleanupRoot(tempRoot, tmpDir); root = tempRoot; } catch (error) { problems.push(error.message); }
   }
-  return { ok: problems.length === 0, endedRuns, rows: counts, removed, kept, problems, manual: problems.length ? manualSteps(tempRoot, runs, rows) : [] };
+  return { problems, kept, files, artifactDirs, projectDirs: removableDirs, root };
+}
+
+function isSymlink(p) {
+  try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; }
 }
 
 function manualSteps(tempRoot, runs, rows) {

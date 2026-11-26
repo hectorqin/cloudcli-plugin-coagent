@@ -30,7 +30,9 @@ runs, pass or fail, from the moment the temp root exists, and only touches that 
    according to CloudCLI (`GET /api/agent/sessions/:id`, waiting up to 60 s for a finishing turn).
 2. If anything is uncertain, it deletes nothing. It prints `CLEANUP INCOMPLETE` with the problems and manual
    steps, and exits non-zero.
-3. Otherwise it deletes the CloudCLI rows (`sessions`, `superseded_provider_sessions`, `scheduled_messages`,
+3. It then validates every deletion target up front (transcripts, artifact dirs, project dirs, the root). If any
+   target is invalid, it deletes nothing, as in step 2.
+4. Otherwise it deletes the CloudCLI rows (`sessions`, `superseded_provider_sessions`, `scheduled_messages`,
    `projects`) whose project path is inside the root, and the exact transcript files named by those rows or by the
    run's own Claude agents. A Claude project dir is removed only if no file is left in it. It never scans by name
    prefix and never follows a symlink. Finally it removes the root.
