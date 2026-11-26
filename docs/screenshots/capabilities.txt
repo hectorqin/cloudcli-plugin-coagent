@@ -1,0 +1,28 @@
+$ curl -s -i -H "x-api-key: ck_xxx" http://localhost:3001/api/agent/capabilities
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "permissionModes": {
+    "claude": [
+      "bypassPermissions",
+      "default",
+      "acceptEdits",
+      "plan"
+    ],
+    "codex": [
+      "bypassPermissions",
+      "default",
+      "acceptEdits"
+    ],
+    "opencode": [
+      "bypassPermissions",
+      "default"
+    ],
+    "cursor": [
+      "bypassPermissions"
+    ]
+  },
+  "unattended": true,
+  "sessionStatus": true
+}
