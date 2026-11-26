@@ -124,31 +124,38 @@ function waitWindows(run: RunDetailDTO): { agents: string[]; end: number | null 
 }
 
 /**
- * Worker ids named in a finished wait_for_agents result: the senders of the delivered messages, plus the broker's tail
- * paragraph ("Still working: …" / "Waited on: …") and the time-limit status line. Only the tail is searched for those,
- * so a message body cannot add names.
+ * The targets of a finished wait_for_agents call, from its result text. Current brokers end every finished wait with
+ * an authoritative "Waited on: a, b." (or "none") line; that list is used as is (`authoritative`). Older results lack
+ * it: then the senders of the delivered messages, the "Still working: …" tail and the time-limit status line are
+ * the best guess (only the tail and status line are searched, so a message body cannot add names there).
  */
-export function waitResultIds(text: string): string[] {
-  const ids = [...text.matchAll(/^### From (\S+) · /gm)].map((m) => m[1]);
+export function waitResultIds(text: string): { ids: string[]; authoritative: boolean } {
   const tail = text.slice(text.lastIndexOf('\n\n') + 1);
-  for (const m of tail.matchAll(/(?:Still working|Waited on): ([^\n]*?)\.(?:\s|$)/g)) ids.push(...m[1].split(','));
+  const waited = tail.match(/^\s*Waited on: ([^\n]*)\.\s*$/);
+  const split = (list: string) => list.split(',').map((x) => x.trim()).filter(Boolean);
+  if (waited) return { ids: waited[1].trim() === 'none' ? [] : split(waited[1]), authoritative: true };
+  const ids = [...text.matchAll(/^### From (\S+) · /gm)].map((m) => m[1]);
+  const still = tail.match(/Still working: ([^\n]*?)\.(?:\s|$)/)?.[1];
+  if (still) ids.push(...split(still));
   const status = text.startsWith('Stopped waiting') ? text.match(/Status: ([^\n]*?)\.(?:\s|$)/)?.[1] : undefined;
   if (status) ids.push(...status.split(', ').map((x) => x.split(':')[0]));
-  return [...new Set(ids.map((x) => x.trim()).filter(Boolean))];
+  return { ids: [...new Set(split(ids.join(',')))], authoritative: false };
 }
 
 /**
  * Ids of the workers one wait_for_agents call is about: its explicit `agents`; while running, the targets of the lead's
- * open wait window; once finished, the workers its result names, else the last finished wait window's targets.
- * null = unknown (the card falls back to the run's active workers).
+ * open wait window; once finished, the result's "Waited on" list, else (legacy results) the workers its result names,
+ * else the last finished wait window's targets. null = unknown (the card falls back to the run's active workers).
  */
 export function waitTargetIds(ctx: ToolContext, run: RunDetailDTO): string[] | null {
   const explicit = Array.isArray(input(ctx).agents) ? (input(ctx).agents as unknown[]).map(String).filter(Boolean) : [];
   if (explicit.length) return explicit;
   const windows = waitWindows(run);
   if (ctx.status === 'running') return windows.findLast((w) => w.end === null)?.agents ?? null;
+  const parsed = waitResultIds(resultText(ctx.toolResult));
+  if (parsed.authoritative) return parsed.ids;
   const known = new Set(workersOf(run).map((a) => a.id));
-  const named = waitResultIds(resultText(ctx.toolResult)).filter((id) => known.has(id));
+  const named = parsed.ids.filter((id) => known.has(id));
   if (named.length) return named;
   return windows.findLast((w) => w.end !== null)?.agents ?? null;
 }

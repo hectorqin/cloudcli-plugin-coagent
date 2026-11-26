@@ -120,12 +120,28 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     const keepTop = container.scrollTop;
     const scroller = root.querySelector<HTMLElement>('.scroll');
     const keepLeft = scroller?.scrollLeft ?? 0;
+    const keepDrawer = root.querySelector<HTMLElement>('.drawer')?.scrollTop ?? 0;
+    // Opened diffs survive the redraw as live DOM (no re-parse/re-highlight; collapsed files and layout are kept).
+    const theme = api.context.theme;
+    const mounted = new Map<number, HTMLElement>();
+    for (const el of root.querySelectorAll<HTMLDetailsElement>('details[data-diff][data-loaded]')) {
+      const host = el.querySelector<HTMLElement>(':scope > .cad-host');
+      if (host && !host.dataset.failed && el.dataset.theme === theme) mounted.set(Number(el.dataset.diff), host);
+    }
     root.innerHTML = view();
     for (const el of root.querySelectorAll<HTMLTextAreaElement | HTMLInputElement>('[data-draft]')) {
       el.value = drafts.get(el.dataset.draft!) ?? '';
       el.addEventListener('input', () => drafts.set(el.dataset.draft!, el.value));
     }
-    for (const el of root.querySelectorAll<HTMLDetailsElement>('details[data-diff]')) if (openDiffs.has(Number(el.dataset.diff))) el.open = true;
+    for (const el of root.querySelectorAll<HTMLDetailsElement>('details[data-diff]')) {
+      const id = Number(el.dataset.diff);
+      if (!openDiffs.has(id)) continue;
+      const host = mounted.get(id);
+      if (host) { el.append(host); el.dataset.loaded = 'true'; el.dataset.theme = theme; }
+      el.open = true; // without a kept host, the toggle event mounts it afresh
+    }
+    const dr = root.querySelector<HTMLElement>('.drawer');
+    if (dr) dr.scrollTop = keepDrawer;
     const sc = root.querySelector<HTMLElement>('.scroll');
     if (sc) sc.scrollLeft = keepLeft;
     container.scrollTop = firstPaint || atBottom ? container.scrollHeight : keepTop;
@@ -410,6 +426,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     openDiffs.add(id);
     if (el.dataset.loaded) return;
     el.dataset.loaded = 'true';
+    el.dataset.theme = api.context.theme;
     const gate = state?.current?.gates.find((g) => g.id === id);
     void mountDiff(el, api.rpc.bind(api), id, { dark: api.context.theme === 'dark', snapshotFiles: gate?.snapshot?.files })
       .then((ok) => { if (!ok) delete el.dataset.loaded; });

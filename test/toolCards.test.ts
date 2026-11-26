@@ -85,18 +85,38 @@ describe('tool cards', () => {
       expect(rest).toContain('old-2');
     });
 
-    it('completed: uses the workers named in the result text', () => {
+    it('completed: uses the authoritative "Waited on" list, not the inbox senders', () => {
       const r = rounds([ev(1, 'wait_start', { agents: ['old-1', 'old-2'] }), ev(2, 'wait_end'),
         ev(3, 'wait_start', { agents: ['new-1', 'new-2'] }), ev(4, 'wait_end')]);
-      const text = '[coagent] 1 new message(s) for lead:\n\n### From new-2 · result\ndone 2\n\nStill working: new-1. Call wait_for_agents again to keep waiting.';
-      const c = ctx('wait_for_agents', {}, text);
+      // Targets new-1 (working) and new-2 (reported); old-2 (not a target) sent an urgent question; new-2's result too.
+      const urgent = '[coagent] 2 new message(s) for lead:\n\n### From old-2 · message\nQuick question\n\n### From new-2 · result\ndone 2'
+        + '\n\nStill working: new-1. Call wait_for_agents again to keep waiting.\n\nWaited on: new-1, new-2.';
+      const c = ctx('wait_for_agents', {}, urgent);
       expect(ids(c, r)).toEqual(['new-1', 'new-2']);
-      expect(cardHtml(c, st(r))).toContain('2 other agents in this run');
-      expect(ids(ctx('wait_for_agents', {}, 'No new messages.\n\nNo targeted worker is still working. Waited on: new-2.'), r)).toEqual(['new-2']);
+      const html = cardHtml(c, st(r));
+      expect(html).toContain('2 other agents in this run');
+      expect(html.split('other agents in this run')[0]).not.toContain('<b>old-2</b>');
+      // mode "any": a non-target's result is delivered too, but is not a target.
+      const any = '[coagent] 2 new message(s) for lead:\n\n### From old-1 · result\nlate\n\n### From new-2 · result\ndone 2'
+        + '\n\nStill working: new-1. Call wait_for_agents again to keep waiting.\n\nWaited on: new-1, new-2.';
+      expect(ids(ctx('wait_for_agents', { mode: 'any' }, any), r)).toEqual(['new-1', 'new-2']);
+      expect(ids(ctx('wait_for_agents', {}, 'No new messages.\n\nNo targeted worker is still working.\n\nWaited on: new-2.'), r)).toEqual(['new-2']);
+      expect(ids(ctx('wait_for_agents', {}, 'Stopped waiting after the time limit. Status: new-1: working.\n\nStill working: new-1. Call wait_for_agents again to keep waiting.\n\nWaited on: new-1.'), r))
+        .toEqual(['new-1']);
+      // Zero targets is authoritative too: everyone is "other".
+      const none = ctx('wait_for_agents', {}, 'There are no active workers to wait for.\n\nWaited on: none.');
+      expect(ids(none, r)).toEqual([]);
+      expect(cardHtml(none, st(r))).toContain('4 other agents in this run');
+    });
+
+    it('completed, legacy result without "Waited on": falls back to the names in the result', () => {
+      const r = rounds([ev(1, 'wait_start', { agents: ['new-1', 'new-2'] }), ev(2, 'wait_end')]);
+      const text = '[coagent] 1 new message(s) for lead:\n\n### From new-2 · result\ndone 2\n\nStill working: new-1. Call wait_for_agents again to keep waiting.';
+      expect(ids(ctx('wait_for_agents', {}, text), r)).toEqual(['new-1', 'new-2']);
       expect(ids(ctx('wait_for_agents', {}, 'Stopped waiting after the time limit. Status: new-1: working, new-2: reported.\n\nStill working: new-1. Call wait_for_agents again to keep waiting.'), r))
         .toEqual(['new-1', 'new-2']);
       // Names inside a message body are not targets.
-      expect(ids(ctx('wait_for_agents', {}, '[coagent] 1 new message(s) for lead:\n\n### From new-2 · result\nStill working: old-1.\n\nNo targeted worker is still working. Waited on: new-2.'), r))
+      expect(ids(ctx('wait_for_agents', {}, '[coagent] 1 new message(s) for lead:\n\n### From new-2 · result\nStill working: old-1.\n\nNo targeted worker is still working.'), r))
         .toEqual(['new-2']);
     });
 

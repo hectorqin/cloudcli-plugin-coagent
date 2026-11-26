@@ -13,6 +13,7 @@ import go from 'highlight.js/lib/languages/go';
 import javascript from 'highlight.js/lib/languages/javascript';
 import json from 'highlight.js/lib/languages/json';
 import markdown from 'highlight.js/lib/languages/markdown';
+import plaintext from 'highlight.js/lib/languages/plaintext';
 import python from 'highlight.js/lib/languages/python';
 import rust from 'highlight.js/lib/languages/rust';
 import typescript from 'highlight.js/lib/languages/typescript';
@@ -35,7 +36,7 @@ let hljsReady = false;
 function highlighter() {
   if (!hljsReady) {
     hljsReady = true;
-    for (const [name, lang] of Object.entries({ bash, css, go, javascript, json, markdown, python, rust, typescript, xml, yaml })) {
+    for (const [name, lang] of Object.entries({ bash, css, go, javascript, json, markdown, plaintext, python, rust, typescript, xml, yaml })) {
       hljs.registerLanguage(name, lang);
     }
     hljs.registerAliases(['sh', 'zsh'], { languageName: 'bash' });
@@ -248,9 +249,20 @@ export function mountDiff(target: HTMLElement, rpc: Rpc, gateId: number, opts: {
 
   const draw = () => {
     if (!data) return;
-    host.innerHTML = diffPanelHtml(data.diff, { layout, dark: opts.dark, truncated: data.truncated, snapshotFiles: opts.snapshotFiles });
-    const ui = new Diff2HtmlUI(host, undefined, { highlight: true, synchronisedScroll: true, fileContentToggle: true }, highlighter());
-    ui.highlightCode();
+    const d = data;
+    const render = () => {
+      host.innerHTML = diffPanelHtml(d.diff, { layout, dark: opts.dark, truncated: d.truncated, snapshotFiles: opts.snapshotFiles });
+      return new Diff2HtmlUI(host, undefined, { highlight: true, synchronisedScroll: true, fileContentToggle: true }, highlighter());
+    };
+    let ui = render();
+    try {
+      ui.highlightCode();
+    } catch (e) {
+      // Highlighting is a nicety: on any highlighter error, show the same diff without it (re-rendered, so no line is
+      // left half-highlighted).
+      console.warn('[coagent] diff highlighting failed; showing it unhighlighted', e);
+      ui = render();
+    }
     ui.synchronisedScroll();
     ui.fileContentToggle();
   };
@@ -273,8 +285,19 @@ export function mountDiff(target: HTMLElement, rpc: Rpc, gateId: number, opts: {
     }
   });
 
-  return loadDiff(rpc, gateId).then((d) => { data = d; draw(); return true; }, (e) => {
+  return loadDiff(rpc, gateId).then((d) => {
+    data = d;
+    try {
+      draw();
+      return true;
+    } catch (e) {
+      host.textContent = `Could not render diff: ${(e as Error).message}`;
+      host.dataset.failed = 'true';
+      return false;
+    }
+  }, (e) => {
     host.textContent = `Could not load diff: ${(e as Error).message}`;
+    host.dataset.failed = 'true';
     return false;
   });
 }
