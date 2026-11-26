@@ -78,6 +78,47 @@ describe('workspace cleanup controls', () => {
     expect(container.textContent).toContain('Delete');
   });
 
+  it('cards and tab drawers restore archived and deleted cleanup state from recorded events', async () => {
+    const withEvent = (type: 'workspace_archived' | 'workspace_deleted') => {
+      const copy = structuredClone(state);
+      copy.current!.events.push({
+        id: 2, runId: 'r', agentId: writer.id, type, data: { kind: 'project', projectPath: writer.cwd }, createdAt: '2026-01-01T00:01:00Z',
+      });
+      return copy;
+    };
+    const hostActions = {
+      archiveProject: vi.fn(async () => ({ ok: true as const })), deleteProject: vi.fn(async () => undefined),
+    };
+
+    for (const [type, label] of [['workspace_archived', 'Archived'], ['workspace_deleted', 'Deleted']] as const) {
+      const recorded = withEvent(type);
+      const card = document.createElement('div');
+      document.body.append(card);
+      const cardView = renderTool(card, { ...context, sessionId: `recorded-${type}` }, {
+        rpc: vi.fn(async () => recorded), openSession: vi.fn(), ...hostActions,
+      });
+      await vi.waitFor(() => expect(card.textContent).toContain(label));
+      expect(card.querySelector('[data-clean="archive"]')).toBeNull();
+      if (type === 'workspace_archived') expect(card.querySelector('[data-clean="delete"]')).not.toBeNull();
+      else expect(card.querySelector('[data-clean="delete"]')).toBeNull();
+      cardView.destroy();
+      card.remove();
+
+      const tab = document.createElement('div');
+      document.body.append(tab);
+      mount(tab, { context: { theme: 'light', project: null, session: { id: 'lead-session', title: '' } }, onContextChange: () => () => {},
+        rpc: vi.fn(async () => recorded), ...hostActions });
+      await vi.waitFor(() => expect(tab.querySelector('[data-type="agent"][data-id="coder-1"]')).not.toBeNull());
+      tab.querySelector<HTMLElement>('[data-type="agent"][data-id="coder-1"]')!.click();
+      expect(tab.textContent).toContain(label);
+      expect(tab.querySelector('[data-act="archive"]')).toBeNull();
+      if (type === 'workspace_archived') expect(tab.querySelector('[data-act="delete-project"]')).not.toBeNull();
+      else expect(tab.querySelector('[data-act="delete-project"]')).toBeNull();
+      unmount();
+      tab.remove();
+    }
+  });
+
   it('guards unsafe paths before any host call', async () => {
     const unsafe = structuredClone(state);
     unsafe.current!.agents.find((a) => a.id === writer.id)!.cwd = '/projects/repo';
