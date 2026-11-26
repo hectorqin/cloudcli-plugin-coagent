@@ -84,6 +84,9 @@ export function describeEvent(e: Record<string, unknown>): string | null {
 }
 const BACKOFF_MAX = 60_000;
 
+/** A worktree endRun kept: the agent may still be writing in it, or the path no longer provably belongs to the run. */
+export interface FailedWorktree { agentId: string; path: string; reason: string }
+
 export interface BrokerDeps {
   store: Store;
   cloudcli: CloudCli;
@@ -120,6 +123,8 @@ export class Broker {
   private detached = new Map<string, number>();
   /** Turn rows (store `turns`) this process has open. Any other open row was left by a process that is gone. */
   private openTurns = new Set<number>();
+  /** Runs inside endRun: set synchronously on entry, so no turn starts while endRun waits for the repository lock. */
+  private ending = new Map<string, number>();
   private checkingDetached = false;
   private now: () => number;
   private log: (...args: unknown[]) => void;
@@ -164,6 +169,8 @@ export class Broker {
       preface = this.d.prompts.lead({ run_id: run.id, agent_id: me.id, max_workers: String(MAX_WORKERS) }) + '\n\n---\n\n';
     }
     if (!me) {
+      const ended = this.endedRunAnswer(req);
+      if (ended !== null) return ended;
       fail('You are not part of a coagent run. A run starts when a session calls submit_plan (it becomes the lead).');
     }
     const agent = me!;
@@ -225,6 +232,8 @@ export class Broker {
           // Agent, spawn event and task message land together, before any dispatch: a crash after this point
           // leaves a queued task that is delivered (or recovered) like any other message.
           store.transaction(() => {
+            // ended (or is ending) while the worktree was created
+            if (store.run(run.id)?.status !== 'active' || this.ending.has(run.id)) fail('This run has ended.');
             full(); // re-checked: another spawn may have finished while the worktree was created
             store.createAgent({ id, runId: run.id, role, provider, cwd, branch, worktreePath, status: 'starting', task });
             store.addEvent(run.id, id, 'spawned', { by: lead.id, role, provider, branch });
@@ -284,14 +293,22 @@ export class Broker {
         if (w!.status === 'ended') fail(`${wid} was ended.`);
         if (w!.status === 'interrupted') fail(`${wid} is interrupted; resume or rework it before requesting a merge.`);
         if (this.workerInFlight(wid)) fail(`${wid} is still running; wait for it to finish before requesting a merge.`);
-        const existing = store.pendingGate(run.id, 'merge', wid);
-        if (existing) return `Merge request for ${wid} is already pending as gate #${existing.id}. END YOUR TURN.`;
         const note = typeof a.note === 'string' && a.note.trim() ? a.note.trim() : (w!.result ?? '(no summary)');
         const worktreePath = w!.worktreePath!;
-        await this.d.git.commitAll(worktreePath, `coagent: uncommitted work from ${w!.id}`);
-        const snapshot = await this.d.git.mergeSnapshot(lead.cwd, worktreePath, w!.branch!);
-        const id = store.addGate(run.id, 'merge', agent.id, wid, note, snapshot);
-        store.addEvent(run.id, agent.id, 'gate_opened', { gate: id, kind: 'merge', subject: wid });
+        // Serialized with merges and endRun on this repository: the worktree cannot be removed under us.
+        const opened = await this.withLeadRepo(lead, async () => {
+          if (store.run(run.id)?.status !== 'active') fail('This run has ended.');
+          const existing = store.pendingGate(run.id, 'merge', wid);
+          if (existing) return existing.id;
+          await this.d.git.commitAll(worktreePath, `coagent: uncommitted work from ${w!.id}`);
+          const snapshot = await this.d.git.mergeSnapshot(lead.cwd, worktreePath, w!.branch!);
+          if (store.run(run.id)?.status !== 'active') fail('This run has ended.');
+          const gateId = store.addGate(run.id, 'merge', agent.id, wid, note, snapshot);
+          store.addEvent(run.id, agent.id, 'gate_opened', { gate: gateId, kind: 'merge', subject: wid });
+          return { gateId, snapshot };
+        });
+        if (typeof opened === 'number') return `Merge request for ${wid} is already pending as gate #${opened}. END YOUR TURN.`;
+        const { gateId: id, snapshot } = opened;
         return {
           text: `Merge request for ${wid} (${w!.branch} → your checked-out branch) submitted as gate #${id}. `
             + 'END YOUR TURN; the outcome arrives as a new message.',
@@ -435,10 +452,10 @@ export class Broker {
           this.kick();
           return store.gate(gate.id)!;
         }
-        const repoKey = await git.commonDir(leadAgent.cwd);
-        await withRepoMutex(repoKey, async () => {
-          // A second concurrent approval can be waiting on this lock; honor the decision that got there first.
+        await this.withLeadRepo(leadAgent, async () => {
+          // A second concurrent approval, or endRun, can have got this lock first; honor whatever happened then.
           if (store.gate(gate.id)?.status !== 'pending') return;
+          if (store.run(run.id)?.status !== 'active') return;
           if (!w?.branch || !w.worktreePath) { expire('the worker branch or worktree is missing'); return; }
           if (this.workerInFlight(w.id)) fail(`${w.id} is still running; wait for it to finish before merging.`);
           let dirty: string;
@@ -620,36 +637,117 @@ export class Broker {
     return fail(`could not allocate a unique id for ${prefix}`);
   }
 
-  /** Ends a run. Returns the worktrees that could not be deleted; they stay recorded so a retry can find them. */
-  async endRun(runId: string, removeWorktrees: boolean): Promise<{ failedWorktrees: { agentId: string; path: string; error: string }[] }> {
-    const { store, git } = this.d;
+  /**
+   * Ends a run (the user, from the tab). Under the lead repository's lock, so it never interleaves with a merge:
+   *  1. stop barrier (no await): pending gates expire, queued messages are cancelled, the run and its agents end,
+   *     so nothing can start a new turn;
+   *  2. with `removeWorktrees`, each worktree is deleted only if its agent is provably not running a turn and the
+   *     path is still that agent's worktree of the lead repository. Anything else is kept and returned.
+   * Calling it again on an ended run retries the cleanup.
+   */
+  async endRun(runId: string, removeWorktrees: boolean): Promise<{ failedWorktrees: FailedWorktree[] }> {
+    const { store } = this.d;
     const run = store.run(runId) ?? fail(`No run ${runId}`);
-    const failedWorktrees: { agentId: string; path: string; error: string }[] = [];
-    if (removeWorktrees) {
-      for (const a of store.agents(run.id)) {
-        if (!a.worktreePath) continue; // includes a merged worker whose post-merge removal failed
-        try {
-          await git.removeWorktree(a.worktreePath);
-          store.updateAgent(a.id, { worktreePath: null });
-        } catch (e) {
-          this.log('worktree remove failed', { runId: run.id, agentId: a.id, error: e });
-          failedWorktrees.push({ agentId: a.id, path: a.worktreePath, error: (e as Error).message.split('\n')[0] });
-        }
-      }
+    const lead = store.agent(run.leadAgentId)!;
+    this.ending.set(run.id, (this.ending.get(run.id) ?? 0) + 1);
+    try {
+      return await this.withLeadRepo(lead, () => this.endRunLocked(run.id, lead, removeWorktrees));
+    } finally {
+      const left = (this.ending.get(run.id) ?? 1) - 1;
+      if (left > 0) this.ending.set(run.id, left); else this.ending.delete(run.id);
     }
+  }
+
+  private async endRunLocked(runId: string, lead: AgentDTO, removeWorktrees: boolean): Promise<{ failedWorktrees: FailedWorktree[] }> {
+    const { store } = this.d;
+    const stopped = this.stopRun(runId);
+    const failedWorktrees = removeWorktrees ? await this.removeRunWorktrees(runId, lead) : [];
+    if (stopped) {
+      store.addEvent(runId, null, 'run_ended', failedWorktrees.length ? { removeWorktrees, failedWorktrees } : { removeWorktrees });
+    }
+    if (failedWorktrees.length) this.log('run worktrees kept', { runId, failedWorktrees });
+    return { failedWorktrees };
+  }
+
+  /** The stop barrier of endRun. Synchronous on purpose. False when the run had already ended. */
+  private stopRun(runId: string): boolean {
+    const { store } = this.d;
+    const run = store.run(runId);
+    if (!run || run.status !== 'active') return false;
     store.transaction(() => {
-      // Nothing can decide these gates or deliver these messages once the run has ended.
       for (const gate of store.gates(run.id).filter((g) => g.status === 'pending')) {
-        store.decideGate(gate.id, 'expired', 'run ended');
+        if (!store.decideGate(gate.id, 'expired', 'run ended')) continue;
         store.addEvent(run.id, null, 'gate_decided', {
           gate: gate.id, kind: gate.kind, subject: gate.subjectAgent, status: 'expired', reason: 'the run ended', comment: null,
         });
       }
       for (const a of store.agents(run.id)) store.cancelQueued(a.id);
       store.endRun(run.id);
-      store.addEvent(run.id, null, 'run_ended', failedWorktrees.length ? { removeWorktrees, failedWorktrees } : { removeWorktrees });
     });
-    return { failedWorktrees };
+    // A lead blocked in wait_for_agents stops waiting now; its next poll is told the run ended.
+    if (this.waiting.delete(run.leadAgentId)) store.addEvent(run.id, run.leadAgentId, 'wait_end', { reason: 'run_ended' });
+    this.leases.delete(run.leadAgentId);
+    return true;
+  }
+
+  private async removeRunWorktrees(runId: string, lead: AgentDTO): Promise<FailedWorktree[]> {
+    const { store, git } = this.d;
+    const failed: FailedWorktree[] = [];
+    for (const a of store.agents(runId)) {
+      if (!a.worktreePath) continue; // includes a merged worker whose post-merge removal failed
+      const busy = await this.stillWorking(a);
+      if (busy) { failed.push({ agentId: a.id, path: a.worktreePath, reason: busy }); continue; }
+      try {
+        if (!a.branch) throw new Error(`${a.worktreePath} has no recorded branch; it was left in place`);
+        await git.removeOwnedWorktree(lead.cwd, a.worktreePath, a.branch);
+        store.updateAgent(a.id, { worktreePath: null });
+      } catch (e) {
+        this.log('worktree remove failed', { runId, agentId: a.id, error: e });
+        failed.push({ agentId: a.id, path: a.worktreePath, reason: (e as Error).message.split('\n')[0] });
+      }
+    }
+    return failed;
+  }
+
+  /** Why an agent's worktree must not be deleted yet, or null when it is provably idle. */
+  private async stillWorking(a: AgentDTO): Promise<string | null> {
+    if (this.workerInFlight(a.id)) return 'still running';
+    const processing = await this.processing(a);
+    if (processing === true) return 'still running';
+    if (processing === null) return 'session state unknown (CloudCLI cannot confirm it is idle)';
+    return this.workerInFlight(a.id) ? 'still running' : null; // re-checked after the await
+  }
+
+  /** Runs `fn` under the process-wide lock of the lead's repository (no lock if that repository is gone). */
+  private async withLeadRepo<T>(lead: AgentDTO, fn: () => Promise<T>): Promise<T> {
+    const key = await this.d.git.commonDir(lead.cwd).catch(() => null);
+    return key ? withRepoMutex(key, fn) : fn();
+  }
+
+  /**
+   * A lead still blocked in gate_wait / gate_decide / wait_for_agents when the user ended its run gets the
+   * outcome instead of "not part of a run". null = not such a call.
+   */
+  private endedRunAnswer(req: ToolRequest): string | null {
+    const { store } = this.d;
+    if (!['gate_wait', 'gate_decide', 'wait_for_agents'].includes(req.tool)) return null;
+    const { provider, providerSessionId } = req.caller;
+    if (!provider || !providerSessionId) return null;
+    const agent = store.latestAgentByProviderSession(provider, providerSessionId);
+    const run = agent ? store.run(agent.runId) : null;
+    if (!agent || !run || run.status === 'active' || run.leadAgentId !== agent.id) return null;
+    const stop = 'Stop working on this run and END YOUR TURN.';
+    if (req.tool === 'wait_for_agents') {
+      if (this.waiting.delete(agent.id)) store.addEvent(run.id, agent.id, 'wait_end', { reason: 'run_ended' });
+      return `The user ended run ${run.id}; its workers no longer run. ${stop}`;
+    }
+    const gate = store.gate(Number(req.args.gate));
+    if (!gate || gate.runId !== run.id) return null;
+    if (gate.status === 'expired' || gate.status === 'pending') {
+      return `Gate #${gate.id} EXPIRED: the user ended run ${run.id} before deciding it. `
+        + `Nothing was ${gate.kind === 'merge' ? 'merged' : 'approved'}. ${stop}`;
+    }
+    return `Gate #${gate.id} was ${gate.status} before the user ended run ${run.id}. ${stop}`;
   }
 
   /** User-requested cleanup, deliberately separate from endRun: branches are never removed automatically. */
@@ -775,7 +873,7 @@ export class Broker {
     if (this.leased(id)) return; // its blocked tool call will hand these over
     const agent = store.agent(id);
     if (!agent || NO_DELIVERY.has(agent.status)) return;
-    if (store.run(agent.runId)?.status !== 'active') return;
+    if (store.run(agent.runId)?.status !== 'active' || this.ending.has(agent.runId)) return;
     const msgs = store.undelivered(id);
     if (!msgs.length) return;
     // Results wake the lead once, when no worker is still working. Anything needing a reaction
@@ -816,6 +914,8 @@ export class Broker {
     const closed = orphans.filter((m) => !leads.has(m.to));
     store.markDelivered(closed.map((m) => m.id));
     store.requeue(requeued.map((m) => m.id));
+    // An ended run never delivers again: its orphans are cancelled, not queued forever.
+    for (const to of new Set(requeued.filter((m) => store.run(m.runId)?.status !== 'active').map((m) => m.to))) store.cancelQueued(to);
     for (const [runId, ms] of groupBy(requeued, (m) => m.runId)) {
       store.addEvent(runId, null, 'recovered', { requeued: ms.map((m) => m.id) });
     }
@@ -1046,7 +1146,10 @@ export class Broker {
     // An aborted run was accepted (CloudCLI only aborts a registered run), so it is closed like any accepted turn.
     const accepted = started || res.status === 'ok' || res.status === 'aborted';
     if (accepted) store.completeDispatch(msgIds);
-    else store.requeue(msgIds);
+    else {
+      store.requeue(msgIds);
+      if (store.run(agent.runId)?.status !== 'active') store.cancelQueued(agent.id); // the run ended meanwhile
+    }
     if (accepted) {
       openTurn(); // a run that finished without announcing its session still was a turn
       const id = turnId!;

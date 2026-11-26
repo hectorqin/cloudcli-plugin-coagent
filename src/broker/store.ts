@@ -379,6 +379,13 @@ export class Store {
     const r = this.db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as Row | undefined;
     return r ? this.toAgent(r) : null;
   }
+  /** The session's agent in its most recent run, active or ended. */
+  latestAgentByProviderSession(provider: Provider, providerSessionId: string): AgentDTO | null {
+    const r = this.db.prepare(`SELECT a.* FROM agents a JOIN runs r ON r.id = a.run_id
+      WHERE a.provider = ? AND a.provider_session_id = ? ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1`)
+      .get(provider, providerSessionId) as Row | undefined;
+    return r ? this.toAgent(r) : null;
+  }
   agentByProviderSession(provider: Provider, providerSessionId: string): AgentDTO | null {
     const r = this.db.prepare(`SELECT a.* FROM agents a JOIN runs r ON r.id = a.run_id
       WHERE a.provider = ? AND a.provider_session_id = ? AND r.status = 'active'`).get(provider, providerSessionId) as Row | undefined;
@@ -529,8 +536,10 @@ export class Store {
       AND subject_agent IS ?`).get(runId, kind, subjectAgent) as Row | undefined;
     return r ? toGate(r) : null;
   }
-  decideGate(id: number, status: GateStatus, comment: string | null) {
-    this.db.prepare('UPDATE gates SET status = ?, comment = ?, decided_at = ? WHERE id = ?').run(status, comment, this.ts(), id);
+  /** pending → a terminal status. False when the gate was already decided (a decision is never overwritten). */
+  decideGate(id: number, status: GateStatus, comment: string | null): boolean {
+    return Number(this.db.prepare("UPDATE gates SET status = ?, comment = ?, decided_at = ? WHERE id = ? AND status = 'pending'")
+      .run(status, comment, this.ts(), id).changes) > 0;
   }
 
   // ── events ────────────────────────────────────────────────────────

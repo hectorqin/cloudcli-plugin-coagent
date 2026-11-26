@@ -35,7 +35,7 @@ const fakeBroker = {
   },
   recordWorkspaceEvent: () => ({ ok: true }),
   endRun: async (id: string, removeWorktrees: boolean) => ({
-    failedWorktrees: removeWorktrees ? [{ agentId: 'coder-1', path: `/wt/${id}`, error: 'permission denied' }] : [],
+    failedWorktrees: removeWorktrees ? [{ agentId: 'coder-1', path: `/wt/${id}`, reason: 'still running' }] : [],
   }),
 } as unknown as Broker;
 
@@ -174,7 +174,7 @@ describe('broker HTTP hardening and diagnostics', () => {
   it('the end-run route reports worktrees it could not delete', async () => {
     const headers = { 'x-plugin-secret-apikey': 'tab-key' };
     expect(await request('POST', '/runs/r-1/end', { headers, body: '{"removeWorktrees":true}' })).toMatchObject({
-      status: 200, body: { ok: true, failedWorktrees: [{ agentId: 'coder-1', path: '/wt/r-1', error: 'permission denied' }] },
+      status: 200, body: { ok: true, failedWorktrees: [{ agentId: 'coder-1', path: '/wt/r-1', reason: 'still running' }] },
     });
   });
 
