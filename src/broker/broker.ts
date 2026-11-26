@@ -36,6 +36,8 @@ export const DETACHED_CHECK_MS = 30_000;
 const GONE = new Set(['ended', 'merged']);
 const ACTIVITY_KEEP = 12;
 const repoMutexes = new Map<string, Promise<void>>();
+/** A run marked ending for this long with no endRun in progress here gets its stop finished by tick(). */
+export const ENDING_RETRY_MS = 30_000;
 
 /** Process-wide serialization for operations against the same git common directory. */
 async function withRepoMutex<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -123,6 +125,10 @@ export class Broker {
   private detached = new Map<string, number>();
   /** Turn rows (store `turns`) this process has open. Any other open row was left by a process that is gone. */
   private openTurns = new Set<number>();
+  /** endRun calls in progress in this process (run id → count): tick() leaves their runs alone. */
+  private endRunsInProgress = new Map<string, number>();
+  /** Runs whose stalled stop tick() is finishing right now. */
+  private finishing = new Set<string>();
   private checkingDetached = false;
   private now: () => number;
   private log: (...args: unknown[]) => void;
@@ -672,14 +678,42 @@ export class Broker {
     const { store } = this.d;
     const run = store.run(runId) ?? fail(`No run ${runId}`);
     const lead = store.agent(run.leadAgentId)!;
-    store.markEnding(run.id);
-    const stopped = await this.withLeadRepo(lead, async () => this.stopRun(run.id));
-    const failedWorktrees = removeWorktrees ? await this.removeRunWorktrees(run.id, lead) : [];
-    if (stopped) {
-      store.addEvent(run.id, null, 'run_ended', failedWorktrees.length ? { removeWorktrees, failedWorktrees } : { removeWorktrees });
+    this.endRunsInProgress.set(run.id, (this.endRunsInProgress.get(run.id) ?? 0) + 1);
+    try {
+      store.markEnding(run.id);
+      const stopped = await this.withLeadRepo(lead, async () => this.stopRun(run.id));
+      const failedWorktrees = removeWorktrees ? await this.removeRunWorktrees(run.id, lead) : [];
+      if (stopped || !store.hasEvent(run.id, 'run_ended')) {
+        store.addEvent(run.id, null, 'run_ended', failedWorktrees.length ? { removeWorktrees, failedWorktrees } : { removeWorktrees });
+      }
+      if (failedWorktrees.length) this.log('run worktrees kept', { runId: run.id, failedWorktrees });
+      return { failedWorktrees };
+    } finally {
+      const left = (this.endRunsInProgress.get(run.id) ?? 1) - 1;
+      if (left > 0) this.endRunsInProgress.set(run.id, left); else this.endRunsInProgress.delete(run.id);
     }
-    if (failedWorktrees.length) this.log('run worktrees kept', { runId: run.id, failedWorktrees });
-    return { failedWorktrees };
+  }
+
+  /** Completes a stop that endRun persisted but did not finish (restart, or an endRun that died). ending_at stays. */
+  private finishStop(runId: string, data: Record<string, unknown>) {
+    this.stopRun(runId);
+    if (!this.d.store.hasEvent(runId, 'run_ended')) this.d.store.addEvent(runId, null, 'run_ended', data);
+  }
+
+  /** tick(): a run marked ending for ENDING_RETRY_MS with no endRun in progress here gets its stop finished. */
+  private retryStalledStops() {
+    const { store } = this.d;
+    for (const { runId, ageMs } of store.endingRuns()) {
+      if (ageMs < ENDING_RETRY_MS || this.endRunsInProgress.has(runId) || this.finishing.has(runId)) continue;
+      const run = store.run(runId);
+      const lead = run && store.agent(run.leadAgentId);
+      if (!lead) continue;
+      this.finishing.add(runId);
+      this.log('finishing a stalled run stop', { runId, ageMs });
+      this.track(this.withLeadRepo(lead, async () => this.finishStop(runId, { recovered: true, retried: true }))
+        .catch((e) => this.log('stalled stop failed', { runId, error: e }))
+        .finally(() => this.finishing.delete(runId)));
+    }
   }
 
   /** Whether turns, spawns, gate decisions and merges may still happen in this run. */
@@ -875,6 +909,7 @@ export class Broker {
   /** One delivery pass: push queued messages to every idle recipient. Also driven by a timer in server.ts. */
   async tick() {
     const { store } = this.d;
+    this.retryStalledStops();
     // A wait whose shim stopped polling (tool call cancelled, client gone) ends in the timeline too.
     for (const leadId of [...this.waiting]) {
       if (this.leased(leadId)) continue;
@@ -965,10 +1000,7 @@ export class Broker {
     // No turn row survives a restart: whatever happens in CloudCLI now, this process never sees its end or usage.
     store.interruptOpenTurns(this.openTurns);
     // An endRun that the previous process did not finish: complete the stop (cleanup stays retryable from the tab).
-    for (const run of store.markedRuns()) {
-      if (run.status === 'active') this.stopRun(run.id);
-      if (!store.hasEvent(run.id, 'run_ended')) store.addEvent(run.id, null, 'run_ended', { recovered: true });
-    }
+    for (const run of store.markedRuns()) this.finishStop(run.id, { recovered: true });
     for (const a of store.activeRunAgents()) {
       if (a.role === 'lead' || store.busy.has(a.id) || this.dispatches.has(a.id)) continue;
       const inFlight = store.dispatching(a.id);

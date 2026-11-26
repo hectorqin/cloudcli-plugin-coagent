@@ -329,6 +329,7 @@ export class Store {
       stuckBusy: [...this.busySince.entries()].filter(([, since]) => now - since > 30 * 60_000)
         .map(([agentId, since]) => ({ agentId, since: new Date(since).toISOString() })),
       undelivered: { total: Number(undelivered.count), byAgent: undeliveredByAgent },
+      endingRuns: this.endingRuns(),
     };
   }
   private ts() { return this.now().toISOString(); }
@@ -376,6 +377,12 @@ export class Store {
   /** Runs that endRun has marked, active (stop not finished) or ended: what recovery must complete. */
   markedRuns(): RunDTO[] {
     return (this.db.prepare('SELECT * FROM runs WHERE ending_at IS NOT NULL').all() as Row[]).map((r) => this.toRun(r));
+  }
+  /** Active runs whose stop has not finished yet, oldest first, with their age on this store's clock. */
+  endingRuns(): { runId: string; endingAt: string; ageMs: number }[] {
+    const now = this.now().getTime();
+    return (this.db.prepare("SELECT id, ending_at FROM runs WHERE status = 'active' AND ending_at IS NOT NULL ORDER BY ending_at")
+      .all() as Row[]).map((r) => ({ runId: String(r.id), endingAt: String(r.ending_at), ageMs: Math.max(0, now - Date.parse(String(r.ending_at))) }));
   }
   hasEvent(runId: string, type: EventType): boolean {
     return !!this.db.prepare('SELECT 1 FROM events WHERE run_id = ? AND type = ? LIMIT 1').get(runId, type);

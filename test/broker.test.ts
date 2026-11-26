@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { Broker, MAX_WORKERS } from '../src/broker/broker.js';
+import { Broker, ENDING_RETRY_MS, MAX_WORKERS } from '../src/broker/broker.js';
 import { HttpCloudCli, type CloudCli, type SendInput, type SendResult, type SessionInfo } from '../src/broker/cloudcli.js';
 import { Git } from '../src/broker/git.js';
 import { filePrompts } from '../src/broker/prompts.js';
@@ -1735,6 +1735,71 @@ describe('merge gate outcome (third review)', () => {
     await broker.settle();
     expect(store.gate(gate.id)!.status).toBe('approved');
     expect(store.events(run.id).filter((e) => e.type === 'gate_decided' && e.data.gate === gate.id).map((e) => e.data.status)).toEqual(['approved']);
+  });
+});
+
+describe('stalled ending runs (third review)', () => {
+  /** Backdates a run's ending_at, as if endRun had marked it `ms` ago. */
+  const age = (runId: string, ms: number) => (store as unknown as { db: DatabaseSync }).db
+    .prepare('UPDATE runs SET ending_at = ? WHERE id = ?').run(new Date(Date.now() - ms).toISOString(), runId);
+
+  it('the state marks the run ending and diagnostics list it with its age', async () => {
+    const run = await startApprovedRun();
+    store.markEnding(run.id);
+    age(run.id, 90_000);
+    expect(broker.state(null, run.id).runs.find((r) => r.id === run.id)).toMatchObject({ status: 'active', ending: true });
+    const diag = store.diagnostics();
+    expect(diag.endingRuns).toEqual([{ runId: run.id, endingAt: expect.any(String), ageMs: expect.any(Number) }]);
+    expect(diag.endingRuns[0].ageMs).toBeGreaterThanOrEqual(90_000);
+  });
+
+  it('tick finishes a stop stalled longer than ENDING_RETRY_MS, and never clears ending_at', async () => {
+    const run = await startApprovedRun();
+    await call('submit_plan', { plan: 'v2' }); // a pending gate the stop must expire
+    const gate = store.gates(run.id).find((g) => g.status === 'pending')!;
+    store.markEnding(run.id); // endRun marked it, then died before stopRun (no restart)
+    age(run.id, ENDING_RETRY_MS - 5_000);
+    await broker.tick();
+    await broker.settle();
+    expect(store.run(run.id)!.status).toBe('active'); // not yet: it may still be legitimately waiting for the lock
+    age(run.id, ENDING_RETRY_MS + 5_000);
+    await broker.tick();
+    await broker.settle();
+    expect(store.run(run.id)!.status).toBe('ended');
+    expect(store.gate(gate.id)!.status).toBe('expired');
+    expect(store.events(run.id).filter((e) => e.type === 'run_ended').map((e) => e.data)).toEqual([{ recovered: true, retried: true }]);
+    const raw = (store as unknown as { db: DatabaseSync }).db.prepare('SELECT ending_at FROM runs WHERE id = ?').get(run.id) as { ending_at: string | null };
+    expect(raw.ending_at).not.toBeNull();
+    await broker.tick();
+    await broker.settle();
+    expect(store.events(run.id).filter((e) => e.type === 'run_ended')).toHaveLength(1);
+  });
+
+  it('tick leaves a run alone while an endRun for it is in progress in this process', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    // Hold the repository lock with a request_merge blocked in commitAll, so endRun waits for it.
+    let release!: () => void;
+    const hold = new Promise<void>((r) => { release = r; });
+    let entered!: () => void;
+    const inside = new Promise<void>((r) => { entered = r; });
+    broker = new Broker({
+      store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock,
+      git: { ...Git, commitAll: async (...args: Parameters<typeof Git.commitAll>) => { entered(); await hold; return Git.commitAll(...args); } },
+    });
+    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: w.id }, caller: LEAD });
+    await inside;
+    const ending = broker.endRun(run.id, false);
+    await new Promise((r) => setTimeout(r, 10));
+    age(run.id, ENDING_RETRY_MS + 60_000);
+    await broker.tick(); // must not queue a second stop behind the waiting endRun
+    expect(store.run(run.id)!.status).toBe('active');
+    release();
+    await merging;
+    await ending;
+    await broker.settle();
+    expect(store.run(run.id)!.status).toBe('ended');
+    expect(store.events(run.id).filter((e) => e.type === 'run_ended').map((e) => e.data)).toEqual([{ removeWorktrees: false }]);
   });
 });
 

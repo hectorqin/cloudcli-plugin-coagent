@@ -3,6 +3,7 @@ import type { AgentDTO, GateDTO, RunDetailDTO, StateDTO } from '../shared/protoc
 import { mountDiff } from './diffView.js';
 import { buildTimeline, type Ref, type Row, type Timeline, type Tone, USER_LANE } from './timeline.js';
 import { drawerUsageHtml, laneUsageHtml, runUsageHtml, runUsageText } from './usage.js';
+import { controlsLocked, runPhase, runPhaseBadge } from './runPhase.js';
 import { cleanupTarget, safeWorkerProject } from './workspaceCleanup.js';
 
 interface PluginContext {
@@ -43,7 +44,7 @@ const CSS = `
 .ca .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.ca .grow{flex:1;min-width:0}
 .ca .badge{display:inline-block;padding:0 7px;border-radius:999px;border:1px solid var(--line);font-size:11px;line-height:18px;white-space:nowrap}
 .ca .t-accent,.ca .b-lead{color:var(--accent);border-color:var(--accent)}.ca .t-warn,.ca .b-running,.ca .b-starting,.ca .b-pending,.ca .b-interrupted{color:var(--warn);border-color:var(--warn)}
-.ca .t-ok,.ca .b-reported,.ca .b-merged,.ca .b-approved{color:var(--ok);border-color:var(--ok)}.ca .t-error,.ca .b-error,.ca .b-rejected,.ca .b-expired,.ca .b-failed{color:var(--bad);border-color:var(--bad)}
+.ca .t-ok,.ca .b-reported,.ca .b-merged,.ca .b-approved{color:var(--ok);border-color:var(--ok)}.ca .t-error,.ca .b-error,.ca .b-rejected,.ca .b-expired,.ca .b-failed{color:var(--bad);border-color:var(--bad)}.ca .b-ending{color:var(--warn);border-color:var(--warn)}
 .ca pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:40vh;overflow:auto}
 .ca .files{margin:6px 0;border:1px solid var(--line);border-radius:6px;overflow:hidden}.ca .file{display:flex;gap:8px;padding:3px 7px;border-top:1px solid var(--line);font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}.ca .file:first-child{border-top:0}.ca .file .path{flex:1;min-width:0;overflow-wrap:anywhere}.ca .plus{color:var(--ok)}.ca .minus{color:var(--bad)}
 .ca details>summary{cursor:pointer;color:var(--muted)}
@@ -188,7 +189,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     const intro = `<div class="card sub">This session is not part of a coagent run. Ask any Claude or Codex session to
       “plan this and delegate it to sub-agents”: it calls <code>submit_plan</code> and becomes the lead.</div>`;
     return `${header()}${errHtml}<div class="pad" style="padding-top:0">${intro}${runs.length ? `<h3>Runs</h3>${runs.map((r) => `<div class="card row">
-      <div class="grow"><b>${esc(r.id)}</b> <span class="badge b-${esc(r.status)}">${esc(r.status)}</span>
+      <div class="grow"><b>${esc(r.id)}</b> ${runPhaseBadge(r)}
         <span class="badge b-${esc(r.planStatus)}">plan ${esc(r.planStatus)}</span>${r.pendingGates ? ` <span class="badge b-pending">${r.pendingGates} waiting for you</span>` : ''}
         <div class="sub">${esc(r.projectPath)} · ${r.agentCount} agents · ${esc(new Date(r.createdAt).toLocaleString())}</div>
         ${r.usage ? `<div class="sub">${esc(runUsageText(r.usage))}</div>` : ''}</div>
@@ -198,6 +199,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   function runView(d: RunDetailDTO, errHtml: string): string {
     const tl = buildTimeline(d);
     const ended = d.run.status === 'ended';
+    const ending = runPhase(d.run) === 'ending';
     const pending = d.gates.filter((g) => g.status === 'pending');
     const isLead = state!.me === d.run.leadAgentId;
     const targets = d.agents.filter((a) => cleanupTarget(a, d));
@@ -215,14 +217,16 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       const target = cleanupTarget(a, afterEnd);
       return target?.kind === 'project' ? typeof api.archiveProject === 'function' : !!target && typeof api.archiveSession === 'function';
     });
-    const endPanel = !ended && isLead && endPanelRun === d.run.id ? `<div class="card" style="margin:0 16px 8px"><b>End run ${esc(d.run.id)}</b>
+    const endPanel = !controlsLocked(d.run) && isLead && endPanelRun === d.run.id ? `<div class="card" style="margin:0 16px 8px"><b>End run ${esc(d.run.id)}</b>
       <div class="sub">Choose cleanup to run after the collaboration ends.</div>
       ${d.agents.some((a) => a.worktreePath && a.status !== 'merged') ? '<label><input style="width:auto" type="checkbox" data-end-option="worktrees"> Delete unmerged worktrees</label>' : ''}
       ${endArchivable ? '<label><input style="width:auto" type="checkbox" data-end-option="archive"> Archive all worker sessions</label>' : ''}
       ${writerCount ? '<label><input style="width:auto" type="checkbox" data-end-option="branches"> Delete merged branches (safe only)</label>' : ''}
       <div class="row" style="margin-top:8px"><button class="danger" data-act="confirm-end" data-id="${esc(d.run.id)}">End run</button><button data-act="cancel-end">Cancel</button></div></div>` : '';
     const top = `<div class="top">${header(`${selectedRun ? '<button data-act="back">All runs</button>' : ''}
-        ${ended ? `<span class="badge">ended</span>${endedActions}` : `<button class="danger" data-act="end" data-id="${esc(d.run.id)}">End run</button>`}${branchAction}`)}
+        ${ended ? `<span class="badge">ended</span>${endedActions}`
+          : ending ? `${runPhaseBadge(d.run)}<span class="sub">The run is being ended; approvals and messages are disabled.</span>`
+            : `<button class="danger" data-act="end" data-id="${esc(d.run.id)}">End run</button>`}${branchAction}`)}
       <div class="sub" style="padding:0 16px 8px">Run <b>${esc(d.run.id)}</b> · ${esc(d.run.projectPath)}${runUsageHtml(d.run.usage)}</div>
       ${endPanel}
       ${pending.map((g) => `<div class="pending"><span class="grow">Waiting for you: <b>${g.kind === 'plan'
@@ -321,7 +325,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   // ── details drawer ───────────────────────────────────────────────
   function drawer(d: RunDetailDTO): string {
     if (!selected) return `<div class="drawer sub">Click an arrow, a node or a lane header for details.</div>`;
-    const ended = d.run.status === 'ended';
+    const ended = controlsLocked(d.run); // ending runs take no decisions or messages either
     const close = '<button data-act="close">Close</button>';
     if (selected.type === 'agent') {
       const a = d.agents.find((x) => x.id === selected!.id);
