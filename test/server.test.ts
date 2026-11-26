@@ -38,6 +38,7 @@ describe('broker HTTP hardening and diagnostics', () => {
   let server: http.Server;
   let port: number;
   let clock: number;
+  let registrationAction: unknown;
 
   beforeEach(async () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-http-'));
@@ -46,7 +47,9 @@ describe('broker HTTP hardening and diagnostics', () => {
     clock = Date.parse('2026-01-01T00:00:00Z');
     server = http.createServer(createHandler({
       broker: fakeBroker, store, cloudcli, token: 'mcp-token', dbFile: path.join(tmp, 'coagent.db'),
-      registration: () => ({ claude: 'registered', codex: 'registered' }), register: async () => ({}), now: () => clock,
+      registration: () => ({ claude: 'registered', codex: 'registered' }),
+      register: async (action) => { registrationAction = action; return { claude: String(action), codex: String(action) }; },
+      now: () => clock,
     }));
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     port = (server.address() as { port: number }).port;
@@ -120,6 +123,24 @@ describe('broker HTTP hardening and diagnostics', () => {
       .toMatchObject({ status: 200, body: { ok: true, note: 'Waiting for a worker slot.' } });
     expect(await request('POST', '/agents/coder-1/end', { headers, body: '{"removeWorktree":true}' }))
       .toMatchObject({ status: 200, body: { ok: true, text: 'Ended coder-1; remove=true.' } });
+  });
+
+  it('keeps registration changes tab-authorized and reads the JSON action', async () => {
+    expect((await request('POST', '/registration', { body: '{"action":"unregister"}' })).status).toBe(401);
+    const result = await request('POST', '/registration', {
+      headers: { 'x-plugin-secret-apikey': 'tab-key' }, body: '{"action":"unregister"}',
+    });
+    expect(result).toMatchObject({ status: 200, body: { claude: 'unregister', codex: 'unregister' } });
+    expect(registrationAction).toBe('unregister');
+    expect(store.getJson('autoRegister', true)).toBe(false);
+
+    await request('POST', '/registration', {
+      headers: { 'x-plugin-secret-apikey': 'tab-key' }, body: '{"action":"register"}',
+    });
+    expect(store.getJson('autoRegister', false)).toBe(true);
+    expect((await request('POST', '/registration', {
+      headers: { 'x-plugin-secret-apikey': 'tab-key' }, body: '{"action":"invalid"}',
+    })).status).toBe(400);
   });
 
   it('requires a fresh, unexpired, one-time setup nonce', async () => {

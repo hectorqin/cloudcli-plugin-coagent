@@ -18,7 +18,7 @@ const run: RunDetailDTO = {
   messages: [], events: [],
   gates: [{ id: 7, runId: 'r', kind: 'plan', requestedBy: 'lead', subjectAgent: null, payload: 'p', status: 'pending', comment: null, createdAt: '', snapshot: null }],
 };
-const state = { setup: { apiKeyConfigured: true, registration: {} }, me: 'lead', current: run, runs: [] } as StateDTO;
+const state = { setup: { apiKeyConfigured: true, registration: {}, autoRegister: true }, me: 'lead', current: run, runs: [] } as StateDTO;
 const ctx = (toolName: string, toolInput: unknown, result: string | null, status: ToolContext['status'] = 'completed'): ToolContext => ({
   toolName: `mcp__coagent__${toolName}`, toolId: 't', toolInput, status, theme: 'dark', project: null, sessionId: 'app-lead',
   toolResult: result === null ? null : { content: [{ type: 'text', text: result }], isError: false },

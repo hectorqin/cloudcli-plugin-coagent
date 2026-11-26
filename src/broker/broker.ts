@@ -639,7 +639,10 @@ export class Broker {
     const me = appSessionId ? store.agentByAppSession(appSessionId) : null;
     const showRun = runId ?? me?.runId ?? null;
     return {
-      setup: { apiKeyConfigured: cloudcli.apiKeyConfigured(), registration: this.d.setupInfo?.() ?? {} },
+      setup: {
+        apiKeyConfigured: cloudcli.apiKeyConfigured(), registration: this.d.setupInfo?.() ?? {},
+        autoRegister: store.getJson('autoRegister', true),
+      },
       me: me?.id ?? null,
       current: showRun ? this.detail(showRun) : null,
       runs: store.runSummaries(),

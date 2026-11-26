@@ -1,11 +1,17 @@
 import { DatabaseSync } from 'node:sqlite';
+import fs from 'node:fs';
+import path from 'node:path';
 import type {
   AgentDTO, AgentStatus, DeliveryState, EventDTO, EventType, GateDTO, GateKind, GateStatus, MergeSnapshot,
   AgentUsageDTO, MergeSnapshotData, MessageDTO, PlanStatus, Provider, RunDTO, RunUsageDTO, TurnOutcome,
 } from '../shared/protocol.js';
 import type { TurnUsage } from './usage.js';
+import { writeLog } from './log.js';
 
 type Row = Record<string, unknown>;
+/** VACUUM INTO copies on the order of 100+ MiB/s, so this stays well inside CloudCLI's 10 s startup limit. */
+const MAX_BACKUP_BYTES = 512 * 2 ** 20;
+export const SKIP_BACKUP_MARKER = 'skip-next-backup';
 const s = (v: unknown) => (v === null || v === undefined ? null : String(v));
 const n = (v: unknown) => (v === null || v === undefined ? null : Number(v));
 
@@ -149,6 +155,9 @@ export const MIGRATIONS: readonly MigrationItem[] = [
   TURNS_MIGRATION,
 ];
 
+const SCHEMA_TABLES = [...SCHEMA.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
+const SCHEMA_INDEXES = [...SCHEMA.matchAll(/CREATE INDEX IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
+
 /**
  * What migrate() would still change in this database (empty = up to date). Read-only, so it can run on a database
  * opened with { readOnly: true } before deciding to back it up.
@@ -157,6 +166,9 @@ export function pendingMigrations(db: DatabaseSync): string[] {
   const out: string[] = [];
   const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Row[]).map((r) => String(r.name)));
   const indexes = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Row[]).map((r) => String(r.name)));
+  // The base SCHEMA is the first migration step (migrate() runs it before MIGRATIONS), so check it here too.
+  for (const t of SCHEMA_TABLES) if (!tables.has(t)) out.push(`table ${t}`);
+  for (const i of SCHEMA_INDEXES) if (!indexes.has(i)) out.push(`index ${i}`);
   for (const m of MIGRATIONS) {
     if (!tables.has(m.table)) { out.push(`table ${m.table}`); continue; }
     const cols = new Set((db.prepare(`PRAGMA table_info(${m.table})`).all() as Row[]).map((r) => String(r.name)));
@@ -190,11 +202,70 @@ export class Store {
   /** Recent activity per agent, captured from the run streams (process-local, like `busy`). */
   readonly activity = new Map<string, { ts: string; text: string; key?: string }[]>();
 
-  constructor(file: string, private now: () => Date = () => new Date()) {
+  constructor(file: string, private now: () => Date = () => new Date(), opts: { maxBackupBytes?: number } = {}) {
     this.db = new DatabaseSync(file);
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
-    this.db.exec(SCHEMA);
-    this.migrate();
+    try {
+      if (this.needsMigration()) this.backupOrSkip(file, opts.maxBackupBytes ?? MAX_BACKUP_BYTES);
+      this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+      this.db.exec(SCHEMA);
+      this.migrate();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
+  }
+
+  /** Whether opening this existing coagent database will apply any schema change (same list migrate() applies). */
+  private needsMigration() {
+    const userTables = this.db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").get() as Row;
+    if (Number(userTables.n) === 0) return false; // A new/empty database has no user state to preserve.
+    return pendingMigrations(this.db).length > 0;
+  }
+
+  /**
+   * The backup runs before the broker prints its readiness line, and CloudCLI kills a plugin that is not ready within
+   * 10 s, so a database too large to copy in time refuses to start with instructions instead of being killed mid-copy.
+   * Escape hatch: a `skip-next-backup` file next to the database (consumed on use) or COAGENT_SKIP_BACKUP=1.
+   */
+  private backupOrSkip(file: string, maxBytes: number) {
+    const marker = path.join(path.dirname(file), SKIP_BACKUP_MARKER);
+    if (fs.existsSync(marker) || process.env.COAGENT_SKIP_BACKUP === '1') {
+      writeLog('warn', 'skipping database migration backup by explicit override', { db: file });
+      fs.rmSync(marker, { force: true });
+      return;
+    }
+    const bytes = [file, `${file}-wal`].reduce((sum, f) => sum + (fs.statSync(f, { throwIfNoEntry: false })?.size ?? 0), 0);
+    if (bytes > maxBytes) {
+      throw new Error(`database ${file} is ${Math.round(bytes / 2 ** 20)} MiB, too large to back up within CloudCLI's `
+        + `startup limit; copy it somewhere safe, then create ${marker} and restart to migrate without a backup`);
+    }
+    this.backupBeforeMigration(file);
+  }
+
+  /** VACUUM INTO includes committed WAL contents in one consistent, standalone SQLite file. */
+  private backupBeforeMigration(file: string) {
+    const dir = path.join(path.dirname(file), 'backups');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const stamp = this.now().toISOString().replace(/[-:.]/g, '');
+    let backup = path.join(dir, `coagent-${stamp}.db`);
+    for (let suffix = 1; fs.existsSync(backup); suffix++) backup = path.join(dir, `coagent-${stamp}-${suffix}.db`);
+    const started = Date.now();
+    try {
+      this.db.prepare('VACUUM INTO ?').run(backup);
+      fs.chmodSync(backup, 0o600);
+
+      const backups = fs.readdirSync(dir).filter((name) => /^coagent-.*\.db$/.test(name)).map((name) => {
+        const filename = path.join(dir, name);
+        return { filename, name, mtime: fs.statSync(filename).mtimeMs };
+      }).sort((a, b) => b.mtime - a.mtime || b.name.localeCompare(a.name));
+      for (const old of backups.slice(5)) fs.rmSync(old.filename);
+      writeLog('info', 'database migration backup complete', {
+        backup, durationMs: Date.now() - started, bytes: fs.statSync(backup).size,
+      });
+    } catch (error) {
+      try { fs.rmSync(backup, { force: true }); } catch { /* preserve the original failure */ }
+      throw new Error(`database migration backup failed before schema changes: ${(error as Error).message}`, { cause: error });
+    }
   }
 
   /** Idempotent: safe on fresh and on any older database. Driven by MIGRATIONS. */
