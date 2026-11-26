@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import type {
   AgentDTO, GateDTO, MergeSnapshot, MergeSnapshotData, MessageDTO, Provider, RunDetailDTO, StateDTO, ToolRequest, ToolResponse,
 } from '../shared/protocol.js';
@@ -673,8 +675,22 @@ export class Broker {
     const run = store.run(runId) ?? fail(`No run ${runId}`);
     const agent = store.agent(agentId) ?? fail(`No agent ${agentId}`);
     if (agent.runId !== run.id) fail(`${agentId} is not part of run ${run.id}`);
-    if (!agent.branch || agent.cwd === store.agent(run.leadAgentId)?.cwd) fail('Only writer workspaces can be archived or deleted.');
-    store.addEvent(run.id, agent.id, type, { projectPath: agent.cwd });
+    const lead = store.agent(run.leadAgentId)!;
+    const canonical = (value: string) => {
+      const resolved = path.resolve(value);
+      try { return fs.realpathSync(resolved); } catch { return resolved; }
+    };
+    const projectPath = canonical(agent.cwd);
+    const leadPath = canonical(lead.cwd);
+    const repoPath = canonical(run.projectPath);
+    const container = `${repoPath}-worktrees`;
+    const relative = path.relative(container, projectPath);
+    const allowedStatus = agent.status === 'merged' || (type === 'workspace_archived' && agent.status === 'ended');
+    if (!agent.branch || !allowedStatus || projectPath === leadPath || projectPath === repoPath
+      || !relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+      fail('Only merged writer workspaces (or ended writers when archiving) can be cleaned up.');
+    }
+    store.addEvent(run.id, agent.id, type, { projectPath });
     return { ok: true };
   }
 

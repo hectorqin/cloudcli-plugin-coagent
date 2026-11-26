@@ -193,4 +193,4 @@ tab 改为泳道时序图：每个 agent 一条泳道（最左为 You），时�
 - writer 合并后自动删除 git worktree，但保留 CloudCLI project/session/transcript 和分支；planner/reviewer 与 lead 共用 project，绝不能归档或删除。
 - fork 在 tab API 与 tool renderer host 暴露可选的 `archiveProject(projectPath)` / `deleteProject(projectPath)`。合并卡片与 agent/gate 抽屉按能力检测显示“Archive worker session”（保留 session，可从 archive view 恢复）和需确认的 Delete（连 session/transcript 删除）；vanilla host 显示 sidebar worktrees 位置提示。run 结束后可逐个、非阻塞地批量归档 writer project。
 - UI 成功调用 host 后，通过 tab 鉴权的事件路由记录 `workspace_archived` / `workspace_deleted`；失败只显示对应 item 的错误，不阻断其他清理。
-- 分支清理与 `endRun` 分离且从不自动执行。lead 显式调用 `POST /runs/:id/branches/delete-merged`：仅处理状态为 merged 且 tip 是 lead 当前 `HEAD` ancestor 的 worker 分支，并只用 `git branch -d`。未合并、ended-unmerged、缺失或仍被 worktree checkout 的分支均保留并返回原因；结果记录为 `branches_deleted`。
+- 分支清理与 `endRun` 分离且从不自动执行。lead 显式调用 `POST /runs/:id/branches/delete-merged`：仅处理状态为 merged 且 tip 是 lead 当前 `HEAD` ancestor 的 worker 分支，并只用 `git branch -d`。未合并、ended-unmerged、缺失或仍被 worktree checkout 的分支均保留并返回原因；结果记录为 `branches_deleted`。这里的“仅 lead”是 tab UI/一致性 guard，不是独立授权边界（tab 请求已经代表本机 CloudCLI 用户）；真正的删除安全边界是 ancestry 检查与 `branch -d`。

@@ -25,7 +25,7 @@ const context: ToolContext = {
   toolResult: { content: 'Merge request submitted as gate #8.', isError: false }, status: 'completed', theme: 'light', project: null, sessionId: 'card-session',
 };
 
-afterEach(() => { unmount(); document.body.innerHTML = ''; vi.restoreAllMocks(); });
+afterEach(() => { unmount(); document.body.innerHTML = ''; vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('workspace cleanup controls', () => {
   it('merge cards feature-detect host cleanup, show the vanilla-host hint, and invoke archive without blocking', async () => {
@@ -76,5 +76,124 @@ describe('workspace cleanup controls', () => {
     container.querySelector<HTMLElement>('[data-type="agent"][data-id="coder-1"]')!.click();
     expect(container.textContent).toContain('Archive worker session');
     expect(container.textContent).toContain('Delete');
+  });
+
+  it('guards unsafe paths before any host call', async () => {
+    const unsafe = structuredClone(state);
+    unsafe.current!.agents.find((a) => a.id === writer.id)!.cwd = '/projects/repo';
+    const archiveProject = vi.fn(async () => ({ ok: true as const }));
+    const container = document.createElement('div');
+    document.body.append(container);
+    const view = renderTool(container, { ...context, sessionId: 'unsafe-card' }, {
+      rpc: vi.fn(async () => unsafe), openSession: vi.fn(), archiveProject, deleteProject: vi.fn(async () => undefined),
+    });
+    await vi.waitFor(() => expect(container.textContent).toContain('Merge approval'));
+    expect(container.textContent).not.toContain('Archive worker session');
+    expect(container.textContent).not.toContain('Archive it from the sidebar');
+    expect(archiveProject).not.toHaveBeenCalled();
+    view.destroy();
+  });
+
+  it('keeps one host call in flight, survives redraws, and does not let event RPC failure erase success', async () => {
+    let release!: (value: { ok: true }) => void;
+    const pending = new Promise<{ ok: true }>((resolve) => { release = resolve; });
+    const archiveProject = vi.fn(() => pending);
+    const rpc = vi.fn((method: string, path: string) => path.startsWith('state') ? Promise.resolve(state) : Promise.reject(new Error('event unavailable')));
+    const container = document.createElement('div');
+    document.body.append(container);
+    const view = renderTool(container, { ...context, sessionId: 'pending-card' }, { rpc, openSession: vi.fn(), archiveProject });
+    await vi.waitFor(() => expect(container.querySelector('[data-clean="archive"]')).not.toBeNull());
+    const button = container.querySelector<HTMLButtonElement>('[data-clean="archive"]')!;
+    button.click();
+    button.click();
+    view.update({ ...context, sessionId: 'pending-card' });
+    await Promise.resolve();
+    expect(archiveProject).toHaveBeenCalledTimes(1);
+    expect(container.querySelector<HTMLButtonElement>('[data-clean="archive"]')!.disabled).toBe(true);
+    release({ ok: true });
+    await vi.waitFor(() => expect(container.textContent).toContain('Archived'));
+    expect(container.textContent).not.toContain('event unavailable');
+    expect(container.querySelector('[data-clean]')).toBeNull();
+    view.destroy();
+  });
+
+  it('shows host-declared and rejected errors while leaving cleanup retryable', async () => {
+    for (const [sessionId, archiveProject, message] of [
+      ['false-card', vi.fn(async () => ({ ok: false as const, error: 'not a worktree' })), 'not a worktree'],
+      ['reject-card', vi.fn(async () => { throw new Error('host offline'); }), 'host offline'],
+      ['throw-card', vi.fn(() => { throw new Error('sync failure'); }), 'sync failure'],
+    ] as const) {
+      const container = document.createElement('div');
+      document.body.append(container);
+      const view = renderTool(container, { ...context, sessionId }, { rpc: vi.fn(async () => state), openSession: vi.fn(), archiveProject });
+      await vi.waitFor(() => expect(container.querySelector('[data-clean="archive"]')).not.toBeNull());
+      container.querySelector<HTMLButtonElement>('[data-clean="archive"]')!.click();
+      await vi.waitFor(() => expect(container.textContent).toContain(`Error: ${message}`));
+      expect(container.querySelector('[data-clean="archive"]')).not.toBeNull();
+      view.destroy();
+      container.remove();
+    }
+  });
+
+  it('confirms delete with worker identity/path and archives all writers with a readable top summary', async () => {
+    const confirmSpy = vi.fn(() => true);
+    vi.stubGlobal('confirm', confirmSpy);
+    const deleteProject = vi.fn(async () => ({ ok: true }));
+    const card = document.createElement('div');
+    document.body.append(card);
+    const cardView = renderTool(card, { ...context, sessionId: 'delete-card' }, {
+      rpc: vi.fn(async (_method, path) => path.startsWith('state') ? state : { ok: true }), openSession: vi.fn(), deleteProject,
+    });
+    await vi.waitFor(() => expect(card.querySelector('[data-clean="delete"]')).not.toBeNull());
+    card.querySelector<HTMLButtonElement>('[data-clean="delete"]')!.click();
+    expect(confirmSpy).toHaveBeenCalledWith(`Delete worker project ${writer.id} (${writer.cwd})? Its sessions and transcripts will be permanently removed.`);
+    await vi.waitFor(() => expect(deleteProject).toHaveBeenCalledWith(writer.cwd));
+    cardView.destroy();
+
+    const ended = structuredClone(state);
+    ended.current!.run.status = 'ended';
+    const archiveProject = vi.fn(async () => ({ ok: true as const }));
+    const tab = document.createElement('div');
+    document.body.append(tab);
+    mount(tab, { context: { theme: 'light', project: null, session: { id: 'lead-session', title: '' } }, onContextChange: () => () => {},
+      rpc: vi.fn(async (_method, path) => path.startsWith('state') ? ended : path.includes('delete-merged')
+        ? { deleted: [], skipped: [{ branch: 'coagent/r/coder-1', reason: 'checked out elsewhere' }] } : { ok: true }), archiveProject, deleteProject });
+    await vi.waitFor(() => expect(tab.textContent).toContain('Archive all worker sessions'));
+    tab.querySelector<HTMLButtonElement>('[data-act="archive-all"]')!.click();
+    await vi.waitFor(() => expect(tab.textContent).toContain('Archive all: 1 archived.'));
+    expect(archiveProject).toHaveBeenCalledTimes(1);
+    expect(archiveProject).toHaveBeenCalledWith(writer.cwd);
+    expect(tab.querySelector('[data-act="archive-all"]')).toBeNull();
+    tab.querySelector<HTMLButtonElement>('[data-act="delete-branches"]')!.click();
+    await vi.waitFor(() => expect(tab.textContent).toContain('deleted 0; skipped: coagent/r/coder-1 — checked out elsewhere'));
+  });
+
+  it('uses an inline end-run options panel instead of chained confirms', async () => {
+    const confirmSpy = vi.fn();
+    vi.stubGlobal('confirm', confirmSpy);
+    const container = document.createElement('div');
+    document.body.append(container);
+    mount(container, { context: { theme: 'light', project: null, session: { id: 'lead-session', title: '' } }, onContextChange: () => () => {},
+      rpc: vi.fn(async () => state), archiveProject: vi.fn(async () => ({ ok: true as const })) });
+    await vi.waitFor(() => expect(container.querySelector('[data-act="end"]')).not.toBeNull());
+    container.querySelector<HTMLButtonElement>('[data-act="end"]')!.click();
+    expect(container.textContent).toContain('Choose cleanup to run after the collaboration ends.');
+    expect(container.querySelector('[data-end-option="archive"]')).not.toBeNull();
+    expect(confirmSpy).not.toHaveBeenCalled();
+
+    unmount();
+    const noWriters = structuredClone(state);
+    noWriters.current!.agents = noWriters.current!.agents.filter((a) => a.role === 'lead' || a.role === 'reviewer');
+    noWriters.current!.gates = [];
+    noWriters.current!.events = [];
+    const empty = document.createElement('div');
+    document.body.append(empty);
+    mount(empty, { context: { theme: 'light', project: null, session: { id: 'lead-session', title: '' } }, onContextChange: () => () => {},
+      rpc: vi.fn(async () => noWriters), archiveProject: vi.fn(async () => ({ ok: true as const })) });
+    await vi.waitFor(() => expect(empty.querySelector('[data-act="end"]')).not.toBeNull());
+    empty.querySelector<HTMLButtonElement>('[data-act="end"]')!.click();
+    expect(empty.querySelector('[data-end-option="archive"]')).toBeNull();
+    expect(empty.querySelector('[data-end-option="branches"]')).toBeNull();
+    expect(empty.querySelector('[data-act="delete-branches"]')).toBeNull();
   });
 });

@@ -5,6 +5,7 @@
 import type { AgentDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
 import { mountDiff } from './diffView.js';
 import { CTX_CAVEAT, cardUsageText } from './usage.js';
+import { safeWorkerProject } from './workspaceCleanup.js';
 
 export interface ToolContext {
   toolName: string;
@@ -181,12 +182,13 @@ export function agentsFor(ctx: ToolContext, run: RunDetailDTO | null): AgentDTO[
   return [];
 }
 
-interface CleanupView { archive: boolean; delete: boolean; result?: string }
+interface CleanupView { archive: boolean; delete: boolean; pending?: boolean; done?: boolean; result?: string }
 
 function cleanupHtml(worker: AgentDTO | undefined, run: RunDetailDTO | null, cleanup: CleanupView): string {
-  if (!worker?.branch || worker.status !== 'merged') return '';
-  const controls = `${cleanup.archive ? `<button class="primary" data-clean="archive" data-agent="${esc(worker.id)}">Archive worker session</button>` : ''}
-    ${cleanup.delete ? `<button class="danger" data-clean="delete" data-agent="${esc(worker.id)}">Delete</button>` : ''}`;
+  if (!worker || !run || !safeWorkerProject(worker, run) || worker.status !== 'merged') return '';
+  const disabled = cleanup.pending ? ' disabled' : '';
+  const controls = cleanup.done ? '' : `${cleanup.archive ? `<button class="primary" data-clean="archive" data-agent="${esc(worker.id)}"${disabled}>Archive worker session</button>` : ''}
+    ${cleanup.delete ? `<button class="danger" data-clean="delete" data-agent="${esc(worker.id)}"${disabled}>Delete</button>` : ''}`;
   const hint = !cleanup.archive && !cleanup.delete
     ? `<span class="m">Archive it from the sidebar (the project is under ${esc(run?.run.projectPath.split('/').filter(Boolean).at(-1) ?? 'repo')} → worktrees)</span>` : '';
   return `<div class="cat-a"><div class="row">${controls}${hint}</div>${cleanup.result ? `<div class="m">${esc(cleanup.result)}</div>` : ''}</div>`;
@@ -257,7 +259,7 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
   let state: StateDTO | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let alive = true;
-  let cleanupResult = '';
+  let cleanup = { pending: false, done: false, result: '' };
   const root = document.createElement('div');
   root.className = 'cat';
   container.append(root);
@@ -267,7 +269,8 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
     const keep = openDetails();
     root.classList.toggle('dark', ctx.theme === 'dark');
     root.innerHTML = cardHtml(ctx, state, {
-      archive: typeof host.archiveProject === 'function', delete: typeof host.deleteProject === 'function', result: cleanupResult,
+      archive: typeof host.archiveProject === 'function', delete: typeof host.deleteProject === 'function',
+      pending: cleanup.pending, done: cleanup.done, result: cleanup.result,
     });
     root.querySelectorAll('details').forEach((d, i) => { if (keep.has(i)) d.open = true; });
   }
@@ -286,21 +289,23 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
     const clean = (ev.target as Element).closest<HTMLButtonElement>('[data-clean]');
     if (!clean || !state?.current) return;
     const worker = state.current.agents.find((a) => a.id === clean.dataset.agent);
-    if (!worker?.branch || worker.status !== 'merged') return;
+    const projectPath = worker ? safeWorkerProject(worker, state.current) : null;
+    if (!worker || !projectPath || worker.status !== 'merged' || cleanup.pending || cleanup.done) return;
     const action = clean.dataset.clean as 'archive' | 'delete';
-    if (action === 'delete' && !confirm('Delete this worker project? Its sessions and transcripts will be removed.')) return;
-    clean.disabled = true;
-    const operation = action === 'archive' ? host.archiveProject?.(worker.cwd) : host.deleteProject?.(worker.cwd);
-    void Promise.resolve(operation).then(async (result) => {
+    if (action === 'delete' && !confirm(`Delete worker project ${worker.id} (${projectPath})? Its sessions and transcripts will be permanently removed.`)) return;
+    cleanup.pending = true;
+    draw();
+    void Promise.resolve().then(() => action === 'archive' ? host.archiveProject!(projectPath) : host.deleteProject!(projectPath)).then((result) => {
       if (result && typeof result === 'object' && 'ok' in result && !(result as { ok: boolean }).ok) {
-        cleanupResult = `Error: ${String((result as { error?: unknown }).error ?? 'cleanup failed')}`;
+        cleanup.result = `Error: ${String((result as { error?: unknown }).error ?? 'cleanup failed')}`;
       } else {
-        cleanupResult = action === 'archive' ? 'Archived' : 'Deleted';
-        await host.rpc('POST', `runs/${state!.current!.run.id}/workspaces/event`, {
+        cleanup.result = action === 'archive' ? 'Archived' : 'Deleted';
+        cleanup.done = true;
+        void Promise.resolve().then(() => host.rpc('POST', `runs/${state!.current!.run.id}/workspaces/event`, {
           agentId: worker.id, type: action === 'archive' ? 'workspace_archived' : 'workspace_deleted',
-        });
+        })).catch(() => undefined);
       }
-    }, (e) => { cleanupResult = `Error: ${(e as Error).message}`; }).finally(draw);
+    }, (e) => { cleanup.result = `Error: ${(e as Error).message}`; }).finally(() => { cleanup.pending = false; draw(); });
   });
   root.addEventListener('toggle', (ev) => {
     const el = ev.target as HTMLDetailsElement;

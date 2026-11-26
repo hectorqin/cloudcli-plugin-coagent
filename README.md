@@ -107,6 +107,10 @@ lead's current `HEAD`, and uses `git branch -d`. Unmerged, ended-unmerged, missi
 reported as skipped and are left intact. On vanilla CloudCLI, project cleanup functions are unavailable and the UI
 points to the worker project under the repository's sidebar worktree group instead.
 
+The tab only shows branch cleanup to the lead session, but this is a UI guard rather than a security boundary: every
+tab request is already authorized as the CloudCLI user. Git's ancestry check and `branch -d` are the deletion safety
+boundary.
+
 ## Caveats
 
 - Sessions started through CloudCLI's Agent API run with permissions bypassed. That covers every worker turn and

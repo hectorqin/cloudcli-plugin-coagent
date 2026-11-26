@@ -569,6 +569,47 @@ describe('merge gate', () => {
     expect(sh(repo, 'branch', '--list', checkedOut.branch!)).toContain(checkedOut.branch!);
     expect(store.events(run.id).at(-1)).toMatchObject({ type: 'branches_deleted', agentId: run.leadAgentId });
   });
+
+  it('skips a formerly merged branch when the lead HEAD moved behind it', async () => {
+    const run = await startApprovedRun();
+    const base = sh(repo, 'rev-parse', 'HEAD');
+    const w = await spawn('coder');
+    fs.writeFileSync(path.join(w.worktreePath!, 'moved.txt'), 'merged\n');
+    await call('request_merge', { worker: w.id });
+    await broker.decideGate(store.gates(run.id).find((g) => g.kind === 'merge')!.id, true, null);
+    await broker.settle();
+    sh(repo, 'checkout', '--detach', base);
+    const result = await broker.deleteMergedBranches(run.id, run.leadAgentId);
+    expect(result.deleted).toEqual([]);
+    expect(result.skipped).toContainEqual(expect.objectContaining({ agentId: w.id, reason: 'branch is not fully merged into the lead HEAD' }));
+    expect(sh(repo, 'branch', '--list', w.branch!)).toContain(w.branch!);
+  });
+
+  it('deletes a merged worker branch while the lead itself is on a detached HEAD', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    fs.writeFileSync(path.join(w.worktreePath!, 'detached.txt'), 'merged\n');
+    await call('request_merge', { worker: w.id });
+    await broker.decideGate(store.gates(run.id).find((g) => g.kind === 'merge')!.id, true, null);
+    await broker.settle();
+    sh(repo, 'checkout', '--detach', 'HEAD');
+    const result = await broker.deleteMergedBranches(run.id, run.leadAgentId);
+    expect(result.deleted).toEqual([{ agentId: w.id, branch: w.branch }]);
+  });
+
+  it('records workspace events only for canonical merged writer paths (ended writers may only be archived)', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    expect(() => broker.recordWorkspaceEvent(run.id, w.id, 'workspace_archived')).toThrow(/Only merged writer/);
+    store.updateAgent(w.id, { status: 'merged' });
+    expect(broker.recordWorkspaceEvent(run.id, w.id, 'workspace_deleted')).toEqual({ ok: true });
+    store.updateAgent(w.id, { status: 'ended' });
+    expect(() => broker.recordWorkspaceEvent(run.id, w.id, 'workspace_deleted')).toThrow(/Only merged writer/);
+    expect(broker.recordWorkspaceEvent(run.id, w.id, 'workspace_archived')).toEqual({ ok: true });
+    store.updateAgent(w.id, { status: 'merged' });
+    (store as unknown as { db: DatabaseSync }).db.prepare('UPDATE agents SET cwd = ? WHERE id = ?').run(repo, w.id);
+    expect(() => broker.recordWorkspaceEvent(run.id, w.id, 'workspace_archived')).toThrow(/Only merged writer/);
+  });
 });
 
 describe('wait_for_agents and batched results', () => {

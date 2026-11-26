@@ -140,6 +140,15 @@ describe('broker HTTP hardening and diagnostics', () => {
       .toMatchObject({ status: 200, body: { deleted: [{ agentId: 'coder-1' }], skipped: [] } });
   });
 
+  it('keeps workspace timeline events tab-authorized and validates their type', async () => {
+    const url = '/runs/r-1/workspaces/event';
+    expect((await request('POST', url, { body: '{"agentId":"coder-1","type":"workspace_archived"}' })).status).toBe(401);
+    const headers = { 'x-plugin-secret-apikey': 'tab-key' };
+    expect((await request('POST', url, { headers, body: '{"agentId":"coder-1","type":"other"}' })).status).toBe(400);
+    expect(await request('POST', url, { headers, body: '{"agentId":"coder-1","type":"workspace_deleted"}' }))
+      .toMatchObject({ status: 200, body: { ok: true } });
+  });
+
   it('keeps registration changes tab-authorized and reads the JSON action', async () => {
     expect((await request('POST', '/registration', { body: '{"action":"unregister"}' })).status).toBe(401);
     const result = await request('POST', '/registration', {
