@@ -31,7 +31,7 @@ It prints `PASS`/`FAIL` per provider, the removed paths, and a `SUMMARY` line.
 | Date | Provider | Result | Duration | Run | Notes |
 |---|---|---|---|---|---|
 | 2026-11-25 | claude | PASS | 48.6 s | r-58bde4 | Inline form answered by the tab decision; cleanup left nothing behind. |
-| — | codex | PENDING | — | — | Not run: Codex quota exhausted until about 19:13. |
+| 2026-11-26 | codex | PASS | 86.7 s | r-3c6cd7 | No inline form. Each tab decision reached the lead as a new broker-delivered turn (`turn_start` right after `gate_decided`). Cleanup left nothing behind. |
 
 ## Part 2 — browser checklist
 
@@ -66,9 +66,10 @@ Notes: ______________________________________________________________________
 - [ ] Pass  [ ] Fail — **Tab wins, form retracts.** Expected: leave the form open and decide the same gate in the
   CoAgent tab. The chat form disappears promptly, the tool call completes once with the tab's decision, and no
   second decision is possible.
-- [ ] Pass  [ ] Fail  [x] Pending — **Codex lead (no form).** Expected: a Codex lead shows no form. Its turn ends at
+- [ ] Pass  [ ] Fail — **Codex lead (no form).** Expected: a Codex lead shows no form. Its turn ends at
   the gate; deciding in the tab makes the broker deliver the decision as a new lead turn, and the flow continues to
-  the merge. *Pending: Codex quota exhausted until about 19:13 on 2026-11-25.*
+  the merge. *The broker side passed in Part 1 (2026-11-26); check
+  here that the chat shows no form and the new turns appear in the lead's session.*
 
 Notes: ______________________________________________________________________
 
@@ -119,7 +120,7 @@ Notes: ______________________________________________________________________
 
 ## Final result
 
-- [ ] Pass  [ ] Fail — Every required item passes (Codex items may stay pending), `main` holds the approved merge
+- [ ] Pass  [ ] Fail — Every required item passes, `main` holds the approved merge
   commit, and no worker worktree, pending gate or queued message is left.
 
 Overall notes / defects: ______________________________________________________
