@@ -22,16 +22,26 @@ endpoint after they have been pending for 4 s, checks that the merge gate diff m
 - the timeline has `run_started`, `gate_opened`, `gate_decided`, `spawned`, `turn_start`, `turn_end`, `wait_start`,
   `wait_end`, `merge`; both gates approved; no message left `queued` or `dispatching`.
 
-Timeout: 15 min per provider. Cleanup always runs, pass or fail, and only touches its own temp root: it ends the
-run (`removeWorktrees: true`), deletes the CloudCLI rows (`sessions`, `superseded_provider_sessions`,
-`scheduled_messages`, `projects`) whose project path is inside the temp root, their transcript files (Claude
-`~/.claude/projects/…` or Codex `~/.codex/sessions/…`), the Claude project dirs for the temp root, and the temp root.
-It prints `PASS`/`FAIL` per provider, the removed paths, and a `SUMMARY` line.
+Timeout: 15 min per provider. Cleanup (`scripts/e2e-cleanup.mjs`, unit-tested in `test/e2e-cleanup.test.ts`) always
+runs, pass or fail, from the moment the temp root exists, and only touches that root:
+
+1. It ends every coagent run whose project is inside the root (`removeWorktrees: true`). It then requires each end
+   to succeed with no kept worktree, the run to read back as ended, and every session involved to be idle
+   according to CloudCLI (`GET /api/agent/sessions/:id`, waiting up to 60 s for a finishing turn).
+2. If anything is uncertain, it deletes nothing. It prints `CLEANUP INCOMPLETE` with the problems and manual
+   steps, and exits non-zero.
+3. Otherwise it deletes the CloudCLI rows (`sessions`, `superseded_provider_sessions`, `scheduled_messages`,
+   `projects`) whose project path is inside the root, and the exact transcript files named by those rows or by the
+   run's own Claude agents. A Claude project dir is removed only if no file is left in it. It never scans by name
+   prefix and never follows a symlink. Finally it removes the root.
+
+It prints `PASS`/`FAIL` per provider, the removed and kept paths, and a `SUMMARY` line.
 
 | Date | Provider | Result | Duration | Run | Notes |
 |---|---|---|---|---|---|
 | 2026-11-25 | claude | PASS | 48.6 s | r-58bde4 | Inline form answered by the tab decision; cleanup left nothing behind. |
 | 2026-11-26 | codex | PASS | 86.7 s | r-3c6cd7 | No inline form. Each tab decision reached the lead as a new broker-delivered turn (`turn_start` right after `gate_decided`). Cleanup left nothing behind. |
+| 2026-11-26 | claude | PASS | 50.5 s | r-945c91 | Re-run to verify the rewritten cleanup. It kept the lead's Claude project dir because Claude Code had left an empty `memory/` folder in it; that case is now handled, and I removed the dir by hand. |
 
 ## Part 2 — browser checklist
 
@@ -101,7 +111,8 @@ Notes: ______________________________________________________________________
   whether to delete its worktree, frees its slot, rejects its pending merge request and tells the lead. Only that
   worker's worktree is removed; its branch is kept. Merged, ended or busy workers show no **End agent**.
 - [ ] Pass  [ ] Fail — **End run.** Expected: ending the run (optionally deleting unmerged worktrees) marks it ended;
-  any pending gate becomes `expired` and the run list shows no pending approvals for it.
+  any pending gate becomes `expired` and the run list shows no pending approvals for it. A lead waiting on a gate or
+  in `wait_for_agents` is told the run ended. If a worker is still mid-turn, its worktree is kept (not deleted).
 
 Notes: ______________________________________________________________________
 

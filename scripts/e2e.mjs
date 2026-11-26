@@ -9,8 +9,8 @@ import { execFile as execFileCb } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
+import { cleanupTempRoot, isInside } from './e2e-cleanup.mjs';
 
 const execFile = promisify(execFileCb);
 const CLOUDCLI_URL = 'http://127.0.0.1:3001';
@@ -75,15 +75,14 @@ async function git(cwd, ...args) {
   return stdout.trim();
 }
 
-async function makeRepo(provider) {
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), `coagent-e2e-${provider}-`));
+async function makeRepo(tempRoot) {
   const repo = path.join(tempRoot, 'repo');
   fs.mkdirSync(repo);
   await git(repo, 'init', '-q', '-b', 'main');
   fs.writeFileSync(path.join(repo, 'README.md'), 'coagent e2e fixture\n');
   await git(repo, 'add', 'README.md');
   await git(repo, '-c', 'user.name=coagent-e2e', '-c', 'user.email=coagent-e2e@localhost', 'commit', '-q', '-m', 'fixture');
-  return { tempRoot, repo, worktreeContainer: `${repo}-worktrees` };
+  return { tempRoot, repo };
 }
 
 async function jsonRequest(url, apiKey, { method = 'GET', body, signal } = {}) {
@@ -164,7 +163,9 @@ function findOurRun(state, repo) {
 async function exerciseProvider(provider, timeoutMs) {
   const started = Date.now();
   const { apiKey, brokerUrl } = readConfig();
-  const created = await makeRepo(provider);
+  // Cleanup owns the root from the moment it exists, even if building the fixture fails.
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), `coagent-e2e-${provider}-`));
+  const captured = new Map(); // the run's agents as seen while polling: the cleanup allowlist
   const { controller, clear } = deadlineSignal(timeoutMs);
   let runId = null;
   let leadBody = null;
@@ -176,6 +177,7 @@ async function exerciseProvider(provider, timeoutMs) {
   let stableCompletePolls = 0;
 
   try {
+    const created = await makeRepo(tempRoot);
     ({ bodyDone: leadBody, stream: leadStream } = await startLead(provider, created.repo, apiKey, controller.signal));
     leadBody.catch(() => undefined); // awaited in finally; avoid an unhandled rejection on abort
     while (!controller.signal.aborted) {
@@ -197,6 +199,7 @@ async function exerciseProvider(provider, timeoutMs) {
       const state = await jsonRequest(`${brokerUrl}/state?run=${encodeURIComponent(runId)}`, apiKey, { signal: controller.signal });
       const detail = state.current;
       assert.ok(detail, `run ${runId} disappeared from broker state`);
+      for (const agent of detail.agents) captured.set(agent.id, agent);
       const worker = detail.agents.find((agent) => agent.role !== 'lead');
       if (worker?.worktreePath) workerPath = worker.worktreePath;
       assert.ok(detail.agents.filter((agent) => agent.role !== 'lead').length <= 1, 'lead spawned more than one worker');
@@ -235,7 +238,7 @@ async function exerciseProvider(provider, timeoutMs) {
     clear();
     controller.abort();
     if (leadBody) await leadBody.catch(() => undefined);
-    await cleanup({ tempRoot: created.tempRoot, runId, brokerUrl, apiKey });
+    await cleanup({ tempRoot, brokerUrl, apiKey, captured: [...captured.values()] });
   }
 }
 
@@ -245,7 +248,7 @@ async function assertOutcome(detail, created, workerPath) {
   assert.equal(worker.status, 'merged', `worker did not reach merged status (was ${worker.status})`);
   assert.equal(worker.worktreePath, null, 'merged worker retained its worktree path');
   assert.ok(workerPath, 'worker worktree path was never observed');
-  assert.ok(path.resolve(workerPath).startsWith(`${path.resolve(created.tempRoot)}${path.sep}`), 'worker path escaped the temporary root');
+  assert.ok(isInside(created.tempRoot, workerPath), 'worker path escaped the temporary root');
   assert.equal(fs.existsSync(workerPath), false, 'worker worktree still exists on disk');
   assert.equal(await git(created.repo, 'branch', '--show-current'), 'main', 'fixture is no longer on main');
   const hello = fs.readFileSync(path.join(created.repo, 'hello.txt'), 'utf8');
@@ -264,105 +267,53 @@ async function assertOutcome(detail, created, workerPath) {
   assert.equal(detail.messages.filter((message) => ['queued', 'dispatching'].includes(message.state)).length, 0, 'messages remain queued or dispatching');
 }
 
-function isInside(root, candidate) {
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+/** CloudCLI's view of a session: true = running a turn, false = idle or unknown to it, null = cannot tell. */
+function sessionStatusClient(apiKey) {
+  let supported = null;
+  return async (id) => {
+    const headers = { 'x-api-key': apiKey };
+    if (supported === null) {
+      const caps = await fetch(`${CLOUDCLI_URL}/api/agent/capabilities`, { headers }).catch(() => null);
+      if (!caps?.ok) return null;
+      supported = (await caps.json()).sessionStatus === true;
+    }
+    if (!supported) return null;
+    const res = await fetch(`${CLOUDCLI_URL}/api/agent/sessions/${encodeURIComponent(id)}`, { headers }).catch(() => null);
+    if (!res) return null;
+    if (res.status === 404) return false;
+    if (!res.ok) return null;
+    const body = await res.json();
+    return typeof body.processing === 'boolean' ? body.processing : null;
+  };
 }
 
-function sqlPlaceholders(values) {
-  return values.map(() => '?').join(',');
-}
+let cleanupIncomplete = false;
 
-/** Claude Code names a project's transcript dir after its cwd with every non-alphanumeric character replaced by '-'. */
-function claudeProjectDirName(projectPath) {
-  return projectPath.replace(/[^a-zA-Z0-9]/g, '-');
-}
-
-function cleanupCloudCli(tempRoot) {
+async function cleanup({ tempRoot, brokerUrl, apiKey, captured }) {
   const home = os.homedir();
-  const dbPath = path.join(home, '.cloudcli', 'auth.db');
-  const claudeRoot = path.join(home, '.claude', 'projects');
-  const codexRoot = path.join(home, '.codex', 'sessions');
-  const result = { rows: {}, transcripts: [], claudeDirs: [] };
-  if (fs.existsSync(dbPath)) {
-    const db = new DatabaseSync(dbPath);
-    try {
-      db.exec('PRAGMA busy_timeout = 10000');
-      // Match in JS rather than with LIKE, whose '_' and '%' wildcards could reach outside the temp root.
-      const ours = (row) => isInside(tempRoot, String(row.project_path));
-      const sessions = db.prepare('SELECT session_id, project_path, jsonl_path FROM sessions').all().filter(ours);
-      const projects = db.prepare('SELECT project_id, project_path FROM projects').all().filter(ours);
-      const sessionIds = sessions.map((row) => String(row.session_id));
-      const superseded = sessionIds.length
-        ? db.prepare(`SELECT jsonl_path FROM superseded_provider_sessions WHERE session_id IN (${sqlPlaceholders(sessionIds)})`).all(...sessionIds)
-        : [];
-      const counts = { scheduled_messages: 0, superseded_provider_sessions: 0, sessions: 0, projects: 0 };
-      db.exec('BEGIN IMMEDIATE');
-      try {
-        if (sessionIds.length) {
-          const ph = sqlPlaceholders(sessionIds);
-          counts.scheduled_messages = Number(db.prepare(`DELETE FROM scheduled_messages WHERE session_id IN (${ph})`).run(...sessionIds).changes);
-          counts.superseded_provider_sessions = Number(db.prepare(`DELETE FROM superseded_provider_sessions WHERE session_id IN (${ph})`).run(...sessionIds).changes);
-          counts.sessions = Number(db.prepare(`DELETE FROM sessions WHERE session_id IN (${ph})`).run(...sessionIds).changes);
-        }
-        for (const row of projects) counts.projects += Number(db.prepare('DELETE FROM projects WHERE project_id = ?').run(row.project_id).changes);
-        db.exec('COMMIT');
-      } catch (error) {
-        db.exec('ROLLBACK');
-        throw error;
-      }
-      result.rows = counts;
-      const transcripts = [...new Set([...sessions, ...superseded].map((row) => row.jsonl_path && String(row.jsonl_path)).filter(Boolean))];
-      for (const file of transcripts) {
-        if (!isInside(claudeRoot, file) && !isInside(codexRoot, file)) {
-          console.error(`cleanup warning: not removing transcript outside ${claudeRoot} and ${codexRoot}: ${file}`);
-          continue;
-        }
-        if (fs.existsSync(file)) { fs.rmSync(file); result.transcripts.push(file); }
-      }
-    } finally {
-      db.close();
-    }
+  const result = await cleanupTempRoot({
+    tempRoot,
+    dbPath: path.join(home, '.cloudcli', 'auth.db'),
+    claudeRoot: path.join(home, '.claude', 'projects'),
+    codexRoot: path.join(home, '.codex', 'sessions'),
+    captured,
+    sessionStatus: sessionStatusClient(apiKey),
+    broker: {
+      runs: async () => (await jsonRequest(`${brokerUrl}/state`, apiKey)).runs,
+      detail: async (id) => (await jsonRequest(`${brokerUrl}/state?run=${encodeURIComponent(id)}`, apiKey)).current,
+      endRun: (id) => jsonRequest(`${brokerUrl}/runs/${encodeURIComponent(id)}/end`, apiKey, { method: 'POST', body: { removeWorktrees: true } }),
+    },
+  });
+  console.log(`CLEAN ${path.basename(tempRoot)}: endedRuns=${result.endedRuns.join(',') || 'none'} rows=${JSON.stringify(result.rows)}`);
+  for (const file of result.removed) console.log(`  removed ${file}`);
+  for (const file of result.kept) console.log(`  kept ${file}`);
+  if (!result.ok) {
+    cleanupIncomplete = true;
+    console.error(`CLEANUP INCOMPLETE for ${tempRoot}:`);
+    for (const problem of result.problems) console.error(`  - ${problem}`);
+    console.error('Manual cleanup steps:');
+    for (const step of result.manual) console.error(`  * ${step}`);
   }
-  // Every Claude transcript dir for a path under the temp root (lead repo and worker worktrees) shares this prefix.
-  const prefix = `${claudeProjectDirName(tempRoot)}-`;
-  if (fs.existsSync(claudeRoot)) {
-    for (const name of fs.readdirSync(claudeRoot)) {
-      if (!name.startsWith(prefix)) continue;
-      const dir = path.join(claudeRoot, name);
-      fs.rmSync(dir, { recursive: true, force: true });
-      result.claudeDirs.push(dir);
-    }
-  }
-  return result;
-}
-
-async function cleanup({ tempRoot, runId, brokerUrl, apiKey }) {
-  // Only ever touch a directory this script created with mkdtemp under os.tmpdir().
-  if (path.dirname(path.resolve(tempRoot)) !== path.resolve(os.tmpdir()) || !path.basename(tempRoot).startsWith('coagent-e2e-')) {
-    throw new Error(`refusing to clean up unexpected temp root: ${tempRoot}`);
-  }
-  const removed = { runs: [], rows: {}, transcripts: [], claudeDirs: [], paths: [] };
-  try {
-    // The run may have been created after the last poll, so look it up again by project path.
-    const summary = await jsonRequest(`${brokerUrl}/state`, apiKey);
-    const ids = new Set(summary.runs.filter((run) => run.status === 'active' && isInside(tempRoot, run.projectPath)).map((run) => run.id));
-    if (runId && summary.runs.some((run) => run.id === runId && run.status === 'active')) ids.add(runId);
-    for (const id of ids) {
-      await jsonRequest(`${brokerUrl}/runs/${encodeURIComponent(id)}/end`, apiKey, { method: 'POST', body: { removeWorktrees: true } });
-      removed.runs.push(id);
-    }
-  } catch (error) {
-    console.error(`cleanup warning: could not end run(s) for ${tempRoot}: ${error.message}`);
-  }
-  try {
-    Object.assign(removed, cleanupCloudCli(tempRoot));
-  } catch (error) {
-    console.error(`cleanup warning: CloudCLI row/transcript cleanup failed: ${error.message}`);
-  }
-  if (fs.existsSync(tempRoot)) { fs.rmSync(tempRoot, { recursive: true, force: true }); removed.paths.push(tempRoot); }
-  console.log(`CLEAN ${path.basename(tempRoot)}: endedRuns=${removed.runs.join(',') || 'none'} rows=${JSON.stringify(removed.rows)}`);
-  for (const file of [...removed.transcripts, ...removed.claudeDirs, ...removed.paths]) console.log(`  removed ${file}`);
 }
 
 const { providers, timeoutMs } = parseArgs(process.argv.slice(2));
@@ -379,4 +330,5 @@ for (const provider of providers) {
   }
 }
 console.log(`SUMMARY ${results.map((result) => `${result.provider}:${result.ok ? 'PASS' : 'FAIL'}:${(result.durationMs / 1000).toFixed(1)}s`).join(' ')}`);
-if (results.some((result) => !result.ok)) process.exitCode = 1;
+if (cleanupIncomplete) console.error('CLEANUP INCOMPLETE: see the manual steps above.');
+if (results.some((result) => !result.ok) || cleanupIncomplete) process.exitCode = 1;
