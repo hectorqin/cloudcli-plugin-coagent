@@ -475,10 +475,19 @@ export class Broker {
           if (!(await git.isAncestor(leadAgent.cwd, snapshot.leadHead, leadHead))) {
             expire('the lead branch diverged from the reviewed head'); return;
           }
-          // Decide before touching the repository: if the gate is no longer pending, nothing is merged.
-          if (!store.decideGate(gate.id, 'approved', comment)) return;
-          const res = await git.merge(leadAgent.cwd, snapshot.workerHead, `coagent: merge ${w.branch} (${w.role} ${w.id})`, leadHead);
-          store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'approved', comment });
+          // The gate stays pending while git merges (every competing decision waits for this lock). It is approved
+          // only if the merge landed; a merge that fails or throws leaves it 'failed', and the lead is told either way.
+          let res: Awaited<ReturnType<typeof git.merge>>;
+          try {
+            res = await git.merge(leadAgent.cwd, snapshot.workerHead, `coagent: merge ${w.branch} (${w.role} ${w.id})`, leadHead);
+          } catch (e) {
+            res = { ok: false, reason: (e as Error).message.split('\n')[0] || 'git merge failed', conflicts: [] };
+          }
+          const status = res.ok ? 'approved' : 'failed';
+          if (!store.decideGate(gate.id, status, comment)) this.log('merge gate decided while merging', { runId: run.id, gate: gate.id });
+          store.addEvent(run.id, null, 'gate_decided', res.ok
+            ? { gate: gate.id, kind: 'merge', subject: w.id, status, comment }
+            : { gate: gate.id, kind: 'merge', subject: w.id, status, reason: res.reason, comment });
           store.addEvent(run.id, w.id, 'merge', res.ok
             ? { ok: true, commit: res.commit, branch: w.branch, snapshot: snapshot.workerHead, baseMoved: res.baseMoved, actualBase: res.actualBase }
             : { ok: false, reason: res.reason, conflicts: res.conflicts, branch: w.branch, snapshot: snapshot.workerHead });

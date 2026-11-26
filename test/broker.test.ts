@@ -1669,6 +1669,75 @@ describe('end_agent / endRun re-review (lock scope, persisted stop)', () => {
   });
 });
 
+describe('merge gate outcome (third review)', () => {
+  /** A worker that committed `file`, with its merge gate open. */
+  async function openMerge(file: string, text = 'worker\n') {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    fs.writeFileSync(path.join(w.worktreePath!, file), text);
+    sh(w.worktreePath!, 'add', '.');
+    sh(w.worktreePath!, 'commit', '-qm', file);
+    await call('request_merge', { worker: w.id });
+    return { run, w, gate: store.gates(run.id).find((g) => g.kind === 'merge')! };
+  }
+  const expectFailed = (runId: string, gateId: number, reason: RegExp) => {
+    expect(store.gate(gateId)!.status).toBe('failed');
+    const decided = store.events(runId).filter((e) => e.type === 'gate_decided' && e.data.gate === gateId);
+    expect(decided.map((e) => e.data.status)).toEqual(['failed']);
+    expect(String(decided[0].data.reason)).toMatch(reason);
+    expect(store.events(runId).find((e) => e.type === 'merge')!.data).toMatchObject({ ok: false });
+    expect(store.messages(runId).filter((m) => m.kind === 'gate' && m.body.includes(`merge FAILED`))).toHaveLength(1);
+  };
+
+  it('a dirty lead tree fails the merge: the gate is failed, not approved, and the worker stays mergeable', async () => {
+    const { run, w, gate } = await openMerge('shared.txt');
+    fs.writeFileSync(path.join(repo, 'shared.txt'), 'uncommitted lead edit\n'); // would be overwritten
+    const head = sh(repo, 'rev-parse', 'HEAD');
+    await broker.decideGate(gate.id, true, null);
+    await broker.settle();
+    expectFailed(run.id, gate.id, /.+/);
+    expect(sh(repo, 'rev-parse', 'HEAD')).toBe(head);
+    expect(fs.readFileSync(path.join(repo, 'shared.txt'), 'utf8')).toBe('uncommitted lead edit\n');
+    expect(store.agent(w.id)!.status).not.toBe('merged');
+    expect(fs.existsSync(w.worktreePath!)).toBe(true);
+    // Not stuck: the lead can request the merge again once the tree is clean.
+    fs.rmSync(path.join(repo, 'shared.txt'));
+    expect((await call('request_merge', { worker: w.id })).text).toMatch(/submitted as gate/);
+  });
+
+  it('a conflict fails the merge and lists the conflicting files', async () => {
+    const { run, gate } = await openMerge('README.md', 'worker\n');
+    fs.writeFileSync(path.join(repo, 'README.md'), 'lead\n');
+    sh(repo, 'commit', '-qam', 'lead edit');
+    await broker.decideGate(gate.id, true, null);
+    await broker.settle();
+    expectFailed(run.id, gate.id, /merge conflict/);
+    expect(store.messages(run.id).find((m) => m.body.includes('merge FAILED'))!.body).toMatch(/- README.md/);
+    expect(sh(repo, 'status', '--porcelain')).toBe('');
+  });
+
+  it('a merge that throws fails the gate and still tells the lead', async () => {
+    const { run, w, gate } = await openMerge('t.txt');
+    broker = new Broker({
+      store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock,
+      git: { ...Git, merge: async () => { throw new Error('fatal: bad object deadbeef\nmore detail'); } },
+    });
+    const decided = await broker.decideGate(gate.id, true, null);
+    await broker.settle();
+    expect(decided.status).toBe('failed');
+    expectFailed(run.id, gate.id, /^fatal: bad object deadbeef$/);
+    expect(store.agent(w.id)!.status).not.toBe('merged');
+  });
+
+  it('a successful merge is approved exactly once', async () => {
+    const { run, gate } = await openMerge('ok.txt');
+    await broker.decideGate(gate.id, true, null);
+    await broker.settle();
+    expect(store.gate(gate.id)!.status).toBe('approved');
+    expect(store.events(run.id).filter((e) => e.type === 'gate_decided' && e.data.gate === gate.id).map((e) => e.data.status)).toEqual(['approved']);
+  });
+});
+
 describe('turn usage', () => {
   /** Stream events only (what onEvent receives): drop the route's session-id/done objects. */
   const stream = (events: Record<string, unknown>[]) => events.filter((e) => e.type !== 'session-id' && e.type !== 'done');

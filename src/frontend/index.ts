@@ -43,7 +43,7 @@ const CSS = `
 .ca .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.ca .grow{flex:1;min-width:0}
 .ca .badge{display:inline-block;padding:0 7px;border-radius:999px;border:1px solid var(--line);font-size:11px;line-height:18px;white-space:nowrap}
 .ca .t-accent,.ca .b-lead{color:var(--accent);border-color:var(--accent)}.ca .t-warn,.ca .b-running,.ca .b-starting,.ca .b-pending,.ca .b-interrupted{color:var(--warn);border-color:var(--warn)}
-.ca .t-ok,.ca .b-reported,.ca .b-merged,.ca .b-approved{color:var(--ok);border-color:var(--ok)}.ca .t-error,.ca .b-error,.ca .b-rejected,.ca .b-expired{color:var(--bad);border-color:var(--bad)}
+.ca .t-ok,.ca .b-reported,.ca .b-merged,.ca .b-approved{color:var(--ok);border-color:var(--ok)}.ca .t-error,.ca .b-error,.ca .b-rejected,.ca .b-expired,.ca .b-failed{color:var(--bad);border-color:var(--bad)}
 .ca pre{white-space:pre-wrap;word-break:break-word;margin:6px 0 0;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:40vh;overflow:auto}
 .ca .files{margin:6px 0;border:1px solid var(--line);border-radius:6px;overflow:hidden}.ca .file{display:flex;gap:8px;padding:3px 7px;border-top:1px solid var(--line);font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}.ca .file:first-child{border-top:0}.ca .file .path{flex:1;min-width:0;overflow-wrap:anywhere}.ca .plus{color:var(--ok)}.ca .minus{color:var(--bad)}
 .ca details>summary{cursor:pointer;color:var(--muted)}

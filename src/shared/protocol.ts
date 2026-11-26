@@ -55,7 +55,8 @@ export type AgentStatus = 'lead' | 'starting' | 'running' | 'idle' | 'reported' 
  */
 export type DeliveryState = 'queued' | 'dispatching' | 'delivered' | 'cancelled';
 export type GateKind = 'plan' | 'merge';
-export type GateStatus = 'pending' | 'approved' | 'rejected' | 'expired';
+/** 'failed': the user approved a merge, but git could not merge it (nothing changed; the lead may request again). */
+export type GateStatus = 'pending' | 'approved' | 'rejected' | 'expired' | 'failed';
 
 export interface MergeSnapshotFile {
   path: string;
