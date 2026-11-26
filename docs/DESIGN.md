@@ -187,3 +187,10 @@ tab 改为泳道时序图：每个 agent 一条泳道（最左为 You），时�
 - **用户中止**：已被接受的 turn 被用户在 CloudCLI 中止时（`complete.aborted` / `status.aborted`），send 返回 `aborted`，turn 记 `aborted`，投递关闭不重试，worker 置 idle 并以 system 消息告知 lead（不按失败处理）。
 - **查询开销**：`/state` 的 run 列表与当前 run 的 agent 用量都用分组查询批量计算，查询数不随历史增长。迁移项以 `MIGRATIONS`（含 `TURNS_MIGRATION`）导出，`pendingMigrations(db)` 只读判断是否需要迁移。
 - 只覆盖 broker 跑的 turn；用户在 UI 里直接与 lead 的对话不经过 broker，不计入。
+
+## 14. 合并后的清理（2026-11-26，Q38–Q40）
+
+- writer 合并后自动删除 git worktree，但保留 CloudCLI project/session/transcript 和分支；planner/reviewer 与 lead 共用 project，绝不能归档或删除。
+- fork 在 tab API 与 tool renderer host 暴露可选的 `archiveProject(projectPath)` / `deleteProject(projectPath)`。合并卡片与 agent/gate 抽屉按能力检测显示“Archive worker session”（保留 session，可从 archive view 恢复）和需确认的 Delete（连 session/transcript 删除）；vanilla host 显示 sidebar worktrees 位置提示。run 结束后可逐个、非阻塞地批量归档 writer project。
+- UI 成功调用 host 后，通过 tab 鉴权的事件路由记录 `workspace_archived` / `workspace_deleted`；失败只显示对应 item 的错误，不阻断其他清理。
+- 分支清理与 `endRun` 分离且从不自动执行。lead 显式调用 `POST /runs/:id/branches/delete-merged`：仅处理状态为 merged 且 tip 是 lead 当前 `HEAD` ancestor 的 worker 分支，并只用 `git branch -d`。未合并、ended-unmerged、缺失或仍被 worktree checkout 的分支均保留并返回原因；结果记录为 `branches_deleted`。

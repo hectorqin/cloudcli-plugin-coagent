@@ -538,6 +538,37 @@ describe('merge gate', () => {
     expect(store.run(run.id)!.status).toBe('ended');
     expect((await call('list_agents', {})).ok).toBe(false); // ended runs no longer resolve identities
   });
+
+  it('deletes only merged worker branches, reports safe-delete skips, and rejects a non-lead caller', async () => {
+    const run = await startApprovedRun();
+    const gone = await spawn('coder');
+    const checkedOut = await spawn('coder');
+    const unmerged = await spawn('coder');
+    const ended = await spawn('coder');
+    for (const w of [gone, checkedOut]) {
+      fs.writeFileSync(path.join(w.worktreePath!, `${w.id}.txt`), `${w.id}\n`);
+      await call('request_merge', { worker: w.id });
+      const gate = store.gates(run.id).findLast((g) => g.kind === 'merge' && g.subjectAgent === w.id)!;
+      await broker.decideGate(gate.id, true, null);
+      await broker.settle();
+    }
+    await broker.endAgent(ended.id, false, null);
+    const checkout = path.join(tmp, 'checked-out-branch');
+    // A failed automatic worktree cleanup already exercises this condition; otherwise check it out anew.
+    if (!fs.existsSync(checkedOut.worktreePath!)) sh(repo, 'worktree', 'add', checkout, checkedOut.branch!);
+
+    await expect(broker.deleteMergedBranches(run.id, unmerged.id)).rejects.toMatchObject({ code: 403 });
+    const result = await broker.deleteMergedBranches(run.id, run.leadAgentId);
+    expect(result.deleted).toEqual([{ agentId: gone.id, branch: gone.branch }]);
+    expect(result.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: checkedOut.id, reason: expect.stringMatching(/checked out|worktree/i) }),
+      expect.objectContaining({ agentId: unmerged.id, reason: 'worker is not merged' }),
+      expect.objectContaining({ agentId: ended.id, reason: 'worker ended without being merged' }),
+    ]));
+    expect(sh(repo, 'branch', '--list', gone.branch!)).toBe('');
+    expect(sh(repo, 'branch', '--list', checkedOut.branch!)).toContain(checkedOut.branch!);
+    expect(store.events(run.id).at(-1)).toMatchObject({ type: 'branches_deleted', agentId: run.leadAgentId });
+  });
 });
 
 describe('wait_for_agents and batched results', () => {

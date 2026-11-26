@@ -633,6 +633,51 @@ export class Broker {
     store.addEvent(run.id, null, 'run_ended', { removeWorktrees });
   }
 
+  /** User-requested cleanup, deliberately separate from endRun: branches are never removed automatically. */
+  async deleteMergedBranches(runId: string, byAgentId: string) {
+    const { store, git } = this.d;
+    const run = store.run(runId) ?? fail(`No run ${runId}`);
+    if (byAgentId !== run.leadAgentId) fail(`Only the lead (${run.leadAgentId}) can delete run branches.`, 403);
+    const lead = store.agent(run.leadAgentId)!;
+    const deleted: { agentId: string; branch: string }[] = [];
+    const skipped: { agentId: string; branch: string; reason: string }[] = [];
+    const repoKey = await git.commonDir(lead.cwd);
+    await withRepoMutex(repoKey, async () => {
+      const head = await git.head(lead.cwd);
+      for (const worker of store.agents(run.id).filter((a) => a.branch)) {
+        const branch = worker.branch!;
+        if (worker.status !== 'merged') {
+          skipped.push({ agentId: worker.id, branch, reason: worker.status === 'ended' ? 'worker ended without being merged' : 'worker is not merged' });
+          continue;
+        }
+        let tip: string;
+        try { tip = await git.resolve(lead.cwd, branch); } catch {
+          skipped.push({ agentId: worker.id, branch, reason: 'branch does not exist' });
+          continue;
+        }
+        if (!(await git.isAncestor(lead.cwd, tip, head))) {
+          skipped.push({ agentId: worker.id, branch, reason: 'branch is not fully merged into the lead HEAD' });
+          continue;
+        }
+        const result = await git.deleteBranch(lead.cwd, branch);
+        if (result.ok) deleted.push({ agentId: worker.id, branch });
+        else skipped.push({ agentId: worker.id, branch, reason: result.reason });
+      }
+    });
+    store.addEvent(run.id, byAgentId, 'branches_deleted', { deleted, skipped });
+    return { deleted, skipped };
+  }
+
+  recordWorkspaceEvent(runId: string, agentId: string, type: 'workspace_archived' | 'workspace_deleted') {
+    const { store } = this.d;
+    const run = store.run(runId) ?? fail(`No run ${runId}`);
+    const agent = store.agent(agentId) ?? fail(`No agent ${agentId}`);
+    if (agent.runId !== run.id) fail(`${agentId} is not part of run ${run.id}`);
+    if (!agent.branch || agent.cwd === store.agent(run.leadAgentId)?.cwd) fail('Only writer workspaces can be archived or deleted.');
+    store.addEvent(run.id, agent.id, type, { projectPath: agent.cwd });
+    return { ok: true };
+  }
+
   // ── state for the tab ─────────────────────────────────────────────
   state(appSessionId: string | null, runId: string | null): StateDTO {
     const { store, cloudcli } = this.d;

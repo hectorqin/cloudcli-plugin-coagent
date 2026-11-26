@@ -29,6 +29,11 @@ const fakeBroker = {
   },
   userMessage: () => 'Waiting for a worker slot.',
   endAgent: async (id: string, removeWorktree: boolean) => `Ended ${id}; remove=${removeWorktree}.`,
+  deleteMergedBranches: (runId: string, agentId: string) => {
+    if (agentId !== 'lead') throw new ToolError('Only the lead can delete run branches.', 403);
+    return { deleted: [{ agentId: 'coder-1', branch: `coagent/${runId}/coder-1` }], skipped: [] };
+  },
+  recordWorkspaceEvent: () => ({ ok: true }),
 } as unknown as Broker;
 
 describe('broker HTTP hardening and diagnostics', () => {
@@ -123,6 +128,16 @@ describe('broker HTTP hardening and diagnostics', () => {
       .toMatchObject({ status: 200, body: { ok: true, note: 'Waiting for a worker slot.' } });
     expect(await request('POST', '/agents/coder-1/end', { headers, body: '{"removeWorktree":true}' }))
       .toMatchObject({ status: 200, body: { ok: true, text: 'Ended coder-1; remove=true.' } });
+  });
+
+  it('keeps branch deletion tab-authorized and preserves lead-only ToolErrors', async () => {
+    const url = '/runs/r-1/branches/delete-merged';
+    expect((await request('POST', url, { body: '{"agentId":"lead"}' })).status).toBe(401);
+    const headers = { 'x-plugin-secret-apikey': 'tab-key' };
+    expect(await request('POST', url, { headers, body: '{"agentId":"worker"}' }))
+      .toMatchObject({ status: 403, body: { error: 'Only the lead can delete run branches.' } });
+    expect(await request('POST', url, { headers, body: '{"agentId":"lead"}' }))
+      .toMatchObject({ status: 200, body: { deleted: [{ agentId: 'coder-1' }], skipped: [] } });
   });
 
   it('keeps registration changes tab-authorized and reads the JSON action', async () => {

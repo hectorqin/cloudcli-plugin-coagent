@@ -19,6 +19,8 @@ export interface ToolContext {
 export interface ToolHost {
   rpc(method: string, path: string, body?: unknown): Promise<unknown>;
   openSession(sessionId: string): void;
+  archiveProject?(projectPath: string): Promise<{ ok: true } | { ok: false; error: unknown }>;
+  deleteProject?(projectPath: string): Promise<unknown>;
 }
 
 const POLL_MS = 2000;
@@ -179,7 +181,18 @@ export function agentsFor(ctx: ToolContext, run: RunDetailDTO | null): AgentDTO[
   return [];
 }
 
-export function cardHtml(ctx: ToolContext, state: StateDTO | null): string {
+interface CleanupView { archive: boolean; delete: boolean; result?: string }
+
+function cleanupHtml(worker: AgentDTO | undefined, run: RunDetailDTO | null, cleanup: CleanupView): string {
+  if (!worker?.branch || worker.status !== 'merged') return '';
+  const controls = `${cleanup.archive ? `<button class="primary" data-clean="archive" data-agent="${esc(worker.id)}">Archive worker session</button>` : ''}
+    ${cleanup.delete ? `<button class="danger" data-clean="delete" data-agent="${esc(worker.id)}">Delete</button>` : ''}`;
+  const hint = !cleanup.archive && !cleanup.delete
+    ? `<span class="m">Archive it from the sidebar (the project is under ${esc(run?.run.projectPath.split('/').filter(Boolean).at(-1) ?? 'repo')} → worktrees)</span>` : '';
+  return `<div class="cat-a"><div class="row">${controls}${hint}</div>${cleanup.result ? `<div class="m">${esc(cleanup.result)}</div>` : ''}</div>`;
+}
+
+export function cardHtml(ctx: ToolContext, state: StateDTO | null, cleanup: CleanupView = { archive: false, delete: false }): string {
   const name = shortName(ctx.toolName);
   const run = state?.current ?? null;
   const args = input(ctx);
@@ -226,7 +239,8 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null): string {
         <details data-diff="${gate.id}"><summary>View diff${gate.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details></div>` : '';
       return head(title, gate?.comment ? `comment: ${gate.comment}` : '', badge)
         + `<div class="cat-a"><details ${st === 'pending' ? 'open' : ''}><summary>${kind === 'plan' ? 'Plan' : 'Note'}</summary><pre>${esc(body)}</pre></details></div>`
-        + review + hint + resultBlock;
+        + review + hint + (kind === 'merge' && st === 'approved'
+          ? cleanupHtml(run?.agents.find((a) => a.id === gate?.subjectAgent), run, cleanup) : '') + resultBlock;
     }
     case 'send_message':
       return head('Message', `→ ${String(args.to ?? '')}: ${clip(String(args.body ?? ''), 120)}`) + resultBlock;
@@ -243,6 +257,7 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
   let state: StateDTO | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let alive = true;
+  let cleanupResult = '';
   const root = document.createElement('div');
   root.className = 'cat';
   container.append(root);
@@ -251,7 +266,9 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
   function draw() {
     const keep = openDetails();
     root.classList.toggle('dark', ctx.theme === 'dark');
-    root.innerHTML = cardHtml(ctx, state);
+    root.innerHTML = cardHtml(ctx, state, {
+      archive: typeof host.archiveProject === 'function', delete: typeof host.deleteProject === 'function', result: cleanupResult,
+    });
     root.querySelectorAll('details').forEach((d, i) => { if (keep.has(i)) d.open = true; });
   }
   const live = () => ctx.status === 'running'
@@ -266,6 +283,24 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
   root.addEventListener('click', (ev) => {
     const btn = (ev.target as Element).closest<HTMLElement>('[data-open]');
     if (btn) host.openSession(btn.dataset.open!);
+    const clean = (ev.target as Element).closest<HTMLButtonElement>('[data-clean]');
+    if (!clean || !state?.current) return;
+    const worker = state.current.agents.find((a) => a.id === clean.dataset.agent);
+    if (!worker?.branch || worker.status !== 'merged') return;
+    const action = clean.dataset.clean as 'archive' | 'delete';
+    if (action === 'delete' && !confirm('Delete this worker project? Its sessions and transcripts will be removed.')) return;
+    clean.disabled = true;
+    const operation = action === 'archive' ? host.archiveProject?.(worker.cwd) : host.deleteProject?.(worker.cwd);
+    void Promise.resolve(operation).then(async (result) => {
+      if (result && typeof result === 'object' && 'ok' in result && !(result as { ok: boolean }).ok) {
+        cleanupResult = `Error: ${String((result as { error?: unknown }).error ?? 'cleanup failed')}`;
+      } else {
+        cleanupResult = action === 'archive' ? 'Archived' : 'Deleted';
+        await host.rpc('POST', `runs/${state!.current!.run.id}/workspaces/event`, {
+          agentId: worker.id, type: action === 'archive' ? 'workspace_archived' : 'workspace_deleted',
+        });
+      }
+    }, (e) => { cleanupResult = `Error: ${(e as Error).message}`; }).finally(draw);
   });
   root.addEventListener('toggle', (ev) => {
     const el = ev.target as HTMLDetailsElement;

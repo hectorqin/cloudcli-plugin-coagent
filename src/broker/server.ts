@@ -170,6 +170,15 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
     if ((match = p.match(/^\/runs\/([\w-]+)\/end$/)) && method === 'POST') {
       const body = await readJson(req); await d.broker.endRun(match[1], body.removeWorktrees === true); return { ok: true };
     }
+    if ((match = p.match(/^\/runs\/([\w-]+)\/branches\/delete-merged$/)) && method === 'POST') {
+      const body = await readJson(req);
+      return d.broker.deleteMergedBranches(match[1], String(body.agentId ?? ''));
+    }
+    if ((match = p.match(/^\/runs\/([\w-]+)\/workspaces\/event$/)) && method === 'POST') {
+      const body = await readJson(req);
+      if (body.type !== 'workspace_archived' && body.type !== 'workspace_deleted') throw new HttpError(400, 'invalid workspace event type');
+      return d.broker.recordWorkspaceEvent(match[1], String(body.agentId ?? ''), body.type);
+    }
     throw new HttpError(404, 'not found');
   }
 

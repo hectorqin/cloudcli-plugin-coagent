@@ -13,6 +13,8 @@ interface PluginAPI {
   readonly context: PluginContext;
   onContextChange(cb: (ctx: PluginContext) => void): () => void;
   rpc(method: string, path: string, body?: unknown): Promise<unknown>;
+  archiveProject?(projectPath: string): Promise<{ ok: true } | { ok: false; error: unknown }>;
+  deleteProject?(projectPath: string): Promise<unknown>;
 }
 
 const POLL_MS = 2000;
@@ -83,6 +85,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   let diagnosticsOpen = false;
   let diagnostics: unknown = null;
   const drafts = new Map<string, string>();
+  const cleanupResults = new Map<string, string>();
   /** Gate diffs the user opened: kept open across re-renders (the diff itself is cached by diffView). */
   const openDiffs = new Set<number>();
 
@@ -191,8 +194,14 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     const tl = buildTimeline(d);
     const ended = d.run.status === 'ended';
     const pending = d.gates.filter((g) => g.status === 'pending');
+    const isLead = state!.me === d.run.leadAgentId;
+    const writerCount = d.agents.filter((a) => a.role !== 'lead' && !!a.branch).length;
+    const repo = d.run.projectPath.split('/').filter(Boolean).at(-1) ?? 'repo';
+    const endedActions = ended && isLead ? `${writerCount && typeof api.archiveProject === 'function' ? '<button class="primary" data-act="archive-all">Archive all worker sessions</button>' : ''}
+      ${writerCount && typeof api.archiveProject !== 'function' ? `<span class="sub">Archive worker projects from the sidebar (${esc(repo)} → worktrees)</span>` : ''}` : '';
+    const branchAction = isLead ? `<button data-act="delete-branches">Delete merged branches</button>${cleanupResults.get('branches') ? `<span class="sub">${esc(cleanupResults.get('branches'))}</span>` : ''}` : '';
     const top = `<div class="top">${header(`${selectedRun ? '<button data-act="back">All runs</button>' : ''}
-        ${ended ? '<span class="badge">ended</span>' : `<button class="danger" data-act="end" data-id="${esc(d.run.id)}">End run</button>`}`)}
+        ${ended ? `<span class="badge">ended</span>${endedActions}` : `<button class="danger" data-act="end" data-id="${esc(d.run.id)}">End run</button>`}${branchAction}`)}
       <div class="sub" style="padding:0 16px 8px">Run <b>${esc(d.run.id)}</b> · ${esc(d.run.projectPath)}${runUsageHtml(d.run.usage)}</div>
       ${pending.map((g) => `<div class="pending"><span class="grow">Waiting for you: <b>${g.kind === 'plan'
         ? `plan #${g.id} from ${esc(g.requestedBy)}` : `merge ${esc(g.subjectAgent)} (#${g.id})`}</b></span>
@@ -323,11 +332,14 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       <div class="files">${g.snapshot.files.map((f) => `<div class="file"><span>${esc(f.status)}</span><span class="path">${f.oldPath ? `${esc(f.oldPath)} → ` : ''}${esc(f.path)}</span>${f.binary
         ? '<span>binary</span>' : `<span class="plus">+${f.additions ?? 0}</span><span class="minus">-${f.deletions ?? 0}</span>`}</div>`).join('')}</div>
       <details data-diff="${g.id}"><summary>View diff${g.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details>` : '';
-    return `<div class="row"><b class="grow">${title}</b>${close}</div><pre>${esc(g.payload)}</pre>${review}${actions}`;
+    const worker = g.kind === 'merge' ? state?.current?.agents.find((a) => a.id === g.subjectAgent) : undefined;
+    const cleanup = g.status === 'approved' && worker?.status === 'merged' ? workspaceActions(worker) : '';
+    return `<div class="row"><b class="grow">${title}</b>${close}</div><pre>${esc(g.payload)}</pre>${review}${actions}${cleanup}`;
   }
 
   function agentDetail(a: AgentDTO, ended: boolean, close: string): string {
     const canMsg = !ended && a.status !== 'merged' && a.status !== 'ended';
+    const cleanup = a.branch && a.status === 'merged' ? workspaceActions(a) : '';
     return `<div class="row"><b class="grow">${esc(a.id)} <span class="sub">${esc(a.role)} · ${esc(a.provider)}</span>
         <span class="badge b-${esc(a.status)}">${esc(a.status)}</span></b>
         ${a.appSessionId ? `<button data-act="go" data-id="${esc(a.appSessionId)}">Go to session</button>
@@ -341,7 +353,34 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       ${canMsg ? `<div class="row" style="margin-top:8px"><input class="grow" style="width:auto" data-draft="msg-${esc(a.id)}" placeholder="Message ${esc(a.id)}…">
         <button data-act="msg" data-id="${esc(a.id)}">Send</button></div>` : ''}
       ${canMsg && a.role !== 'lead' && !a.busy ? `<div class="row" style="margin-top:8px"><span class="grow sub">Ending frees its worker slot; it stops receiving messages.</span>
-        <button class="danger" data-act="end-agent" data-id="${esc(a.id)}" data-wt="${a.worktreePath ? '1' : ''}">End agent</button></div>` : ''}`;
+        <button class="danger" data-act="end-agent" data-id="${esc(a.id)}" data-wt="${a.worktreePath ? '1' : ''}">End agent</button></div>` : ''}${cleanup}`;
+  }
+
+  function workspaceActions(a: AgentDTO): string {
+    // A branch is the durable writer marker even after its worktree has been removed. Read-only workers never have one.
+    const archive = typeof api.archiveProject === 'function';
+    const del = typeof api.deleteProject === 'function';
+    const repo = state?.current?.run.projectPath.split('/').filter(Boolean).at(-1) ?? 'repo';
+    const result = cleanupResults.get(a.id);
+    return `<div class="row" style="margin-top:8px">${archive ? `<button class="primary" data-act="archive" data-id="${esc(a.id)}">Archive worker session</button>` : ''}
+      ${del ? `<button class="danger" data-act="delete-project" data-id="${esc(a.id)}">Delete</button>` : ''}
+      ${!archive && !del ? `<span class="sub">Archive it from the sidebar (the project is under ${esc(repo)} → worktrees)</span>` : ''}
+      ${result ? `<span class="sub ${result.startsWith('Error:') ? 'err' : ''}">${esc(result)}</span>` : ''}</div>`;
+  }
+
+  async function cleanWorkspace(a: AgentDTO, action: 'archive' | 'delete') {
+    try {
+      const result = action === 'archive' ? await api.archiveProject!(a.cwd) : await api.deleteProject!(a.cwd);
+      if (result && typeof result === 'object' && 'ok' in result && !(result as { ok: boolean }).ok) {
+        cleanupResults.set(a.id, `Error: ${String((result as { error?: unknown }).error ?? 'cleanup failed')}`);
+      } else {
+        cleanupResults.set(a.id, action === 'archive' ? 'Archived' : 'Deleted');
+        await api.rpc('POST', `runs/${a.runId}/workspaces/event`, {
+          agentId: a.id, type: action === 'archive' ? 'workspace_archived' : 'workspace_deleted',
+        });
+      }
+    } catch (e) { cleanupResults.set(a.id, `Error: ${(e as Error).message}`); }
+    render();
   }
 
   // ── events ───────────────────────────────────────────────────────
@@ -377,7 +416,44 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       case 'end': {
         if (!confirm(`End run ${id}? Agents stop receiving messages.`)) return;
         const removeWorktrees = confirm('Also delete the unmerged worktrees of this run? (Branches are kept.)');
-        void act(() => api.rpc('POST', `runs/${id}/end`, { removeWorktrees }));
+        const current = state?.current;
+        void act(async () => {
+          await api.rpc('POST', `runs/${id}/end`, { removeWorktrees });
+          if (current && api.archiveProject && confirm('Archive all worker sessions now?')) {
+            for (const a of current.agents.filter((x) => x.role !== 'lead' && !!x.branch)) void cleanWorkspace(a, 'archive');
+          }
+          if (current && confirm('Delete merged worker branches now? Unmerged and checked-out branches will be kept.')) {
+            const result = await api.rpc('POST', `runs/${id}/branches/delete-merged`, { agentId: state!.me });
+            cleanupResults.set('branches', JSON.stringify(result));
+          }
+        });
+        break;
+      }
+      case 'archive': {
+        const a = state?.current?.agents.find((x) => x.id === id);
+        if (a?.branch && a.status === 'merged' && api.archiveProject) void cleanWorkspace(a, 'archive');
+        break;
+      }
+      case 'delete-project': {
+        const a = state?.current?.agents.find((x) => x.id === id);
+        if (!a?.branch || a.status !== 'merged' || !api.deleteProject) break;
+        if (confirm('Delete this worker project? Its sessions and transcripts will be removed.')) void cleanWorkspace(a, 'delete');
+        break;
+      }
+      case 'archive-all': {
+        if (!api.archiveProject || !state?.current) break;
+        // Fire independently: one host failure must not prevent the other worker projects being archived.
+        for (const a of state.current.agents.filter((x) => x.role !== 'lead' && !!x.branch)) void cleanWorkspace(a, 'archive');
+        break;
+      }
+      case 'delete-branches': {
+        const d = state?.current;
+        if (!d) break;
+        el.setAttribute('disabled', '');
+        void act(async () => {
+          const result = await api.rpc('POST', `runs/${d.run.id}/branches/delete-merged`, { agentId: state!.me });
+          cleanupResults.set('branches', JSON.stringify(result));
+        });
         break;
       }
       case 'end-agent': {
