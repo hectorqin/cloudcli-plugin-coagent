@@ -1,7 +1,7 @@
 From fd7b666cbc3a7e2bf0cfc52f32883d5bf721c7d3 Mon Sep 17 00:00:00 2001
 From: hectorqin <14220132+hectorqin@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 00:48:07 +0000
-Subject: [PATCH 4/4] feat(plugins): let plugin UIs archive or delete projects
+Subject: [PATCH 4/8] feat(plugins): let plugin UIs archive or delete projects
  and sessions
 
 Plugin tabs and tool renderers get archiveProject(path),
