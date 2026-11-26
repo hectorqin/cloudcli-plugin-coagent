@@ -670,7 +670,7 @@ export class Broker {
     return { deleted, skipped };
   }
 
-  recordWorkspaceEvent(runId: string, agentId: string, type: 'workspace_archived' | 'workspace_deleted') {
+  recordWorkspaceEvent(runId: string, agentId: string, type: 'workspace_archived' | 'workspace_deleted', kind: 'project' | 'session') {
     const { store } = this.d;
     const run = store.run(runId) ?? fail(`No run ${runId}`);
     const agent = store.agent(agentId) ?? fail(`No agent ${agentId}`);
@@ -680,17 +680,26 @@ export class Broker {
       const resolved = path.resolve(value);
       try { return fs.realpathSync(resolved); } catch { return resolved; }
     };
+    if (agent.id === run.leadAgentId) fail('The lead project and session cannot be cleaned up.');
+    if (kind === 'session') {
+      const allowedStatus = run.status === 'ended' || ['reported', 'idle', 'ended'].includes(agent.status);
+      if (agent.branch || !allowedStatus || !agent.appSessionId || agent.appSessionId === lead.appSessionId) {
+        fail('Only finished read-only worker sessions can be cleaned up.');
+      }
+      store.addEvent(run.id, agent.id, type, { kind, sessionId: agent.appSessionId });
+      return { ok: true };
+    }
     const projectPath = canonical(agent.cwd);
     const leadPath = canonical(lead.cwd);
     const repoPath = canonical(run.projectPath);
     const container = `${repoPath}-worktrees`;
     const relative = path.relative(container, projectPath);
-    const allowedStatus = agent.status === 'merged' || (type === 'workspace_archived' && agent.status === 'ended');
+    const allowedStatus = run.status === 'ended' || agent.status === 'merged' || agent.status === 'ended';
     if (!agent.branch || !allowedStatus || projectPath === leadPath || projectPath === repoPath
       || !relative || relative.startsWith('..') || path.isAbsolute(relative)) {
-      fail('Only merged writer workspaces (or ended writers when archiving) can be cleaned up.');
+      fail('Only merged/ended writer projects can be cleaned up.');
     }
-    store.addEvent(run.id, agent.id, type, { projectPath });
+    store.addEvent(run.id, agent.id, type, { kind, projectPath });
     return { ok: true };
   }
 

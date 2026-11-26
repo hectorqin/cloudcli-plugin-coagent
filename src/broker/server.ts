@@ -177,7 +177,8 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
     if ((match = p.match(/^\/runs\/([\w-]+)\/workspaces\/event$/)) && method === 'POST') {
       const body = await readJson(req);
       if (body.type !== 'workspace_archived' && body.type !== 'workspace_deleted') throw new HttpError(400, 'invalid workspace event type');
-      return d.broker.recordWorkspaceEvent(match[1], String(body.agentId ?? ''), body.type);
+      if (body.kind !== 'project' && body.kind !== 'session') throw new HttpError(400, 'invalid workspace event kind');
+      return d.broker.recordWorkspaceEvent(match[1], String(body.agentId ?? ''), body.type, body.kind);
     }
     throw new HttpError(404, 'not found');
   }

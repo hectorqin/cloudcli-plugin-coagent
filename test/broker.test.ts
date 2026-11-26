@@ -600,15 +600,23 @@ describe('merge gate', () => {
   it('records workspace events only for canonical merged writer paths (ended writers may only be archived)', async () => {
     const run = await startApprovedRun();
     const w = await spawn('coder');
-    expect(() => broker.recordWorkspaceEvent(run.id, w.id, 'workspace_archived')).toThrow(/Only merged writer/);
+    expect(() => broker.recordWorkspaceEvent(run.id, w.id, 'workspace_archived', 'project')).toThrow(/Only merged\/ended writer/);
     store.updateAgent(w.id, { status: 'merged' });
-    expect(broker.recordWorkspaceEvent(run.id, w.id, 'workspace_deleted')).toEqual({ ok: true });
+    expect(broker.recordWorkspaceEvent(run.id, w.id, 'workspace_deleted', 'project')).toEqual({ ok: true });
     store.updateAgent(w.id, { status: 'ended' });
-    expect(() => broker.recordWorkspaceEvent(run.id, w.id, 'workspace_deleted')).toThrow(/Only merged writer/);
-    expect(broker.recordWorkspaceEvent(run.id, w.id, 'workspace_archived')).toEqual({ ok: true });
+    expect(broker.recordWorkspaceEvent(run.id, w.id, 'workspace_deleted', 'project')).toEqual({ ok: true });
+    expect(broker.recordWorkspaceEvent(run.id, w.id, 'workspace_archived', 'project')).toEqual({ ok: true });
     store.updateAgent(w.id, { status: 'merged' });
     (store as unknown as { db: DatabaseSync }).db.prepare('UPDATE agents SET cwd = ? WHERE id = ?').run(repo, w.id);
-    expect(() => broker.recordWorkspaceEvent(run.id, w.id, 'workspace_archived')).toThrow(/Only merged writer/);
+    expect(() => broker.recordWorkspaceEvent(run.id, w.id, 'workspace_archived', 'project')).toThrow(/Only merged\/ended writer/);
+
+    const ro = await spawn('reviewer');
+    expect(ro.branch).toBeNull();
+    expect(broker.recordWorkspaceEvent(run.id, ro.id, 'workspace_archived', 'session')).toEqual({ ok: true });
+    expect(store.events(run.id).at(-1)).toMatchObject({ type: 'workspace_archived', data: { kind: 'session', sessionId: ro.appSessionId } });
+    expect(() => broker.recordWorkspaceEvent(run.id, run.leadAgentId, 'workspace_archived', 'session')).toThrow(/lead project and session/);
+    (store as unknown as { db: DatabaseSync }).db.prepare('UPDATE agents SET app_session_id = ? WHERE id = ?').run('lead-app', ro.id);
+    expect(() => broker.recordWorkspaceEvent(run.id, ro.id, 'workspace_archived', 'session')).toThrow(/finished read-only worker/);
   });
 });
 

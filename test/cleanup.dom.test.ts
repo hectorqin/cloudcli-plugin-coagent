@@ -46,11 +46,11 @@ describe('workspace cleanup controls', () => {
     expect(rich.textContent).toContain('Delete');
     rich.querySelector<HTMLButtonElement>('[data-clean="archive"]')!.click();
     await vi.waitFor(() => expect(archiveProject).toHaveBeenCalledWith(writer.cwd));
-    expect(rpc).toHaveBeenCalledWith('POST', 'runs/r/workspaces/event', { agentId: writer.id, type: 'workspace_archived' });
+    expect(rpc).toHaveBeenCalledWith('POST', 'runs/r/workspaces/event', { agentId: writer.id, type: 'workspace_archived', kind: 'project' });
     view.destroy();
   });
 
-  it('the tab shows cleanup after merge for writers only, including the gate drawer', async () => {
+  it('the tab shows guarded sidebar cleanup hints for both worker kinds, including the gate drawer', async () => {
     const container = document.createElement('div');
     document.body.append(container);
     const api = { context: { theme: 'light' as const, project: null, session: { id: 'lead-session', title: '' } },
@@ -61,7 +61,7 @@ describe('workspace cleanup controls', () => {
     expect(container.textContent).toContain('Archive it from the sidebar (the project is under repo → worktrees)');
     container.querySelector<HTMLElement>('[data-type="agent"][data-id="reviewer-1"]')!.click();
     expect(container.textContent).not.toContain('Archive worker session');
-    expect(container.textContent).not.toContain('Archive it from the sidebar');
+    expect(container.textContent).toContain('Archive it from the sidebar');
     container.querySelector<HTMLElement>('[data-type="gate"][data-id="8"]')!
       .dispatchEvent(new MouseEvent('click', { bubbles: true }));
     expect(container.textContent).toContain('Archive it from the sidebar (the project is under repo → worktrees)');
@@ -195,5 +195,52 @@ describe('workspace cleanup controls', () => {
     expect(empty.querySelector('[data-end-option="archive"]')).toBeNull();
     expect(empty.querySelector('[data-end-option="branches"]')).toBeNull();
     expect(empty.querySelector('[data-act="delete-branches"]')).toBeNull();
+  });
+
+  it('archives a read-only worker by session only and refuses the lead session id', async () => {
+    const archiveProject = vi.fn(async () => ({ ok: true as const }));
+    const archiveSession = vi.fn(async () => ({ ok: true as const }));
+    const rpc = vi.fn(async (_method: string, path: string) => path.startsWith('state') ? state : { ok: true });
+    const waitContext: ToolContext = { ...context, toolName: 'mcp__coagent__wait_for_agents', toolInput: { agents: [reviewer.id] },
+      toolResult: { content: `Waited on: ${reviewer.id}.`, isError: false }, sessionId: 'readonly-card' };
+    const container = document.createElement('div');
+    document.body.append(container);
+    const view = renderTool(container, waitContext, { rpc, openSession: vi.fn(), archiveProject, archiveSession });
+    await vi.waitFor(() => expect(container.querySelector(`[data-clean="archive"][data-agent="${reviewer.id}"]`)).not.toBeNull());
+    container.querySelector<HTMLButtonElement>(`[data-clean="archive"][data-agent="${reviewer.id}"]`)!.click();
+    await vi.waitFor(() => expect(archiveSession).toHaveBeenCalledWith(reviewer.appSessionId));
+    expect(archiveProject).not.toHaveBeenCalled();
+    expect(rpc).toHaveBeenCalledWith('POST', 'runs/r/workspaces/event', { agentId: reviewer.id, type: 'workspace_archived', kind: 'session' });
+    view.destroy();
+
+    const shared = structuredClone(state);
+    const leadSession = shared.current!.agents.find((a) => a.role === 'lead')!.appSessionId;
+    shared.current!.agents.find((a) => a.id === reviewer.id)!.appSessionId = leadSession;
+    const refused = document.createElement('div');
+    document.body.append(refused);
+    const refusedView = renderTool(refused, { ...waitContext, sessionId: 'shared-session-card' }, {
+      rpc: vi.fn(async () => shared), openSession: vi.fn(), archiveSession,
+    });
+    await vi.waitFor(() => expect(refused.textContent).toContain('Waiting on agents'));
+    expect(refused.querySelector('[data-clean]')).toBeNull();
+    refusedView.destroy();
+  });
+
+  it('bulk archive covers writer projects and read-only sessions without touching the lead', async () => {
+    const ended = structuredClone(state);
+    ended.current!.run.status = 'ended';
+    const archiveProject = vi.fn(async () => ({ ok: true as const }));
+    const archiveSession = vi.fn(async () => ({ ok: true as const }));
+    const container = document.createElement('div');
+    document.body.append(container);
+    mount(container, { context: { theme: 'light', project: null, session: { id: 'lead-session', title: '' } }, onContextChange: () => () => {},
+      rpc: vi.fn(async (_method, path) => path.startsWith('state') ? ended : { ok: true }), archiveProject, archiveSession });
+    await vi.waitFor(() => expect(container.querySelector('[data-act="archive-all"]')).not.toBeNull());
+    container.querySelector<HTMLButtonElement>('[data-act="archive-all"]')!.click();
+    await vi.waitFor(() => expect(container.textContent).toContain('Archive all: 2 archived.'));
+    expect(archiveProject).toHaveBeenCalledWith(writer.cwd);
+    expect(archiveSession).toHaveBeenCalledWith(reviewer.appSessionId);
+    expect(archiveProject).toHaveBeenCalledTimes(1);
+    expect(archiveSession).toHaveBeenCalledTimes(1);
   });
 });

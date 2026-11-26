@@ -99,9 +99,11 @@ Merging a writer removes its git worktree but deliberately keeps its CloudCLI pr
 branch. After the merge, its approval card and the CoAgent agent/gate drawers offer **Archive worker session** and
 **Delete** when the host supports project cleanup. Archive hides the project while preserving sessions so it can be
 restored from the sidebar archive view; Delete requires confirmation and permanently removes the project, sessions,
-and transcripts. Read-only planner/reviewer sessions share the lead project and are never offered either action.
+and transcripts. Finished read-only planner/reviewer workers share the lead project, so cleanup targets only their
+individual session (`archiveSession` / `deleteSession`) and never the shared project or lead session.
 
-After ending a run, the tab offers **Archive all worker sessions** and **Delete merged branches**. Branch cleanup is
+After ending a run, the tab offers **Archive all worker sessions** (writer projects plus individual read-only sessions)
+and **Delete merged branches**. Branch cleanup is
 explicit and conservative: it considers only workers recorded as merged, requires their tips to be ancestors of the
 lead's current `HEAD`, and uses `git branch -d`. Unmerged, ended-unmerged, missing, or still-checked-out branches are
 reported as skipped and are left intact. On vanilla CloudCLI, project cleanup functions are unavailable and the UI
