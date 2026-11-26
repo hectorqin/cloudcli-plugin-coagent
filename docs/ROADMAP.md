@@ -259,3 +259,5 @@
   - fork patch 3：`/api/agent` `permissionMode`、`GET /api/agent/capabilities`、`GET /api/agent/sessions/:id`（安装包 `1.37.10-coagent.2`）
 - **决定（2026-11-25）**：插件权限策略**不做**，worker 默认按 CloudCLI Agent API 的 `bypassPermissions` 运行（推翻 §五 第 1 项）。fork patch 3 的 `permissionMode` 保留备用，`sessions/:id` 状态接口继续被重启恢复使用。
 - **第二波**：token/耗时可见性、发布工程（CI、URL 安装、升级/卸载）、端到端验收（脚本 + 浏览器清单）。
+
+- **v0.3.0 发布（2026-11-26）**：第二波及追加项全部合并——token/耗时可见性、发布工程（CI、URL 安装冒烟、迁移前备份、注册开关）、端到端验收（Claude/Codex 均 PASS）、GitHub 风格 diff 面板、等待卡片只显示本轮目标、合并后工作区清理（项目/会话归档、合并分支删除）、`/coagent` skill、额度暂停自动续跑与 `handoff_agent`。fork 安装包 `1.37.10-coagent.3`（patch 1–4）。每个分支均经跨 provider 审查（Codex 额度耗尽期间临时由 Claude 审查）。

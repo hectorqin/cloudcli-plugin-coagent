@@ -5,6 +5,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-26
+
 ### Added
 
 - Workers that hit a provider usage or rate limit are `paused` (not failed) until the announced reset time (UTC when no
@@ -24,11 +26,21 @@ All notable changes to this project are documented in this file. The format is b
 - Merge review snapshots with immutable worker/lead commits, file statistics, and bounded unified diffs.
 - Hardened loopback HTTP handling, setup nonces, data-file permissions, structured redacted logs, and diagnostics.
 - Release CI, production-install smoke testing, version/manifest validation, migration backups, and uninstall controls.
+- Token and time visibility per worker and per run (`turns` table; context snapshots vs per-turn usage, unknown shown
+  as "—", never dollars).
+- GitHub-style merge diff (diff2html + highlight.js): file list with +/− bars, collapsible files, Unified/Split toggle,
+  dark/light themes; loaded lazily and kept mounted across tab redraws.
+- Post-merge cleanup: archive/delete a writer's worktree project or a read-only worker's session, bulk archive and
+  delete-merged-branches when a run ends (needs the fork's plugin project/session actions; a sidebar hint otherwise).
+- `end_agent`, and an end-to-end acceptance script (`scripts/e2e.mjs`) with a browser checklist (`docs/ACCEPTANCE.md`).
 
 ### Changed
 
 - Run-scoped worktree/branch identities and safer worker capacity/termination behavior improve reliability.
 - Registration and configuration failures are visible through the tab and diagnostics.
+- "Waiting on agents" cards show only the workers that wait targets; others are folded away.
+- Ending a run is a persisted stop barrier serialized with merges; a merge gate is approved only when the merge lands
+  (otherwise `failed`); runs stuck in "Ending…" are shown and retried.
 
 ## [0.2.0]
 
