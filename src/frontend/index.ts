@@ -1,5 +1,6 @@
 /** CoAgent tab. Bundled into one ES module (the host imports it from a Blob URL). */
 import type { AgentDTO, GateDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
+import { mountDiff } from './diffView.js';
 import { buildTimeline, type Ref, type Row, type Timeline, type Tone, USER_LANE } from './timeline.js';
 import { drawerUsageHtml, laneUsageHtml, runUsageHtml, runUsageText } from './usage.js';
 
@@ -82,6 +83,8 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   let diagnosticsOpen = false;
   let diagnostics: unknown = null;
   const drafts = new Map<string, string>();
+  /** Gate diffs the user opened: kept open across re-renders (the diff itself is cached by diffView). */
+  const openDiffs = new Set<number>();
 
   const applyTheme = () => root.classList.toggle('dark', api.context.theme === 'dark');
   applyTheme();
@@ -117,11 +120,28 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     const keepTop = container.scrollTop;
     const scroller = root.querySelector<HTMLElement>('.scroll');
     const keepLeft = scroller?.scrollLeft ?? 0;
+    const keepDrawer = root.querySelector<HTMLElement>('.drawer')?.scrollTop ?? 0;
+    // Opened diffs survive the redraw as live DOM (no re-parse/re-highlight; collapsed files and layout are kept).
+    const theme = api.context.theme;
+    const mounted = new Map<number, HTMLElement>();
+    for (const el of root.querySelectorAll<HTMLDetailsElement>('details[data-diff][data-loaded]')) {
+      const host = el.querySelector<HTMLElement>(':scope > .cad-host');
+      if (host && !host.dataset.failed && el.dataset.theme === theme) mounted.set(Number(el.dataset.diff), host);
+    }
     root.innerHTML = view();
     for (const el of root.querySelectorAll<HTMLTextAreaElement | HTMLInputElement>('[data-draft]')) {
       el.value = drafts.get(el.dataset.draft!) ?? '';
       el.addEventListener('input', () => drafts.set(el.dataset.draft!, el.value));
     }
+    for (const el of root.querySelectorAll<HTMLDetailsElement>('details[data-diff]')) {
+      const id = Number(el.dataset.diff);
+      if (!openDiffs.has(id)) continue;
+      const host = mounted.get(id);
+      if (host) { el.append(host); el.dataset.loaded = 'true'; el.dataset.theme = theme; }
+      el.open = true; // without a kept host, the toggle event mounts it afresh
+    }
+    const dr = root.querySelector<HTMLElement>('.drawer');
+    if (dr) dr.scrollTop = keepDrawer;
     const sc = root.querySelector<HTMLElement>('.scroll');
     if (sc) sc.scrollLeft = keepLeft;
     container.scrollTop = firstPaint || atBottom ? container.scrollHeight : keepTop;
@@ -302,7 +322,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     const review = g.snapshot ? `<div class="sub">Reviewed worker ${esc(g.snapshot.workerHead.slice(0, 10))} · base ${esc(g.snapshot.mergeBase.slice(0, 10))}</div>
       <div class="files">${g.snapshot.files.map((f) => `<div class="file"><span>${esc(f.status)}</span><span class="path">${f.oldPath ? `${esc(f.oldPath)} → ` : ''}${esc(f.path)}</span>${f.binary
         ? '<span>binary</span>' : `<span class="plus">+${f.additions ?? 0}</span><span class="minus">-${f.deletions ?? 0}</span>`}</div>`).join('')}</div>
-      <details data-diff="${g.id}"><summary>Unified diff${g.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details>` : '';
+      <details data-diff="${g.id}"><summary>View diff${g.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details>` : '';
     return `<div class="row"><b class="grow">${title}</b>${close}</div><pre>${esc(g.payload)}</pre>${review}${actions}`;
   }
 
@@ -400,16 +420,16 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   root.addEventListener('click', onClick);
   const onToggle = (ev: Event) => {
     const el = ev.target as HTMLDetailsElement;
-    if (!el.matches('details[data-diff]') || !el.open || el.dataset.loaded) return;
-    el.dataset.loaded = 'loading';
-    const pre = document.createElement('pre');
-    pre.textContent = 'Loading diff…';
-    el.append(pre);
-    void api.rpc('GET', `gates/${el.dataset.diff}/diff`).then((raw) => {
-      const data = raw as { diff: string; truncated: boolean };
-      pre.textContent = data.diff + (data.truncated ? '\n\n[diff truncated]' : '');
-      el.dataset.loaded = 'true';
-    }, (e) => { pre.textContent = `Could not load diff: ${(e as Error).message}`; delete el.dataset.loaded; });
+    if (!el.matches('details[data-diff]')) return;
+    const id = Number(el.dataset.diff);
+    if (!el.open) { openDiffs.delete(id); return; }
+    openDiffs.add(id);
+    if (el.dataset.loaded) return;
+    el.dataset.loaded = 'true';
+    el.dataset.theme = api.context.theme;
+    const gate = state?.current?.gates.find((g) => g.id === id);
+    void mountDiff(el, api.rpc.bind(api), id, { dark: api.context.theme === 'dark', snapshotFiles: gate?.snapshot?.files })
+      .then((ok) => { if (!ok) delete el.dataset.loaded; });
   };
   root.addEventListener('toggle', onToggle, true);
 

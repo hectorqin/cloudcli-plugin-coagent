@@ -568,6 +568,9 @@ describe('wait_for_agents and batched results', () => {
     expect(done.pending).toBeFalsy();
     expect(done.text).toMatch(/A done[\s\S]*B done/);
     expect(done.text).toMatch(/No targeted worker is still working/);
+    expect(done.text).toContain(`Waited on: ${a.id}, ${b.id}.`); // the chat card reads its workers from here
+    const starts = store.events(store.agent(a.id)!.runId).filter((e) => e.type === 'wait_start');
+    expect(starts.at(-1)!.data.agents).toEqual([a.id, b.id]);
     // Consumed by the wait, so never pushed to the lead as a separate turn.
     expect(cc.calls.filter((c) => c.sessionId === 'lead-app' && /A done/.test(c.message))).toHaveLength(0);
   });
@@ -609,6 +612,42 @@ describe('wait_for_agents and batched results', () => {
     await broker.settle();
     await broker.tick(); await broker.settle();
     expect(cc.calls.filter((c) => c.sessionId === 'lead-app' && /early/.test(c.message))).toHaveLength(1);
+  });
+
+  it('always ends with the authoritative "Waited on" list, even when a non-target sends an urgent message or a result', async () => {
+    await startApprovedRun();
+    const a = await spawnHeld();
+    const b = await spawnHeld();
+    const c = await spawnHeld();
+    // Wait on a and b only; a reports (turn still open), c is not a target.
+    expect(await wait({ agents: [a.id, b.id] })).toMatchObject({ pending: true });
+    await broker.handleTool({ tool: 'report_result', args: { summary: 'A done', agent_id: a.id }, caller: workerCaller(workerProv(a.id)) });
+    await broker.handleTool({ tool: 'send_message', args: { to: 'lead', body: 'urgent from C', agent_id: c.id }, caller: workerCaller(workerProv(c.id)) });
+    const urgent = await wait({ agents: [a.id, b.id] });
+    expect(urgent.pending).toBeFalsy();
+    expect(urgent.text).toContain(`### From ${c.id} · message`);
+    expect(urgent.text.endsWith(`\n\nWaited on: ${a.id}, ${b.id}.`)).toBe(true);
+
+    // mode "any": a non-target's result is delivered too, the list still names only the targets.
+    await broker.handleTool({ tool: 'report_result', args: { summary: 'C done', agent_id: c.id }, caller: workerCaller(workerProv(c.id)) });
+    await broker.handleTool({ tool: 'report_result', args: { summary: 'B done', agent_id: b.id }, caller: workerCaller(workerProv(b.id)) });
+    const any = await wait({ mode: 'any', agents: [b.id] });
+    expect(any.pending).toBeFalsy();
+    expect(any.text).toMatch(/C done[\s\S]*B done/);
+    expect(any.text.endsWith(`\n\nWaited on: ${b.id}.`)).toBe(true);
+
+    // Time limit.
+    const timeout = await wait({ agents: [a.id], give_up: true });
+    expect(timeout.text).toMatch(/^Stopped waiting after the time limit/);
+    expect(timeout.text.endsWith(`\n\nWaited on: ${a.id}.`)).toBe(true);
+    cc.holds.splice(0).forEach((x) => x());
+    await broker.settle();
+  });
+
+  it('says "Waited on: none." when there is nothing to wait for', async () => {
+    await startApprovedRun();
+    const r = await wait();
+    expect(r.text).toBe('There are no active workers to wait for.\n\nWaited on: none.');
   });
 
   it('records the wait in the timeline', async () => {

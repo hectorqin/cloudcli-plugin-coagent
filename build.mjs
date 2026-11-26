@@ -1,7 +1,20 @@
 import * as esbuild from 'esbuild';
 
 const watch = process.argv.includes('--watch');
-const common = { bundle: true, sourcemap: watch ? 'inline' : false, minify: !watch, logLevel: 'info' };
+// `import css from 'pkg/file.css?raw'` → the file's text (vitest understands the same suffix natively).
+const rawPlugin = {
+  name: 'raw',
+  setup(build) {
+    build.onResolve({ filter: /\?raw$/ }, async (args) => {
+      const r = await build.resolve(args.path.slice(0, -4), { kind: args.kind, resolveDir: args.resolveDir });
+      return r.errors.length ? { errors: r.errors } : { path: r.path, namespace: 'raw' };
+    });
+    build.onLoad({ filter: /.*/, namespace: 'raw' }, async (args) => ({
+      contents: await (await import('node:fs/promises')).readFile(args.path, 'utf8'), loader: 'text',
+    }));
+  },
+};
+const common = { bundle: true, sourcemap: watch ? 'inline' : false, minify: !watch, logLevel: 'info', plugins: [rawPlugin] };
 
 const targets = [
   // Tab UI: the host imports this single file from a Blob URL, so it must be self-contained.

@@ -886,9 +886,11 @@ export class Broker {
     const tail = still.length
       ? `\n\nStill working: ${still.join(', ')}. Call wait_for_agents again to keep waiting.`
       : '\n\nNo targeted worker is still working.';
-    if (!targets.length && !inbox.length) return 'There are no active workers to wait for.';
-    if (a.give_up === true && !inbox.length) return `Stopped waiting after the time limit. Status: ${status}.${tail}`;
-    return `${inbox.length ? formatInbox(leadId, inbox) : 'No new messages.'}${tail}`;
+    // Authoritative, always last: the chat card lists exactly these workers (the inbox may carry messages from others).
+    const waitedOn = `\n\nWaited on: ${targets.length ? targets.map((t) => t.id).join(', ') : 'none'}.`;
+    if (!targets.length && !inbox.length) return `There are no active workers to wait for.${waitedOn}`;
+    if (a.give_up === true && !inbox.length) return `Stopped waiting after the time limit. Status: ${status}.${tail}${waitedOn}`;
+    return `${inbox.length ? formatInbox(leadId, inbox) : 'No new messages.'}${tail}${waitedOn}`;
   }
 
   /** Waits for every pending dispatch and delivery (used by tests and shutdown). */
