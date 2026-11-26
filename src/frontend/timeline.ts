@@ -3,6 +3,7 @@
  * Rows are ordinal (one per item, oldest first), not proportional to wall time, so bursts stay readable.
  */
 import type { EventDTO, MessageDTO, RunDetailDTO } from '../shared/protocol.js';
+import { utcClock as clock } from './clock.js';
 
 export const USER_LANE = '__user';
 
@@ -27,6 +28,7 @@ export interface Timeline { lanes: Lane[]; rows: Row[]; bars: Bar[] }
 
 const firstLine = (s: string) => s.split('\n').find((l) => l.trim())?.trim() ?? '';
 
+
 export function buildTimeline(d: RunDetailDTO): Timeline {
   const lanes: Lane[] = [{ id: USER_LANE, label: 'You', sub: 'approvals & messages' }];
   for (const a of d.agents) lanes.push({ id: a.id, label: a.id, sub: `${a.role} · ${a.provider}` });
@@ -48,7 +50,7 @@ export function buildTimeline(d: RunDetailDTO): Timeline {
     switch (e.type) {
       case 'run_started': row = { kind: 'node', ts: e.createdAt, lane, label: 'became lead', tone: 'accent', shape: 'square', ref }; break;
       case 'run_ended': row = { kind: 'node', ts: e.createdAt, lane, label: 'ended the run', tone: 'muted', shape: 'square', ref }; break;
-      case 'spawned': row = { kind: 'node', ts: e.createdAt, lane, label: `spawned · ${String(e.data.provider ?? '')}`, tone: 'accent', shape: 'square', ref }; break;
+      case 'spawned': row = { kind: 'node', ts: e.createdAt, lane, label: e.data.handoffFrom ? `took over from ${String(e.data.handoffFrom)} · ${String(e.data.provider ?? '')}` : `spawned · ${String(e.data.provider ?? '')}`, tone: 'accent', shape: 'square', ref }; break;
       case 'gate_opened': {
         const g = gateById.get(Number(e.data.gate));
         const status = g?.status ?? 'pending';
@@ -64,7 +66,23 @@ export function buildTimeline(d: RunDetailDTO): Timeline {
           ? { kind: 'node', ts: e.createdAt, lane, label: `merged ${String(e.data.commit ?? '').slice(0, 7)}`, tone: 'ok', shape: 'dot', ref }
           : { kind: 'node', ts: e.createdAt, lane, label: `merge failed: ${String(e.data.reason ?? '')}`, tone: 'error', shape: 'dot', ref };
         break;
-      case 'agent_ended': row = { kind: 'node', ts: e.createdAt, lane, label: 'ended', tone: 'muted', shape: 'square', ref }; break;
+      case 'agent_ended':
+        row = { kind: 'node', ts: e.createdAt, lane, label: e.data.handoff ? 'ended (handed off)' : 'ended', tone: 'muted', shape: 'square', ref };
+        break;
+      case 'handoff':
+        // An arrow from the old worker's lane to the worker that took over.
+        row = {
+          kind: 'arrow', ts: e.createdAt, from: lane, to: laneOf(String(e.data.to ?? '')), tone: 'accent', pending: false, ref,
+          label: `handoff → ${String(e.data.to ?? '')} · ${String(e.data.provider ?? '')}`,
+        };
+        break;
+      case 'paused':
+        row = { kind: 'node', ts: e.createdAt, lane, label: `paused (${String(e.data.reason ?? 'limit')}) until ${clock(e.data.resumeAt, '?')}`, tone: 'warn', shape: 'dot', ref };
+        break;
+      case 'resumed':
+        row = { kind: 'node', ts: e.createdAt, lane, label: e.data.by === 'user' ? 'resumed by you' : 'auto-resumed', tone: 'accent', shape: 'dot', ref };
+        break;
+      case 'resume_cancelled': row = { kind: 'node', ts: e.createdAt, lane, label: 'auto-resume cancelled', tone: 'muted', shape: 'dot', ref }; break;
       case 'workspace_archived': row = { kind: 'node', ts: e.createdAt, lane, label: 'workspace archived', tone: 'muted', shape: 'square', ref }; break;
       case 'workspace_deleted': row = { kind: 'node', ts: e.createdAt, lane, label: 'workspace deleted', tone: 'muted', shape: 'square', ref }; break;
       case 'branches_deleted': row = { kind: 'node', ts: e.createdAt, lane, label: `deleted ${Array.isArray(e.data.deleted) ? e.data.deleted.length : 0} merged branch(es)`, tone: 'muted', shape: 'square', ref }; break;

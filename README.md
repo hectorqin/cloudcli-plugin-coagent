@@ -22,7 +22,7 @@ them, and merges their branches. The user approves the plan and every merge in t
   pending plan/merge approvals.
 
 Tools: `submit_plan`, `spawn_agent`, `wait_for_agents`, `send_message`, `read_inbox`, `report_result`, `request_merge`,
-`list_agents`. With a Claude lead, plan and merge approvals appear as a form in the lead's chat (MCP elicitation), and
+`end_agent`, `handoff_agent`, `list_agents`. With a Claude lead, plan and merge approvals appear as a form in the lead's chat (MCP elicitation), and
 `wait_for_agents` keeps the call open until the workers are done, so delegation reads like native subagents. With the
 CloudCLI fork's `toolRenderers` extension point, these calls render as live worker cards.
 Protocol prompts live in `prompts/` and are read fresh on every use.
@@ -92,6 +92,37 @@ in the tab; workers appear there; approve merges when the lead requests them.
 The globally discovered skill may also appear in plain Claude Code or other hosts, but CoAgent runs require its MCP
 tools and therefore work only in CloudCLI Claude/Codex sessions. If `submit_plan` is unavailable, the skill stops and
 explains this requirement.
+
+## Usage limits, resuming and handoff
+
+When a worker's turn fails on a provider usage or rate limit (for example Codex's “You've hit your usage limit … try
+again at 7:13 PM” or Claude's “You've hit your 5-hour limit · resets 7:10pm (UTC)”, or, when it is how the run itself ended, a generic rate limit / HTTP 429; an intermediate tool error that merely
+mentions a 429 does not count), the broker does not mark it `error`. It marks it **paused** until the announced reset time. A time with no timezone is
+taken as UTC; named zones are resolved for the reset date, so DST changes are honored. When the text has no readable
+time, or one more than 7 days away, the broker waits a configurable backoff (at most 7 days): `quotaBackoffMinutes` in
+`PUT /config`, 30 minutes by default. The lead gets “`<id>` paused (usage limit), auto-resume at `<time>`”, and
+`wait_for_agents` returns early once with the same news. When the time comes, the broker resumes the **same worker in
+its own session**. If CloudCLI had already accepted the cut-off turn, the worker also gets one message: “Your previous
+turn was interrupted (…). Check your worktree state (git status / git diff) and continue the task.” That message is
+never repeated: if the resumed turn hits the limit again, the worker is simply paused again with a new time. A paused
+worker keeps its worker slot. Messages to it wait for the resume. `end_agent` cancels the resume. The pause survives
+broker restarts.
+
+Other failures are still not retried automatically. The CoAgent tab drawer and the wait/spawn chat cards offer
+**Resume** for failed or interrupted workers, which sends the same resume message. For paused workers they offer
+**Resume now** and **Cancel auto-resume**. Cancelling makes the worker `interrupted` and tells the lead.
+
+If a provider cannot continue, the lead calls `handoff_agent(worker, provider, note?)`. A writer's replacement gets a
+new worktree that starts at the old worker's branch HEAD. Its uncommitted changes (tracked, staged, deleted and
+untracked, but not ignored files) are carried over from a snapshot taken without touching the old worktree, and the
+broker checks that the result is the identical tree before going on. If any step fails, nothing changes. The handoff is
+refused while the worker's session runs a turn, and also when CloudCLI cannot confirm the session is idle (vanilla
+hosts lack the session-status endpoint of the CloudCLI fork). It is checked again just before the switch. It is also
+refused when a submodule holds uncommitted, untracked or unrecorded work, which cannot be carried over. A read-only
+worker is simply restarted on the other provider. The new worker's first message holds the original task, the old
+worker's recent activity, its last result or error, its undelivered messages and the lead's note. The old worker ends
+and frees its slot, but keeps its worktree and branch, and its pending merge request is rejected. The timeline draws
+an arrow from the old lane to the new one.
 
 ## Cleaning up
 

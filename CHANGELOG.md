@@ -7,6 +7,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Workers that hit a provider usage or rate limit are `paused` (not failed) until the announced reset time (UTC when no
+  timezone is given; configurable `quotaBackoffMinutes` otherwise), then resumed automatically in the same session.
+  The pause survives restarts, keeps the worker's slot, and is cancelled by `end_agent`. `wait_for_agents` returns
+  early once on a pause.
+- Tab drawer and chat-card **Resume** for failed/interrupted workers, plus **Resume now** / **Cancel auto-resume** for
+  paused ones (`POST /agents/:id/resume`, `POST /agents/:id/cancel-resume`).
+- `handoff_agent(worker, provider, note?)`: moves a stopped worker's job to a new worker on another provider. A writer's
+  new worktree starts at the old branch with its uncommitted and untracked changes carried over and verified. The
+  timeline shows the handoff as an arrow between lanes. It is refused unless CloudCLI confirms the worker's session
+  is idle (checked again before the switch), and when a submodule holds work that cannot be carried over.
+- Turn outcomes follow CloudCLI's terminal `complete` event: an intermediate error event no longer fails a turn that
+  completed, and only the run's terminal failure can be classified as a quota/rate limit by generic wording.
 - A shared `/coagent` (Claude) / `$coagent` (Codex) skill, safely installed and removed alongside MCP registration.
 - Crash recovery with leased message delivery and session-status-aware detached worker recovery.
 - Merge review snapshots with immutable worker/lead commits, file statistics, and bounded unified diffs.

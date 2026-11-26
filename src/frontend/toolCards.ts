@@ -6,6 +6,7 @@ import type { AgentDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
 import { mountDiff } from './diffView.js';
 import { CTX_CAVEAT, cardUsageText } from './usage.js';
 import { cleanupTarget } from './workspaceCleanup.js';
+import { utcClock } from './clock.js';
 
 export interface ToolContext {
   toolName: string;
@@ -87,8 +88,25 @@ function ensureStyle() {
 
 function statusBadge(a: AgentDTO): string {
   if (a.busy || a.status === 'starting' || a.status === 'running') return '<span class="cat-b run"><span class="cat-dot"></span>working</span>';
-  const tone = a.status === 'error' ? 'bad' : a.status === 'reported' || a.status === 'merged' ? 'ok' : a.status === 'lead' ? 'acc' : '';
+  const tone = a.status === 'error' ? 'bad' : a.status === 'reported' || a.status === 'merged' ? 'ok' : a.status === 'lead' ? 'acc'
+    : a.status === 'paused' || a.status === 'interrupted' ? 'run' : '';
   return `<span class="cat-b ${tone}">${esc(a.status)}</span>`;
+}
+
+
+/**
+ * Resume controls for a stopped worker: a paused one resumes by itself, so it gets "Resume now" (skip the wait) and
+ * "Cancel auto-resume"; a failed or interrupted one gets "Resume" (continue in its own session).
+ */
+export function resumeControls(a: AgentDTO, pending = false): string {
+  if (a.role === 'lead' || a.busy) return '';
+  const dis = pending ? ' disabled' : '';
+  if (a.status === 'paused') {
+    return `<span class="m">paused (${esc(a.pauseReason ?? 'provider limit')}) · auto-resume at ${esc(utcClock(a.resumeAt))}</span>`
+      + `<button data-resume="${esc(a.id)}"${dis}>Resume now</button><button data-cancel-resume="${esc(a.id)}"${dis}>Cancel auto-resume</button>`;
+  }
+  if (a.status === 'error' || a.status === 'interrupted') return `<button data-resume="${esc(a.id)}"${dis}>Resume</button>`;
+  return '';
 }
 
 function callBadge(ctx: ToolContext): string {
@@ -102,12 +120,14 @@ function usageSpan(a: AgentDTO): string {
   return a.usage ? `<span class="m u" title="${esc(`turn time · context window use\n${CTX_CAVEAT}`)}">${esc(cardUsageText(a.usage))}</span>` : '';
 }
 
-function agentRow(a: AgentDTO, opts: { activity: boolean }): string {
+function agentRow(a: AgentDTO, opts: { activity: boolean; pending?: boolean; note?: string }): string {
   const acts = opts.activity ? a.activity.slice(-3) : [];
+  const resume = resumeControls(a, opts.pending);
   return `<div class="cat-a"><div class="row"><b>${esc(a.id)}</b><span class="m">${esc(a.role)} · ${esc(a.provider)}</span>${statusBadge(a)}${usageSpan(a)}
       ${a.appSessionId ? `<button data-open="${esc(a.appSessionId)}">Open ↗</button>` : ''}</div>
     ${acts.length ? `<div class="cat-act">${acts.map((x) => `<div title="${esc(x.text)}">${esc(x.text)}</div>`).join('')}</div>` : ''}
     ${a.lastError ? `<div class="m" style="color:var(--bad)">${esc(clip(a.lastError, 200))}</div>` : ''}
+    ${resume ? `<div class="row cat-resume">${resume}</div>` : ''}${opts.note ? `<div class="m">${esc(opts.note)}</div>` : ''}
     ${a.result ? `<details><summary>Result</summary><pre>${esc(a.result)}</pre></details>` : ''}</div>`;
 }
 
@@ -185,6 +205,7 @@ export function agentsFor(ctx: ToolContext, run: RunDetailDTO | null): AgentDTO[
 }
 
 interface CleanupState { pending: boolean; done: boolean; result: string }
+interface ResumeState { pending: boolean; result: string }
 interface CleanupView {
   archiveProject: boolean; deleteProject: boolean; archiveSession: boolean; deleteSession: boolean;
   state?: (agentId: string) => CleanupState | undefined;
@@ -207,7 +228,7 @@ function cleanupHtml(worker: AgentDTO | undefined, run: RunDetailDTO | null, cle
 
 export function cardHtml(ctx: ToolContext, state: StateDTO | null, cleanup: CleanupView = {
   archiveProject: false, deleteProject: false, archiveSession: false, deleteSession: false,
-}): string {
+}, resumes: Map<string, ResumeState> = new Map()): string {
   const name = shortName(ctx.toolName);
   const run = state?.current ?? null;
   const args = input(ctx);
@@ -222,8 +243,11 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null, cleanup: Clea
       const a = agentsFor(ctx, run)[0];
       const who = a ? `${a.id} · ${a.role} · ${a.provider}` : `${String(args.role ?? '')}${args.provider ? ` · ${String(args.provider)}` : ''}`;
       const open = a?.appSessionId ? `<button data-open="${esc(a.appSessionId)}">Open ↗</button>` : '';
+      const resume = a ? resumeControls(a, resumes.get(a.id)?.pending) : '';
+      const resumeNote = a ? resumes.get(a.id)?.result : '';
       return `<div class="cat-h"><span class="t">Spawned</span><span class="s">${esc(who)} — ${esc(clip(String(args.task ?? ''), 90))}</span>`
         + `${a ? statusBadge(a) + usageSpan(a) : callBadge(ctx)}${open}</div>`
+        + (resume || resumeNote ? `<div class="cat-a"><div class="row cat-resume">${resume}</div>${resumeNote ? `<div class="m">${esc(resumeNote)}</div>` : ''}</div>` : '')
         + (a?.result ? `<div class="cat-a"><details><summary>Result</summary><pre>${esc(a.result)}</pre></details></div>` : '')
         + (a ? '' : resultBlock);
     }
@@ -235,7 +259,9 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null, cleanup: Clea
       const sub = ctx.status === 'running' ? `waiting for ${mode} · ${working} working` : `waited for ${mode}`;
       const rest = others.length ? `<div class="cat-a"><details class="cat-others"><summary>${others.length} other agent${others.length === 1 ? '' : 's'} in this run</summary>`
         + `${others.map((a) => agentRow(a, { activity: false })).join('')}</details></div>` : '';
-      return head('Waiting on agents', sub) + agents.map((a) => agentRow(a, { activity: ctx.status === 'running' }) + cleanupHtml(a, run, cleanup)).join('') + rest + resultBlock;
+      return head('Waiting on agents', sub) + agents.map((a) => agentRow(a, {
+        activity: ctx.status === 'running', pending: resumes.get(a.id)?.pending, note: resumes.get(a.id)?.result,
+      }) + cleanupHtml(a, run, cleanup)).join('') + rest + resultBlock;
     }
     case 'submit_plan':
     case 'request_merge': {
@@ -273,6 +299,7 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
   let timer: ReturnType<typeof setTimeout> | undefined;
   let alive = true;
   const cleanups = new Map<string, CleanupState>();
+  const resumes = new Map<string, ResumeState>();
   const root = document.createElement('div');
   root.className = 'cat';
   container.append(root);
@@ -285,11 +312,11 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
       archiveProject: typeof host.archiveProject === 'function', deleteProject: typeof host.deleteProject === 'function',
       archiveSession: typeof host.archiveSession === 'function', deleteSession: typeof host.deleteSession === 'function',
       state: (id) => cleanups.get(id),
-    });
+    }, resumes);
     root.querySelectorAll('details').forEach((d, i) => { if (keep.has(i)) d.open = true; });
   }
   const live = () => ctx.status === 'running'
-    || agentsFor(ctx, state?.current ?? null).some((a) => a.busy || a.status === 'starting' || a.status === 'running');
+    || agentsFor(ctx, state?.current ?? null).some((a) => a.busy || a.status === 'starting' || a.status === 'running' || a.status === 'paused');
   async function refresh(force = false) {
     clearTimeout(timer);
     state = await loadState(host, ctx.sessionId, force);
@@ -300,6 +327,19 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
   root.addEventListener('click', (ev) => {
     const btn = (ev.target as Element).closest<HTMLElement>('[data-open]');
     if (btn) host.openSession(btn.dataset.open!);
+    const resumeBtn = (ev.target as Element).closest<HTMLButtonElement>('[data-resume],[data-cancel-resume]');
+    if (resumeBtn) {
+      const id = resumeBtn.dataset.resume ?? resumeBtn.dataset.cancelResume!;
+      const cancel = resumeBtn.dataset.resume === undefined;
+      if (resumes.get(id)?.pending) return;
+      resumes.set(id, { pending: true, result: '' });
+      draw();
+      void Promise.resolve().then(() => host.rpc('POST', `agents/${encodeURIComponent(id)}/${cancel ? 'cancel-resume' : 'resume'}`, {}))
+        .then((r) => { resumes.set(id, { pending: false, result: String((r as { text?: unknown })?.text ?? (cancel ? 'Auto-resume cancelled' : 'Resumed')) }); },
+          (e) => { resumes.set(id, { pending: false, result: `Error: ${(e as Error).message}` }); })
+        .finally(() => { void refresh(true); });
+      return;
+    }
     const clean = (ev.target as Element).closest<HTMLButtonElement>('[data-clean]');
     if (!clean || !state?.current) return;
     const worker = state.current.agents.find((a) => a.id === clean.dataset.agent);

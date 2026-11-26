@@ -25,6 +25,27 @@ const ctx = (toolName: string, toolInput: unknown, result: string | null, status
 });
 
 describe('tool cards', () => {
+  it('offers Resume for failed/interrupted workers and Resume now / Cancel auto-resume for paused ones', () => {
+    const r2: RunDetailDTO = {
+      ...run,
+      agents: [
+        agent('lead', 'lead', { status: 'lead' }),
+        agent('coder-1', 'coder', { status: 'paused', pauseReason: 'usage limit', resumeAt: '2026-11-26T19:14:00.000Z' }),
+        agent('coder-2', 'coder', { status: 'error', lastError: 'boom' }),
+        agent('coder-3', 'coder', { status: 'interrupted' }),
+        agent('coder-4', 'coder', { status: 'reported' }),
+      ],
+    };
+    const html = cardHtml(ctx('wait_for_agents', {}, null, 'running'), { ...state, current: r2 });
+    expect(html).toContain('auto-resume at 19:14 UTC');
+    expect(html).toContain('<button data-resume="coder-1">Resume now</button><button data-cancel-resume="coder-1">Cancel auto-resume</button>');
+    expect(html).toContain('<button data-resume="coder-2">Resume</button>');
+    expect(html).toContain('<button data-resume="coder-3">Resume</button>');
+    expect(html).not.toContain('data-resume="coder-4"');
+    const spawnCard = cardHtml(ctx('spawn_agent', { role: 'coder', task: 't' }, 'Spawned coder-2 (role coder)'), { ...state, current: r2 });
+    expect(spawnCard).toContain('<button data-resume="coder-2">Resume</button>');
+  });
+
   it('reads MCP block results', () => {
     expect(resultText({ content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }], isError: false })).toBe('a\nb');
     expect(resultText({ content: 'plain', isError: false })).toBe('plain');

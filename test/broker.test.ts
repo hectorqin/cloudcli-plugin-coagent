@@ -28,6 +28,10 @@ class FakeCloudCli implements CloudCli {
   status: ((id: string) => boolean | null) | null = null;
   /** Releases for turns started with 'hold' (a worker that keeps working until released). */
   holds: (() => void)[] = [];
+  /** Error text for the next 'error' / 'accepted-error' results (default: 'boom' / 'died mid-turn'). */
+  errorText: string[] = [];
+  /** A held turn ends with this error instead of ok when released (one per released turn, in order). */
+  holdError: string[] = [];
   /** Stream events per accepted turn, emitted after the session id (one list per send, in order). */
   events: Record<string, unknown>[][] = [];
   private n = 0;
@@ -51,9 +55,11 @@ class FakeCloudCli implements CloudCli {
       this.live.add(app0);
       await new Promise<void>((r) => this.holds.push(r));
       this.live.delete(app0);
-      return { status: 'ok', appSessionId: app0 };
+      const held = this.holdError.shift();
+      return held ? { status: 'error', error: held, terminal: true } : { status: 'ok', appSessionId: app0 };
     }
-    if (st === 'error') return { status: 'error', error: 'boom' };
+    // Like HttpCloudCli: an HTTP failure or the error that ended the run is terminal.
+    if (st === 'error') return { status: 'error', error: this.errorText.shift() ?? 'boom', terminal: true };
     let app = input.sessionId ?? null;
     if (!app) {
       app = `app-${++this.n}`;
@@ -61,7 +67,7 @@ class FakeCloudCli implements CloudCli {
     }
     onApp?.(app);
     emit();
-    if (st === 'accepted-error') return { status: 'error', error: 'died mid-turn' };
+    if (st === 'accepted-error') return { status: 'error', error: this.errorText.shift() ?? 'died mid-turn', terminal: true };
     if (st === 'aborted') return { status: 'aborted', appSessionId: app };
     return { status: 'ok', appSessionId: app };
   }
@@ -2007,5 +2013,479 @@ describe('turn usage (review rework)', () => {
     const again = new DatabaseSync(file, { readOnly: true });
     expect(pendingMigrations(again)).toEqual([]);
     again.close();
+  });
+});
+
+describe('quota pauses and auto-resume (Q41)', () => {
+  const CODEX_LIMIT = "You've hit your usage limit. To get more access now, send a request to your admin or try again at 7:13 PM.";
+  const CLAUDE_LIMIT = "Claude Code returned an error result: You've hit your 5-hour limit · resets 7:10pm (UTC)";
+  const T0 = Date.parse('2026-11-26T18:00:00Z');
+  const sends = (id: string) => cc.calls.filter((c) => c.projectPath === store.agent(id)!.cwd && c.sessionId !== 'lead-app');
+  const resumeMsgs = (id: string) => sends(id).filter((c) => /previous turn was interrupted/.test(c.message));
+  const restart = () => {
+    store.close();
+    store = new Store(path.join(tmp, 'db.sqlite'));
+    cc = Object.assign(new FakeCloudCli(), { sessions: cc.sessions, live: cc.live, calls: cc.calls });
+    broker = new Broker({ store, cloudcli: cc, git: Git, prompts: filePrompts(PROMPTS), now: () => clock });
+  };
+  async function pausedCoder(limit = CODEX_LIMIT) {
+    clock = T0;
+    const run = await startApprovedRun();
+    cc.next.push('accepted-error');
+    cc.errorText.push(limit);
+    const w = await spawn('coder', 'build the feature');
+    return { run, w: store.agent(w.id)! };
+  }
+
+  it('pauses on a usage limit (not error), tells the lead, then resumes the same session at the reset time', async () => {
+    const { run, w } = await pausedCoder();
+    expect(w).toMatchObject({ status: 'paused', pauseReason: 'usage limit', resumeAt: '2026-11-26T19:14:00.000Z', lastError: CODEX_LIMIT });
+    const app = w.appSessionId!;
+    expect(app).toBeTruthy();
+    expect(store.events(run.id).find((e) => e.type === 'paused')!.data).toMatchObject({ reason: 'usage limit', resumeAt: '2026-11-26T19:14:00.000Z' });
+    const note = cc.calls.filter((c) => c.sessionId === 'lead-app').at(-1)!;
+    expect(note.message).toContain(`${w.id} paused (usage limit), auto-resume at 2026-11-26 19:14 UTC`);
+    expect(store.agents(run.id).find((a) => a.id === w.id)!.status).toBe('paused');
+
+    // Not before its time; messages from the lead wait for the resume.
+    clock = Date.parse('2026-11-26T19:00:00Z');
+    const queued = await call('send_message', { to: w.id, body: 'also add docs' });
+    expect(queued.text).toMatch(/paused by a provider usage limit until 2026-11-26 19:14 UTC/);
+    await broker.tick(); await broker.settle();
+    expect(sends(w.id)).toHaveLength(1);
+
+    clock = Date.parse('2026-11-26T19:15:00Z');
+    await broker.tick(); await broker.settle();
+    const resumed = sends(w.id).slice(1);
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0].sessionId).toBe(app); // the same CloudCLI session
+    expect(resumed[0].message).toMatch(/Your previous turn was interrupted \(usage limit\)\. Check your worktree state \(git status \/ git diff\)/);
+    expect(resumed[0].message).toContain('also add docs');
+    expect(store.agent(w.id)).toMatchObject({ status: 'idle', appSessionId: app, resumeAt: null, pauseReason: null });
+    expect(store.events(run.id).find((e) => e.type === 'resumed')!.data).toMatchObject({ by: 'auto', from: 'paused' });
+    await broker.tick(); await broker.settle();
+    expect(resumeMsgs(w.id)).toHaveLength(1); // never repeated
+  });
+
+  it('a resume that hits the limit again re-pauses with a fresh time; each pause resumes exactly once', async () => {
+    const { w } = await pausedCoder();
+    clock = Date.parse('2026-11-26T19:15:00Z');
+    cc.next.push('accepted-error');
+    cc.errorText.push(CLAUDE_LIMIT); // resets 7:10pm (UTC): already past today → tomorrow
+    await broker.tick(); await broker.settle();
+    expect(store.agent(w.id)).toMatchObject({ status: 'paused', resumeAt: '2026-11-27T19:11:00.000Z' });
+    expect(resumeMsgs(w.id)).toHaveLength(1);
+    for (let i = 0; i < 3; i++) { clock += 60_000; await broker.tick(); await broker.settle(); }
+    expect(resumeMsgs(w.id)).toHaveLength(1);
+
+    clock = Date.parse('2026-11-27T19:12:00Z');
+    await broker.tick(); await broker.settle();
+    expect(resumeMsgs(w.id)).toHaveLength(2);
+    expect(store.agent(w.id)!.status).toBe('idle');
+  });
+
+  it('a limit hit before CloudCLI accepted the turn pauses too, and the requeued task is delivered on resume', async () => {
+    clock = T0;
+    await startApprovedRun();
+    cc.next.push('error');
+    cc.errorText.push('HTTP 429: Too Many Requests');
+    const w = await spawn('planner', 'plan the thing');
+    expect(store.agent(w.id)).toMatchObject({ status: 'paused', pauseReason: 'rate limit', resumeAt: '2026-11-26T18:30:00.000Z' });
+    expect(store.undelivered(w.id)).toHaveLength(1);
+    await broker.tick(); await broker.settle();
+    expect(sends(w.id)).toHaveLength(1); // no retry storm while paused
+
+    clock = Date.parse('2026-11-26T18:31:00Z');
+    await broker.tick(); await broker.settle();
+    expect(sends(w.id)).toHaveLength(2);
+    expect(sends(w.id)[1].message).toContain('plan the thing');
+    expect(sends(w.id)[1].message).not.toMatch(/previous turn was interrupted/); // it never saw a turn
+  });
+
+  it('uses the configured backoff when the reset time cannot be read', async () => {
+    broker.setQuotaBackoffMinutes(45);
+    const { w } = await pausedCoder("You've hit your usage limit. Upgrade your plan.");
+    expect(store.agent(w.id)!.resumeAt).toBe(new Date(T0 + 45 * 60_000).toISOString());
+    expect(() => broker.setQuotaBackoffMinutes(-1)).toThrow(/quotaBackoffMinutes/);
+  });
+
+  it('a paused worker survives a restart (stays paused) and still auto-resumes', async () => {
+    const { w } = await pausedCoder();
+    restart();
+    const res = await broker.recover();
+    await broker.settle();
+    expect(res.interrupted).toEqual([]);
+    expect(store.agent(w.id)).toMatchObject({ status: 'paused', resumeAt: '2026-11-26T19:14:00.000Z' });
+    clock = Date.parse('2026-11-26T19:15:00Z');
+    await broker.tick(); await broker.settle();
+    expect(resumeMsgs(w.id)).toHaveLength(1);
+    expect(resumeMsgs(w.id)[0].sessionId).toBe(w.appSessionId);
+  });
+
+  it('ending a paused worker cancels its resume', async () => {
+    const { run, w } = await pausedCoder();
+    expect((await call('end_agent', { worker: w.id })).ok).toBe(true);
+    expect(store.agent(w.id)).toMatchObject({ status: 'ended', resumeAt: null });
+    expect(store.events(run.id).find((e) => e.type === 'agent_ended')!.data).toMatchObject({ cancelledResume: true });
+    clock = Date.parse('2026-11-27T00:00:00Z');
+    await broker.tick(); await broker.settle();
+    expect(resumeMsgs(w.id)).toHaveLength(0);
+  });
+
+  it('no resume in a run that is ending', async () => {
+    const { run, w } = await pausedCoder();
+    store.markEnding(run.id);
+    clock = Date.parse('2026-11-26T19:15:00Z');
+    await broker.tick(); await broker.settle();
+    expect(resumeMsgs(w.id)).toHaveLength(0);
+  });
+
+  it('a paused worker keeps its slot, even a read-only one', async () => {
+    clock = T0;
+    await startApprovedRun();
+    cc.next.push('accepted-error');
+    cc.errorText.push(CODEX_LIMIT);
+    const p = await spawn('planner');
+    expect(store.agent(p.id)!.status).toBe('paused');
+    for (let i = 0; i < MAX_WORKERS - 1; i++) await spawn('coder');
+    const full = await call('spawn_agent', { role: 'planner', task: 't' });
+    expect(full.ok).toBe(false);
+    expect(full.text).toContain(`${p.id} paused`);
+  });
+
+  it('wait_for_agents returns early on a pause, says until when, and waits again afterwards', async () => {
+    clock = T0;
+    await startApprovedRun();
+    cc.next.push('hold');
+    const raw = (tool: ToolName, args: Record<string, unknown>) => broker.handleTool({ tool, args, caller: LEAD });
+    const spawned = await raw('spawn_agent', { role: 'coder', task: 't' });
+    const w = store.agent(spawned.text.match(/Spawned (\S+)/)![1])!;
+    await new Promise((x) => setTimeout(x, 0));
+    expect((await raw('wait_for_agents', {})).pending).toBe(true);
+    cc.holdError.push(CODEX_LIMIT);
+    cc.holds.shift()!();
+    await broker.settle();
+    const r = await call('wait_for_agents', {});
+    expect(r.pending).toBeFalsy();
+    expect(r.text).toContain(`${w.id} paused (usage limit), auto-resume at 2026-11-26 19:14 UTC`);
+    expect(r.text).toMatch(new RegExp(`${w.id} paused until 2026-11-26 19:14 UTC`));
+    expect(r.text).toMatch(/Usually just call wait_for_agents again/);
+    expect(r.text).toMatch(new RegExp(`Waited on: ${w.id}\\.$`));
+    const again = await call('wait_for_agents', {});
+    expect(again.pending).toBe(true);
+    expect(again.text).toContain('paused until');
+  });
+
+  it('the tab Resume: "Resume now" skips the wait; failed/interrupted workers resume once; others are refused', async () => {
+    const { run, w } = await pausedCoder();
+    expect(broker.resumeWorker(w.id, 'user')).toMatch(/Resumed/);
+    await broker.settle();
+    expect(resumeMsgs(w.id)).toHaveLength(1);
+    expect(store.events(run.id).find((e) => e.type === 'resumed')!.data).toMatchObject({ by: 'user' });
+    expect(() => broker.resumeWorker(w.id, 'user')).toThrow(/idle; only paused, failed or interrupted/);
+
+    cc.next.push('accepted-error'); // an ordinary failure: error, and never retried automatically
+    await call('send_message', { to: w.id, body: 'more' });
+    expect(store.agent(w.id)!.status).toBe('error');
+    clock += 3_600_000;
+    await broker.tick(); await broker.settle();
+    expect(resumeMsgs(w.id)).toHaveLength(1);
+    broker.resumeWorker(w.id, 'user');
+    await broker.settle();
+    expect(resumeMsgs(w.id)).toHaveLength(2);
+    expect(resumeMsgs(w.id)[1].message).toMatch(/interrupted \(error: died mid-turn\)/);
+  });
+
+  it('Cancel auto-resume makes it interrupted and tells the lead; nothing resumes by itself', async () => {
+    const { w } = await pausedCoder();
+    expect(broker.cancelAutoResume(w.id)).toMatch(/Cancelled/);
+    await broker.settle();
+    expect(store.agent(w.id)).toMatchObject({ status: 'interrupted', resumeAt: null });
+    expect(cc.calls.filter((c) => c.sessionId === 'lead-app').at(-1)!.message).toMatch(/cancelled the auto-resume/);
+    clock = Date.parse('2026-11-27T00:00:00Z');
+    await broker.tick(); await broker.settle();
+    expect(resumeMsgs(w.id)).toHaveLength(0);
+    expect(() => broker.cancelAutoResume(w.id)).toThrow(/not paused/);
+  });
+
+  it('adds the pause columns to an older database idempotently', () => {
+    const file = path.join(tmp, 'old-agents.sqlite');
+    new Store(file).close();
+    const raw = new DatabaseSync(file);
+    for (const c of ['resume_at', 'pause_reason', 'pause_nudge']) raw.exec(`ALTER TABLE agents DROP COLUMN ${c}`);
+    expect(pendingMigrations(raw)).toEqual(['column agents.resume_at', 'column agents.pause_reason', 'column agents.pause_nudge']);
+    raw.close();
+    new Store(file).close();
+    new Store(file).close();
+    const again = new DatabaseSync(file, { readOnly: true });
+    expect(pendingMigrations(again)).toEqual([]);
+    again.close();
+  });
+});
+
+describe('handoff_agent (Q42)', () => {
+  const lastTo = (id: string) => cc.calls.filter((c) => c.projectPath === store.agent(id)!.cwd && c.sessionId !== 'lead-app').at(-1)!;
+
+  it('a writer: the new worktree starts at the old HEAD with every committed, uncommitted and untracked change', async () => {
+    const run = await startApprovedRun();
+    const old = await spawn('coder', 'implement the parser');
+    const wt = old.worktreePath!;
+    fs.writeFileSync(path.join(wt, 'done.txt'), 'committed\n');
+    sh(wt, 'add', 'done.txt');
+    sh(wt, 'commit', '-q', '-m', 'part 1');
+    const oldHead = sh(wt, 'rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(wt, 'README.md'), 'base\nedited\n'); // tracked, unstaged
+    fs.writeFileSync(path.join(wt, 'staged.txt'), 'staged\n');
+    sh(wt, 'add', 'staged.txt'); // staged, new
+    fs.rmSync(path.join(wt, 'done.txt')); // deleted
+    fs.mkdirSync(path.join(wt, 'src'));
+    fs.writeFileSync(path.join(wt, 'src', 'new.ts'), 'export {};\n'); // untracked
+    fs.writeFileSync(path.join(wt, 'bin.dat'), Buffer.from([0, 1, 2, 255, 0, 10])); // untracked binary
+    fs.writeFileSync(path.join(wt, 'run.sh'), '#!/bin/sh\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(wt, '.gitignore'), 'ignored.log\n');
+    fs.writeFileSync(path.join(wt, 'ignored.log'), 'noise\n');
+    const oldStatus = sh(wt, 'status', '--porcelain');
+    store.pauseAgent(old.id, new Date(clock + 3_600_000).toISOString(), 'usage limit', true, 'You hit your usage limit');
+    store.activity.set(old.id, [{ ts: 'x', text: 'Edit: src/parser.ts' }, { ts: 'y', text: 'Bash: npm test' }]);
+    await call('send_message', { to: old.id, body: 'remember the edge case' }); // queued: it is paused
+
+    const r = await call('handoff_agent', { worker: old.id, provider: 'codex', note: 'reviewer: handle empty input' });
+    expect(r.ok, r.text).toBe(true);
+    const id = r.text.match(/off to (\S+)/)![1];
+    const nw = store.agent(id)!;
+    expect(nw).toMatchObject({ role: 'coder', provider: 'codex' });
+    expect(nw.branch).toBe(`coagent/${run.id}/${id}`);
+    const nwt = nw.worktreePath!;
+    expect(sh(nwt, 'rev-parse', 'HEAD')).toBe(oldHead);
+    expect(fs.readFileSync(path.join(nwt, 'README.md'), 'utf8')).toBe('base\nedited\n');
+    expect(fs.readFileSync(path.join(nwt, 'staged.txt'), 'utf8')).toBe('staged\n');
+    expect(fs.existsSync(path.join(nwt, 'done.txt'))).toBe(false);
+    expect(fs.readFileSync(path.join(nwt, 'src', 'new.ts'), 'utf8')).toBe('export {};\n');
+    expect([...fs.readFileSync(path.join(nwt, 'bin.dat'))]).toEqual([0, 1, 2, 255, 0, 10]);
+    expect(fs.statSync(path.join(nwt, 'run.sh')).mode & 0o111).not.toBe(0);
+    expect(fs.existsSync(path.join(nwt, 'ignored.log'))).toBe(false); // ignored files are not carried
+    // Same content, all as uncommitted changes (the staged file becomes untracked: nothing is lost).
+    expect((await Git.snapshotWorkingTree(nwt)).tree).toBe((await Git.snapshotWorkingTree(wt)).tree);
+    expect(sh(nwt, 'status', '--porcelain', '--untracked-files=all').split('\n').map((l) => l.trim().split(/\s+/).at(-1)).sort())
+      .toEqual(['.gitignore', 'README.md', 'bin.dat', 'done.txt', 'run.sh', 'src/new.ts', 'staged.txt']);
+    // The old worktree is untouched, including its index.
+    expect(sh(wt, 'status', '--porcelain')).toBe(oldStatus);
+    expect(store.agent(old.id)).toMatchObject({ status: 'ended', worktreePath: wt, resumeAt: null });
+
+    const ev = store.events(run.id);
+    expect(ev.find((e) => e.type === 'handoff')).toMatchObject({ agentId: old.id, data: { from: old.id, to: id, provider: 'codex' } });
+    expect(ev.find((e) => e.type === 'agent_ended' && e.agentId === old.id)!.data).toMatchObject({ handoff: id });
+    expect(ev.find((e) => e.type === 'spawned' && e.agentId === id)!.data).toMatchObject({ handoffFrom: old.id });
+
+    const first = lastTo(id);
+    expect(first.provider).toBe('codex');
+    expect(first.sessionId ?? null).toBeNull(); // a new session
+    for (const s of ['implement the parser', 'ALREADY IN YOUR WORKTREE', oldHead.slice(0, 10), 'Edit: src/parser.ts',
+      'You hit your usage limit', 'remember the edge case', 'reviewer: handle empty input', 'src/new.ts']) {
+      expect(first.message).toContain(s);
+    }
+    expect(store.messages(run.id).find((m) => m.to === old.id && m.body === 'remember the edge case')!.state).toBe('cancelled');
+    expect(r.text).toMatch(/uncommitted path\(s\) carried over \(verified identical\)/);
+  });
+
+  it('a read-only worker just starts on the other provider in the lead directory', async () => {
+    const run = await startApprovedRun();
+    const old = await spawn('reviewer', 'review the diff', 'codex');
+    store.updateAgent(old.id, { status: 'error', lastError: 'Codex usage limit' });
+    const r = await call('handoff_agent', { worker: old.id, provider: 'claude' });
+    expect(r.ok, r.text).toBe(true);
+    const nw = store.agent(r.text.match(/off to (\S+)/)![1])!;
+    expect(nw).toMatchObject({ role: 'reviewer', provider: 'claude', cwd: repo, branch: null, worktreePath: null });
+    expect(store.agent(old.id)!.status).toBe('ended');
+    expect(lastTo(nw.id).message).toContain('review the diff');
+    expect(store.events(run.id).some((e) => e.type === 'handoff' && e.data.to === nw.id)).toBe(true);
+  });
+
+  it('is refused while the worker runs a turn, here or per CloudCLI', async () => {
+    await startApprovedRun();
+    cc.next.push('hold');
+    const spawned = await broker.handleTool({ tool: 'spawn_agent', args: { role: 'coder', task: 't' }, caller: LEAD });
+    const busy = store.agent(spawned.text.match(/Spawned (\S+)/)![1])!;
+    await new Promise((x) => setTimeout(x, 0));
+    const r = await broker.handleTool({ tool: 'handoff_agent', args: { worker: busy.id, provider: 'codex' }, caller: LEAD });
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/middle of a turn/);
+    cc.holds.shift()!();
+    await broker.settle();
+
+    cc.status = () => true; // CloudCLI: still processing (e.g. a turn started from its own tab)
+    const r2 = await call('handoff_agent', { worker: busy.id, provider: 'codex' });
+    expect(r2.text).toMatch(/still running a turn in CloudCLI/);
+    expect(store.agents(busy.runId)).toHaveLength(2);
+  });
+
+  it('rejects the pending merge gate of the old worker', async () => {
+    const run = await startApprovedRun();
+    const old = await spawn('coder');
+    fs.writeFileSync(path.join(old.worktreePath!, 'x.txt'), 'x\n');
+    await call('request_merge', { worker: old.id });
+    const gate = store.gates(run.id).find((g) => g.kind === 'merge')!;
+    expect(gate.status).toBe('pending');
+    const r = await call('handoff_agent', { worker: old.id, provider: 'codex' });
+    expect(r.ok, r.text).toBe(true);
+    expect(r.text).toMatch(new RegExp(`gate #${gate.id}\\) was rejected`));
+    expect(store.gate(gate.id)!.status).toBe('rejected');
+    // request_merge committed x.txt on the old branch: the new worker starts with it.
+    const nw = store.agent(r.text.match(/off to (\S+)/)![1])!;
+    expect(fs.readFileSync(path.join(nw.worktreePath!, 'x.txt'), 'utf8')).toBe('x\n');
+  });
+
+  it('only the lead can hand off; gone workers and unknown providers are refused', async () => {
+    await startApprovedRun();
+    const w = await spawn('coder');
+    const other = await spawn('planner');
+    const byWorker = await call('handoff_agent', { worker: other.id, provider: 'codex' }, workerCaller(w.providerSessionId!));
+    expect(byWorker.ok).toBe(false);
+    expect(byWorker.text).toMatch(/Only the lead/);
+    expect((await call('handoff_agent', { worker: w.id, provider: 'gemini' })).text).toMatch(/Unsupported provider/);
+    await call('end_agent', { worker: w.id });
+    expect((await call('handoff_agent', { worker: w.id, provider: 'codex' })).text).toMatch(/ended; there is nothing to hand off/);
+  });
+
+  it('a failed carry-over changes nothing: no new worker, no new worktree, the old worker untouched', async () => {
+    const run = await startApprovedRun();
+    const old = await spawn('coder');
+    fs.writeFileSync(path.join(old.worktreePath!, 'wip.txt'), 'wip\n');
+    broker = new Broker({
+      store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock,
+      git: { ...Git, restoreWorkingTree: async () => { throw new Error('tree mismatch'); } },
+    });
+    const before = fs.readdirSync(path.dirname(old.worktreePath!));
+    const r = await call('handoff_agent', { worker: old.id, provider: 'codex' });
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/Handoff aborted.*tree mismatch.*Nothing was changed/);
+    expect(store.agent(old.id)!.status).toBe('idle');
+    expect(store.agents(run.id)).toHaveLength(2);
+    expect(fs.readdirSync(path.dirname(old.worktreePath!))).toEqual(before);
+    expect(sh(repo, 'branch', '--list', 'coagent/*').split('\n')).toHaveLength(1);
+    expect(fs.readFileSync(path.join(old.worktreePath!, 'wip.txt'), 'utf8')).toBe('wip\n');
+  });
+});
+
+describe('review rework (Q41/Q42)', () => {
+  it('handoff is refused when CloudCLI cannot confirm the session is idle (null status)', async () => {
+    await startApprovedRun();
+    const w = await spawn('coder');
+    cc.status = () => null;
+    const r = await call('handoff_agent', { worker: w.id, provider: 'codex' });
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/cannot confirm that .* session is idle/);
+    expect(r.text).toMatch(/Install the CoAgent CloudCLI fork/);
+    expect(store.agent(w.id)!.status).toBe('idle');
+    expect(store.agents(w.runId)).toHaveLength(2);
+  });
+
+  it('handoff aborts cleanly when the session starts processing between the snapshot and the switch', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    fs.writeFileSync(path.join(w.worktreePath!, 'wip.txt'), 'wip\n');
+    let asked = 0;
+    cc.status = () => ++asked > 1; // idle on the first check, processing on the re-check
+    const before = fs.readdirSync(path.dirname(w.worktreePath!));
+    const r = await call('handoff_agent', { worker: w.id, provider: 'codex' });
+    expect(asked).toBe(2);
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/Handoff aborted, nothing was changed: .* still running a turn/);
+    expect(store.agent(w.id)!.status).toBe('idle');
+    expect(store.agents(run.id)).toHaveLength(2);
+    expect(fs.readdirSync(path.dirname(w.worktreePath!))).toEqual(before);
+    expect(sh(repo, 'branch', '--list', 'coagent/*').split('\n')).toHaveLength(1);
+    expect(store.events(run.id).some((e) => e.type === 'handoff')).toBe(false);
+  });
+
+  it('handoff refuses a worktree with dirty submodules and lists them', async () => {
+    const lib = path.join(tmp, 'lib');
+    fs.mkdirSync(lib);
+    sh(lib, 'init', '-q', '-b', 'main');
+    fs.writeFileSync(path.join(lib, 'lib.txt'), 'v1\n');
+    sh(lib, 'add', '-A');
+    sh(lib, 'commit', '-q', '-m', 'lib');
+    sh(repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'vendor/lib');
+    sh(repo, 'commit', '-q', '-m', 'add submodule');
+    await startApprovedRun();
+    const w = await spawn('coder');
+    sh(w.worktreePath!, '-c', 'protocol.file.allow=always', 'submodule', 'update', '-q', '--init');
+    expect(await Git.dirtySubmodules(w.worktreePath!)).toEqual([]);
+    fs.writeFileSync(path.join(w.worktreePath!, 'vendor/lib/lib.txt'), 'v2\n');
+    fs.writeFileSync(path.join(w.worktreePath!, 'vendor/lib/new.txt'), 'new\n');
+    expect(await Git.dirtySubmodules(w.worktreePath!)).toEqual([{ path: 'vendor/lib', issues: ['modified files', 'untracked files'] }]);
+    const r = await call('handoff_agent', { worker: w.id, provider: 'codex' });
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/Handoff refused: .*submodule\(s\) with work that cannot be carried over: vendor\/lib \(modified files, untracked files\)/);
+    expect(store.agent(w.id)!.status).toBe('idle');
+    expect(store.agents(w.runId)).toHaveLength(2);
+  });
+
+  it('the configured backoff is clamped to the same 7-day cap', () => {
+    store.setJson('quotaBackoffMinutes', 1e12);
+    expect(broker.quotaBackoffMinutes()).toBe(7 * 24 * 60);
+    store.setJson('quotaBackoffMinutes', 'abc');
+    expect(broker.quotaBackoffMinutes()).toBe(30);
+    expect(() => broker.setQuotaBackoffMinutes(7 * 24 * 60 + 1)).toThrow(/at most 10080/);
+    expect(() => broker.setQuotaBackoffMinutes(Infinity)).toThrow();
+  });
+
+  describe('quota classification through the real /api/agent stream', () => {
+    const sse = (events: unknown[]) => events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('');
+    let scripts: unknown[][];
+    let prevKey: string | undefined;
+    beforeEach(() => {
+      scripts = [];
+      prevKey = process.env.COAGENT_API_KEY;
+      process.env.COAGENT_API_KEY = 'ck_test';
+      const fetchImpl = (async () => new Response(new ReadableStream({
+        start(ctl) { ctl.enqueue(new TextEncoder().encode(sse(scripts.shift() ?? []))); ctl.close(); },
+      }), { status: 200 })) as unknown as typeof fetch;
+      const http = new HttpCloudCli({
+        pluginsConfigPath: path.join(tmp, 'none.json'), localServerPath: path.join(tmp, 'none.json'), dbPath: path.join(tmp, 'none.db'), fetchImpl,
+      });
+      // The lead still goes through the fake (it is known to it); workers use the real SSE reader.
+      const real = Object.assign(new FakeCloudCli(), { sessions: cc.sessions });
+      real.send = (input, onApp, onEvent) => (input.sessionId === 'lead-app' ? cc.send(input, onApp, onEvent) : http.send(input, onApp, onEvent));
+      broker = new Broker({ store, cloudcli: real, git: Git, prompts: filePrompts(PROMPTS), now: () => clock });
+    });
+    afterEach(() => {
+      if (prevKey === undefined) delete process.env.COAGENT_API_KEY; else process.env.COAGENT_API_KEY = prevKey;
+    });
+    const start = { type: 'session-id', sessionId: 'app-w' };
+    const text = (t: string) => ({ kind: 'text', role: 'assistant', content: t, provider: 'codex' });
+
+    it('an unrelated tool error mentioning HTTP 429 in a turn that completes does not pause the worker', async () => {
+      await startApprovedRun();
+      scripts.push([start, { kind: 'error', content: 'GET https://api.example.com/v1 failed: HTTP 429 Too Many Requests', provider: 'codex' },
+        text('The API rate-limits us; adding a retry.'), { kind: 'complete', exitCode: 0, success: true, provider: 'codex' }]);
+      const w = await spawn('coder', 'fix the client', 'codex');
+      expect(store.agent(w.id)).toMatchObject({ status: 'idle', lastError: null, resumeAt: null });
+    });
+
+    it('a mid-turn 429 followed by an unrelated terminal failure fails the worker, without pausing it', async () => {
+      await startApprovedRun();
+      scripts.push([start, { kind: 'error', content: 'upstream said 429 rate limit', provider: 'codex' }, text('retrying'),
+        { kind: 'error', content: 'process exited unexpectedly', provider: 'codex' }, { kind: 'complete', exitCode: 1, success: false, provider: 'codex' }]);
+      const w = await spawn('coder', 'fix the client', 'codex');
+      expect(store.agent(w.id)).toMatchObject({ status: 'error', lastError: 'process exited unexpectedly' });
+    });
+
+    it('the terminal provider failure is classified, generic wording included', async () => {
+      clock = Date.parse('2026-11-26T18:00:00Z');
+      await startApprovedRun();
+      scripts.push([start, text('working'), { kind: 'error', content: 'stream error: 429 Too Many Requests; rate limit reached', provider: 'codex' },
+        { kind: 'complete', exitCode: 1, success: false, provider: 'codex' }]);
+      const w = await spawn('coder', 'fix the client', 'codex');
+      expect(store.agent(w.id)).toMatchObject({ status: 'paused', pauseReason: 'rate limit', resumeAt: '2026-11-26T18:30:00.000Z' });
+    });
+
+    it('the distinctive provider phrase pauses even without a terminal complete', async () => {
+      clock = Date.parse('2026-11-26T18:00:00Z');
+      await startApprovedRun();
+      scripts.push([start, { kind: 'error', content: "You've hit your usage limit. Try again at 7:13 PM.", provider: 'codex' }, text('…')]);
+      const w = await spawn('coder', 'fix the client', 'codex');
+      expect(store.agent(w.id)).toMatchObject({ status: 'paused', pauseReason: 'usage limit' });
+    });
   });
 });

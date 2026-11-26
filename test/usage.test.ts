@@ -147,4 +147,25 @@ describe('aborted runs (real SSE sequence)', () => {
   it('a normal complete is still ok', async () => {
     expect((await streamTurn(CLAUDE_TURN)).res.status).toBe('ok');
   });
+  it('run outcome: the terminal complete decides; only the error that ended the run is terminal', async () => {
+    const sid = { type: 'session-id', sessionId: 'app-x' };
+    const text = assistantText('codex', 'working');
+    const ok = { kind: 'complete', exitCode: 0, success: true, provider: 'codex' };
+    const failed = { kind: 'complete', exitCode: 1, success: false, provider: 'codex' };
+    // An intermediate error no longer wins over a successful end.
+    expect((await streamTurn([sid, { kind: 'error', content: 'HTTP 429' }, text, ok])).res).toEqual({ status: 'ok', appSessionId: 'app-x' });
+    // The provider error right before a failing complete is the cause.
+    expect((await streamTurn([sid, text, { kind: 'error', content: 'quota' }, { kind: 'status', text: 'token_budget' }, failed])).res)
+      .toEqual({ status: 'error', error: 'quota', terminal: true });
+    // An older error followed by more work is not the cause.
+    expect((await streamTurn([sid, { kind: 'error', content: 'tool 429' }, text, failed])).res)
+      .toEqual({ status: 'error', error: 'tool 429', terminal: false });
+    expect((await streamTurn([sid, text, failed])).res).toEqual({ status: 'error', error: 'the run failed (exit code 1)', terminal: false });
+    // The route's own failure event ends the stream: terminal.
+    expect((await streamTurn([sid, text, { type: 'error', error: 'rate limit', message: 'Failed: rate limit' }])).res)
+      .toEqual({ status: 'error', error: 'rate limit', terminal: true });
+    // No complete (older hosts): terminal only when the error was the last thing sent.
+    expect((await streamTurn([sid, text, { kind: 'error', content: 'x' }])).res).toEqual({ status: 'error', error: 'x', terminal: true });
+    expect((await streamTurn([sid, { kind: 'error', content: 'x' }, text])).res).toEqual({ status: 'error', error: 'x', terminal: false });
+  });
 });
