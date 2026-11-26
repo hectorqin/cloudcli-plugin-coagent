@@ -7,7 +7,7 @@ const source = fs.readFileSync('src/shared/version.ts', 'utf8');
 const skill = fs.readFileSync('skills/coagent/SKILL.md', 'utf8');
 const match = source.match(/export const VERSION = ['"]([^'"]+)['"]/);
 if (!match) throw new Error('src/shared/version.ts does not export a literal VERSION');
-if (!/^---\nname: coagent\ndescription: .+\n---\n/m.test(skill)) {
+if (!/^---\r?\nname: coagent\r?\ndescription: [^\r\n]+\r?\ndisable-model-invocation: true\r?\n---\r?\n/.test(skill)) {
   throw new Error('skills/coagent/SKILL.md must have coagent name and description frontmatter');
 }
 

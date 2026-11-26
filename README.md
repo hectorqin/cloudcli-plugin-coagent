@@ -59,8 +59,10 @@ CoAgent writes the following user-level state:
 - `~/.agents/skills/coagent/SKILL.md`: the Codex `$coagent` skill (CloudCLI and Codex also discover this global source).
 - `~/.cloudcli-coagent/`: the database, migration backups, runtime discovery file, and broker log.
 
-Skill directories include a `.coagent-owned` marker. Registration updates and unregistration removes only marked
-directories; an existing user-authored `coagent` skill is left untouched and reported as a registration failure.
+Skill directories include a `.coagent-owned` marker. `SKILL.md` is managed content, so edits to it are overwritten on
+registration. Delete `.coagent-owned` to take ownership: future registration and unregistration then report
+`skipped: user-managed skill` and leave the directory untouched. Existing unmarked user-authored skills are likewise
+left untouched. Unregistration removes only the managed `SKILL.md` and marker, preserving other files in the directory.
 
 To uninstall safely, first click **Unregister MCP + skill** in the CoAgent tab. Then remove the plugin in **Settings → Plugins**.
 If the tab is no longer available, run `claude mcp remove -s user coagent` and remove only the
@@ -86,6 +88,10 @@ views are not required for the core tab workflow; unsupported hosts fall back to
 In any CloudCLI session, invoke `/coagent <task>` in Claude or `$coagent <task>` in Codex. The session calls
 `submit_plan` and becomes the lead. You can also ask it to “plan this and delegate it to sub-agents.” Approve the plan
 in the tab; workers appear there; approve merges when the lead requests them.
+
+The globally discovered skill may also appear in plain Claude Code or other hosts, but CoAgent runs require its MCP
+tools and therefore work only in CloudCLI Claude/Codex sessions. If `submit_plan` is unavailable, the skill stops and
+explains this requirement.
 
 ## Caveats
 

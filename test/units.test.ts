@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
-import { codexBlock, installSkill, removeCodexSection, removeSkill, SKILL_MARKER, upsertCodexToml } from '../src/broker/registration.js';
+import { codexBlock, installSkill, removeCodexSection, removeSkill, SKILL_MARKER, skillSourcePath, upsertCodexToml } from '../src/broker/registration.js';
 import { pendingMigrations, SKIP_BACKUP_MARKER, Store } from '../src/broker/store.js';
 import { sseEvents } from '../src/broker/cloudcli.js';
 import { callerFrom, protocolMismatch } from '../src/shim/mcp-shim.js';
@@ -38,6 +38,10 @@ describe('codex config.toml registration', () => {
 });
 
 describe('provider skill registration', () => {
+  it('resolves the shipped skill next to the built dist directory', () => {
+    expect(skillSourcePath(path.resolve('dist/mcp-shim.js'))).toBe(path.resolve('skills/coagent/SKILL.md'));
+  });
+
   it('installs both provider paths idempotently, then updates changed content', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-skills-'));
     try {
@@ -56,10 +60,14 @@ describe('provider skill registration', () => {
       fs.writeFileSync(source, '---\nname: coagent\ndescription: test\n---\n\ntwo\n');
       expect(installSkill(source, claude)).toBe('registered (updated)');
       expect(fs.readFileSync(path.join(claude, 'SKILL.md'), 'utf8')).toContain('two');
+      expect(removeSkill(claude)).toBe('removed');
+      expect(removeSkill(codex)).toBe('removed');
+      expect(fs.existsSync(claude)).toBe(false);
+      expect(fs.existsSync(codex)).toBe(false);
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 
-  it('refuses to overwrite or remove a foreign skill and removes owned skills', () => {
+  it('skips a user-managed skill and removes only files owned by coagent', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-skills-'));
     try {
       const source = path.join(home, 'source.md');
@@ -68,15 +76,49 @@ describe('provider skill registration', () => {
       fs.writeFileSync(source, 'managed');
       fs.mkdirSync(foreign, { recursive: true });
       fs.writeFileSync(path.join(foreign, 'SKILL.md'), 'user content');
-      expect(installSkill(source, foreign)).toMatch(/^failed:/);
+      expect(installSkill(source, foreign)).toBe('skipped: user-managed skill');
       expect(fs.readFileSync(path.join(foreign, 'SKILL.md'), 'utf8')).toBe('user content');
-      expect(removeSkill(foreign)).toMatch(/^not removed:/);
+      expect(removeSkill(foreign)).toBe('skipped: user-managed skill');
       expect(fs.existsSync(foreign)).toBe(true);
 
       installSkill(source, owned);
+      fs.writeFileSync(path.join(owned, 'notes.txt'), 'keep');
       expect(removeSkill(owned)).toBe('removed');
-      expect(fs.existsSync(owned)).toBe(false);
-      expect(removeSkill(owned)).toBe('removed');
+      expect(fs.existsSync(path.join(owned, 'SKILL.md'))).toBe(false);
+      expect(fs.existsSync(path.join(owned, SKILL_MARKER))).toBe(false);
+      expect(fs.readFileSync(path.join(owned, 'notes.txt'), 'utf8')).toBe('keep');
+      expect(removeSkill(owned)).toBe('skipped: user-managed skill');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('marks a partial install for repair before reading or writing content', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-skills-'));
+    try {
+      const source = path.join(home, 'missing.md');
+      const target = path.join(home, '.claude', 'skills', 'coagent');
+      expect(() => installSkill(source, target)).toThrow();
+      expect(fs.existsSync(path.join(target, SKILL_MARKER))).toBe(true);
+      fs.writeFileSync(source, 'repaired');
+      expect(installSkill(source, target)).toBe('registered (updated)');
+      expect(fs.readFileSync(path.join(target, 'SKILL.md'), 'utf8')).toBe('repaired');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('atomically replaces SKILL.md symlinks without writing through them', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-skills-'));
+    try {
+      const source = path.join(home, 'source.md');
+      const outside = path.join(home, 'outside.md');
+      const directory = path.join(home, '.agents', 'skills', 'coagent');
+      fs.writeFileSync(source, 'managed v1');
+      fs.writeFileSync(outside, 'do not change');
+      installSkill(source, directory);
+      fs.rmSync(path.join(directory, 'SKILL.md'));
+      fs.symlinkSync(outside, path.join(directory, 'SKILL.md'));
+      expect(installSkill(source, directory)).toBe('registered (updated)');
+      expect(fs.readFileSync(outside, 'utf8')).toBe('do not change');
+      expect(fs.lstatSync(path.join(directory, 'SKILL.md')).isSymbolicLink()).toBe(false);
+      expect(fs.readFileSync(path.join(directory, 'SKILL.md'), 'utf8')).toBe('managed v1');
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 });

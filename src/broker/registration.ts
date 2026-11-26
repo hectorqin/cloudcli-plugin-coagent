@@ -65,35 +65,47 @@ function claudeEntryMatches(file: string, node: string, shim: string): boolean {
   }
 }
 
-function writeAtomic(file: string, text: string) {
+function writeAtomic(file: string, text: string, backup = true) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  if (fs.existsSync(file) && !fs.existsSync(`${file}.coagent.bak`)) fs.copyFileSync(file, `${file}.coagent.bak`);
-  const tmp = `${file}.coagent.tmp`;
-  fs.writeFileSync(tmp, text);
-  fs.renameSync(tmp, file);
+  if (backup && fs.existsSync(file) && !fs.existsSync(`${file}.coagent.bak`)) fs.copyFileSync(file, `${file}.coagent.bak`);
+  const tmp = `${file}.coagent.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  try {
+    fs.writeFileSync(tmp, text, { flag: 'wx' });
+    fs.renameSync(tmp, file);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
 }
+
+export const skillSourcePath = (shim: string) => path.resolve(path.dirname(shim), '..', 'skills', MCP_NAME, 'SKILL.md');
 
 /** Install only into a new directory or one carrying our ownership marker. */
 export function installSkill(source: string, directory: string): string {
   const marker = path.join(directory, SKILL_MARKER);
   const target = path.join(directory, 'SKILL.md');
   if (fs.existsSync(directory) && !fs.existsSync(marker)) {
-    return 'failed: existing skill is not managed by coagent';
+    return 'skipped: user-managed skill';
   }
-  const content = fs.readFileSync(source, 'utf8');
-  if (fs.existsSync(target) && fs.readFileSync(target, 'utf8') === content
-    && fs.existsSync(marker) && fs.readFileSync(marker, 'utf8') === SKILL_MARKER_CONTENT) return 'registered';
   fs.mkdirSync(directory, { recursive: true });
-  fs.writeFileSync(target, content);
+  // Claim ownership before the content write, so an interrupted first install can repair itself next time.
   fs.writeFileSync(marker, SKILL_MARKER_CONTENT);
+  const content = fs.readFileSync(source, 'utf8');
+  if (fs.existsSync(target) && fs.lstatSync(target).isFile() && fs.readFileSync(target, 'utf8') === content) return 'registered';
+  // Atomic rename replaces a hostile/stale SKILL.md symlink instead of following it.
+  writeAtomic(target, content, false);
   return 'registered (updated)';
 }
 
-/** Remove the complete skill directory only when its marker proves ownership. */
+/** Remove only files we own, preserving any user files that share the directory. */
 export function removeSkill(directory: string): string {
   if (!fs.existsSync(directory)) return 'removed';
-  if (!fs.existsSync(path.join(directory, SKILL_MARKER))) return 'not removed: existing skill is not managed by coagent';
-  fs.rmSync(directory, { recursive: true });
+  const marker = path.join(directory, SKILL_MARKER);
+  if (!fs.existsSync(marker)) return 'skipped: user-managed skill';
+  fs.rmSync(path.join(directory, 'SKILL.md'), { force: true });
+  fs.rmSync(marker, { force: true });
+  try { fs.rmdirSync(directory); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOTEMPTY') throw e;
+  }
   return 'removed';
 }
 
@@ -126,7 +138,7 @@ export async function ensureRegistered(shim: string, node = process.execPath, p 
   } catch (e) {
     status.codex = `failed: ${(e as Error).message.split('\n')[0]}`;
   }
-  const sourceSkill = p.sourceSkill ?? path.resolve(path.dirname(shim), '..', 'skills', MCP_NAME, 'SKILL.md');
+  const sourceSkill = p.sourceSkill ?? skillSourcePath(shim);
   for (const [key, directory] of [['claude-skill', p.claudeSkill], ['codex-skill', p.codexSkill]] as const) {
     try { status[key] = installSkill(sourceSkill, directory); }
     catch (e) { status[key] = `failed: ${(e as Error).message.split('\n')[0]}`; }

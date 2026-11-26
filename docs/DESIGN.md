@@ -44,8 +44,12 @@
 `~/.claude/skills/coagent/SKILL.md`（Claude：`/coagent`）和
 `~/.agents/skills/coagent/SKILL.md`（Codex：`$coagent`）。CloudCLI 的 Codex provider 也把后者作为全局默认
 skill source。skill 只负责发起 `submit_plan` 并强调跨 provider review 和中断续跑；完整协议仍由工具结果提供。
-每个安装目录带 `.coagent-owned` 标记，只有带标记的目录才会被升级或卸载，避免覆盖用户自建的同名 skill。
-MCP 与 skill 共用 `autoRegister` 开关和 tab 注册/卸载操作。
+Claude 专用的 `disable-model-invocation: true` 使其只能由用户显式调用；CloudCLI/Codex 的解析器只读取
+`name` 与 `description`，会忽略这个未知字段。自然语言委派仍可由 `submit_plan` 自己的 tool description 触发。
+全局发现可能让 plain Claude Code 或其他宿主也显示该 skill，但缺少 `submit_plan` 时必须说明 CoAgent 仅支持
+CloudCLI Claude/Codex 会话并停止。每个安装目录带 `.coagent-owned` 标记；`SKILL.md` 是会被升级覆盖的托管文件。
+用户删除 marker 即接管整个目录，此后注册和卸载均跳过；卸载托管 skill 时只删除 `SKILL.md` 与 marker，
+保留目录中的其他文件。MCP 与 skill 共用 `autoRegister` 开关和 tab 注册/卸载操作。
 
 ### 4.2 `plugin/` 后端 = broker
 
