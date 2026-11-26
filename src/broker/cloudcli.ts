@@ -55,6 +55,8 @@ export class HttpCloudCli implements CloudCli {
       pluginsConfigPath?: string;
       localServerPath?: string;
       fetchImpl?: typeof fetch;
+      /** Bound on each session-status request; a timeout counts as "unknown" (default 5 s). */
+      statusTimeoutMs?: number;
     } = {},
   ) {}
 
@@ -176,15 +178,17 @@ export class HttpCloudCli implements CloudCli {
     if (!key) return { processing: null };
     const doFetch = this.opts.fetchImpl ?? fetch;
     const headers = { 'x-api-key': key };
+    // A hung CloudCLI must not hang the caller (endRun/endAgent/recovery): a timeout means "cannot tell".
+    const signal = () => AbortSignal.timeout(this.opts.statusTimeoutMs ?? 5_000);
     try {
       if (this.sessionStatusSupported === null) {
-        const caps = await doFetch(`${this.baseUrl()}/api/agent/capabilities`, { headers });
+        const caps = await doFetch(`${this.baseUrl()}/api/agent/capabilities`, { headers, signal: signal() });
         // Only a definite answer is cached; a transient failure is retried next time.
         if (!caps.ok) return { processing: null };
         this.sessionStatusSupported = ((await caps.json()) as Record<string, unknown>).sessionStatus === true;
       }
       if (!this.sessionStatusSupported) return { processing: null };
-      const res = await doFetch(`${this.baseUrl()}/api/agent/sessions/${encodeURIComponent(sessionId)}`, { headers });
+      const res = await doFetch(`${this.baseUrl()}/api/agent/sessions/${encodeURIComponent(sessionId)}`, { headers, signal: signal() });
       // CloudCLI does not know the session, so it cannot be running a turn in it.
       if (res.status === 404) return { processing: false };
       if (!res.ok) return { processing: null };

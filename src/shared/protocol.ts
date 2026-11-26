@@ -87,6 +87,8 @@ export interface RunDTO {
   leadAgentId: string;
   projectPath: string;
   status: RunStatus;
+  /** endRun has started on this active run: nothing new may start in it. */
+  ending?: boolean;
   planStatus: PlanStatus;
   createdAt: string;
   /** Totals over every turn the broker ran in this run (lead and workers). */

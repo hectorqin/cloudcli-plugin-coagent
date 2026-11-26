@@ -123,8 +123,6 @@ export class Broker {
   private detached = new Map<string, number>();
   /** Turn rows (store `turns`) this process has open. Any other open row was left by a process that is gone. */
   private openTurns = new Set<number>();
-  /** Runs inside endRun: set synchronously on entry, so no turn starts while endRun waits for the repository lock. */
-  private ending = new Map<string, number>();
   private checkingDetached = false;
   private now: () => number;
   private log: (...args: unknown[]) => void;
@@ -188,7 +186,9 @@ export class Broker {
         requireLead();
         const plan = str(a.plan, 'plan');
         const prev = store.pendingGate(run.id, 'plan', null);
-        if (prev) store.decideGate(prev.id, 'rejected', 'superseded by a newer plan');
+        if (prev && store.decideGate(prev.id, 'rejected', 'superseded by a newer plan')) {
+          store.addEvent(run.id, agent.id, 'gate_decided', { gate: prev.id, kind: 'plan', status: 'rejected', comment: 'superseded by a newer plan' });
+        }
         const id = store.addGate(run.id, 'plan', agent.id, null, plan);
         store.setPlanStatus(run.id, 'pending');
         store.addEvent(run.id, agent.id, 'gate_opened', { gate: id, kind: 'plan' });
@@ -233,7 +233,7 @@ export class Broker {
           // leaves a queued task that is delivered (or recovered) like any other message.
           store.transaction(() => {
             // ended (or is ending) while the worktree was created
-            if (store.run(run.id)?.status !== 'active' || this.ending.has(run.id)) fail('This run has ended.');
+            if (!this.runOpen(run.id)) fail('This run has ended.');
             full(); // re-checked: another spawn may have finished while the worktree was created
             store.createAgent({ id, runId: run.id, role, provider, cwd, branch, worktreePath, status: 'starting', task });
             store.addEvent(run.id, id, 'spawned', { by: lead.id, role, provider, branch });
@@ -297,12 +297,17 @@ export class Broker {
         const worktreePath = w!.worktreePath!;
         // Serialized with merges and endRun on this repository: the worktree cannot be removed under us.
         const opened = await this.withLeadRepo(lead, async () => {
-          if (store.run(run.id)?.status !== 'active') fail('This run has ended.');
+          const recheck = () => {
+            if (!this.runOpen(run.id)) fail('This run has ended.');
+            const cur = store.agent(wid)!;
+            if (GONE.has(cur.status) || cur.worktreePath !== worktreePath) fail(`${wid} is ${cur.status}; there is nothing to merge.`);
+          };
+          recheck(); // e.g. end_agent got the lock first
           const existing = store.pendingGate(run.id, 'merge', wid);
           if (existing) return existing.id;
           await this.d.git.commitAll(worktreePath, `coagent: uncommitted work from ${w!.id}`);
           const snapshot = await this.d.git.mergeSnapshot(lead.cwd, worktreePath, w!.branch!);
-          if (store.run(run.id)?.status !== 'active') fail('This run has ended.');
+          recheck();
           const gateId = store.addGate(run.id, 'merge', agent.id, wid, note, snapshot);
           store.addEvent(run.id, agent.id, 'gate_opened', { gate: gateId, kind: 'merge', subject: wid });
           return { gateId, snapshot };
@@ -419,12 +424,13 @@ export class Broker {
     const gate = store.gate(gateId) ?? fail(`No gate #${gateId}`);
     if (gate.status !== 'pending') fail(`Gate #${gateId} is already ${gate.status}.`, 409);
     const run = store.run(gate.runId)!;
-    if (run.status !== 'active') fail('This run has ended.', 409);
+    if (!this.runOpen(run.id)) fail('This run has ended.', 409);
     const lead = run.leadAgentId;
+    const already = () => fail(`Gate #${gateId} is already ${store.gate(gateId)!.status}.`, 409);
     const fb = comment ? `\n\nUser comment: ${comment}` : '';
 
     if (gate.kind === 'plan') {
-      store.decideGate(gate.id, approve ? 'approved' : 'rejected', comment);
+      if (!store.decideGate(gate.id, approve ? 'approved' : 'rejected', comment)) already();
       store.setPlanStatus(run.id, approve ? 'approved' : 'rejected');
       store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'plan', status: approve ? 'approved' : 'rejected', comment });
       store.addMessage(run.id, null, lead, 'gate', approve
@@ -432,15 +438,14 @@ export class Broker {
         : `The user REJECTED your plan (gate #${gate.id}).${fb}\n\nRevise it and call submit_plan again.`, gate.id);
     } else {
       const workerId = gate.subjectAgent!;
-      const w = store.agent(workerId);
       if (!approve) {
-        store.decideGate(gate.id, 'rejected', comment);
+        if (!store.decideGate(gate.id, 'rejected', comment)) already();
         store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: workerId, status: 'rejected', comment });
         store.addMessage(run.id, null, lead, 'gate', `The user REJECTED merging ${workerId} (gate #${gate.id}).${fb}`, gate.id);
       } else {
         const leadAgent = store.agent(lead)!;
         const expire = (reason: string) => {
-          store.decideGate(gate.id, 'expired', comment);
+          if (!store.decideGate(gate.id, 'expired', comment)) return; // decided meanwhile: that decision stands
           store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: workerId, status: 'expired', reason, comment });
           store.addMessage(run.id, null, lead, 'gate',
             `The merge gate for ${workerId} (#${gate.id}) EXPIRED because ${reason}. `
@@ -455,8 +460,10 @@ export class Broker {
         await this.withLeadRepo(leadAgent, async () => {
           // A second concurrent approval, or endRun, can have got this lock first; honor whatever happened then.
           if (store.gate(gate.id)?.status !== 'pending') return;
-          if (store.run(run.id)?.status !== 'active') return;
-          if (!w?.branch || !w.worktreePath) { expire('the worker branch or worktree is missing'); return; }
+          if (!this.runOpen(run.id)) return;
+          const w = store.agent(workerId); // re-read under the lock (end_agent may have run first)
+          if (!w || GONE.has(w.status)) { expire(`${workerId} is ${w?.status ?? 'gone'}`); return; }
+          if (!w.branch || !w.worktreePath) { expire('the worker branch or worktree is missing'); return; }
           if (this.workerInFlight(w.id)) fail(`${w.id} is still running; wait for it to finish before merging.`);
           let dirty: string;
           try { dirty = await git.status(w.worktreePath); } catch { expire('the worker branch or worktree is missing'); return; }
@@ -468,8 +475,9 @@ export class Broker {
           if (!(await git.isAncestor(leadAgent.cwd, snapshot.leadHead, leadHead))) {
             expire('the lead branch diverged from the reviewed head'); return;
           }
+          // Decide before touching the repository: if the gate is no longer pending, nothing is merged.
+          if (!store.decideGate(gate.id, 'approved', comment)) return;
           const res = await git.merge(leadAgent.cwd, snapshot.workerHead, `coagent: merge ${w.branch} (${w.role} ${w.id})`, leadHead);
-          store.decideGate(gate.id, 'approved', comment);
           store.addEvent(run.id, null, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'approved', comment });
           store.addEvent(run.id, w.id, 'merge', res.ok
             ? { ok: true, commit: res.commit, branch: w.branch, snapshot: snapshot.workerHead, baseMoved: res.baseMoved, actualBase: res.actualBase }
@@ -514,7 +522,7 @@ export class Broker {
   userMessage(agentId: string, body: string) {
     const { store } = this.d;
     const a = store.agent(agentId) ?? fail(`No agent ${agentId}`);
-    if (store.run(a.runId)?.status !== 'active') fail('This run has ended.', 409);
+    if (!this.runOpen(a.runId)) fail('This run has ended.', 409);
     if (a.status === 'merged' || a.status === 'ended') fail(`${a.id} is ${a.status} and no longer receives messages.`);
     const wait = this.slotWait(a);
     store.addMessage(a.runId, null, a.id, 'message', str(body, 'body'));
@@ -564,62 +572,66 @@ export class Broker {
    * slot. Its worktree is only deleted when asked; its branch is always kept. `by` null = the user.
    */
   async endAgent(agentId: string, removeWorktree: boolean, by: string | null): Promise<string> {
-    const { store, git } = this.d;
+    const { store } = this.d;
     const check = () => {
       const w = store.agent(agentId) ?? fail(`No agent ${agentId}`);
       const run = store.run(w.runId)!;
-      if (run.status !== 'active') fail('This run has ended.');
+      if (!this.runOpen(run.id)) fail('This run has ended.');
       if (w.id === run.leadAgentId) fail('The lead cannot be ended this way; end the run instead.');
       if (GONE.has(w.status)) fail(`${w.id} is already ${w.status}.`);
       if (store.busy.has(w.id)) fail(`${w.id} is in the middle of a turn; wait for it to finish, then end it.`);
       return { w, run };
     };
-    let { w } = check();
-    if (removeWorktree && w.worktreePath) {
+    const first = check();
+    if (removeWorktree && first.w.worktreePath) {
       // Never delete a worktree a session may still be writing to (e.g. a turn that outlived a broker restart).
-      const processing = await this.processing(w);
+      // Asked outside the repository lock: a slow CloudCLI must not hold up merges.
+      const processing = await this.processing(first.w);
       if (processing !== false) {
-        fail(`Cannot delete the worktree of ${w.id}: ${processing ? 'its session is still running a turn in CloudCLI'
+        fail(`Cannot delete the worktree of ${first.w.id}: ${processing ? 'its session is still running a turn in CloudCLI'
           : 'CloudCLI cannot confirm that its session is idle'}. End it without remove_worktree, or retry later.`);
       }
     }
-    // Stop barrier: from here on (no await until it is persisted) nothing can start a new turn for it.
-    const checked = check();
-    w = checked.w;
-    const { run } = checked;
-    let cancelled = 0;
-    store.transaction(() => {
-      const gate = store.pendingGate(run.id, 'merge', w.id);
-      if (gate) {
-        store.decideGate(gate.id, 'rejected', `${w.id} was ended`);
-        store.addEvent(run.id, by, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'rejected', comment: 'worker ended' });
-      }
-      store.updateAgent(w.id, { status: 'ended' });
-      cancelled = store.cancelQueued(w.id);
-      store.addEvent(run.id, w.id, 'agent_ended', { by: by ?? 'user', removeWorktree, cancelled });
-      if (by === null) {
-        store.addMessage(run.id, null, run.leadAgentId, 'system',
-          `The user ended ${w.id}. It no longer receives messages and no longer counts as a worker.`);
-      }
+    const lead = store.agent(first.run.leadAgentId)!;
+    // Serialized with merge approval and request_merge on this repository, and re-checked under the lock.
+    return this.withLeadRepo(lead, async () => {
+      const { w, run } = check();
+      // Stop barrier: from here on (no await until it is persisted) nothing can start a new turn for it.
+      let cancelled = 0;
+      store.transaction(() => {
+        const gate = store.pendingGate(run.id, 'merge', w.id);
+        if (gate && store.decideGate(gate.id, 'rejected', `${w.id} was ended`)) {
+          store.addEvent(run.id, by, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'rejected', comment: 'worker ended' });
+        }
+        store.updateAgent(w.id, { status: 'ended' });
+        cancelled = store.cancelQueued(w.id);
+        store.addEvent(run.id, w.id, 'agent_ended', { by: by ?? 'user', removeWorktree, cancelled });
+        if (by === null) {
+          store.addMessage(run.id, null, run.leadAgentId, 'system',
+            `The user ended ${w.id}. It no longer receives messages and no longer counts as a worker.`);
+        }
+      });
+      this.detached.delete(w.id);
+      if (by === null) this.kick();
+      const cleanup = removeWorktree && w.worktreePath ? await this.removeAgentWorktree(w, lead)
+        : w.worktreePath ? ` Its worktree ${w.worktreePath} and branch ${w.branch} are kept (not merged).` : '';
+      const dropped = cancelled ? ` ${cancelled} undelivered message(s) to it were cancelled.` : '';
+      return `Ended ${w.id}; its worker slot is free.${dropped}${cleanup}`;
     });
-    this.detached.delete(w.id);
-    if (by === null) this.kick();
+  }
 
-    let cleanup = '';
-    if (removeWorktree && w.worktreePath) {
-      try {
-        await git.removeWorktree(w.worktreePath);
-        store.updateAgent(w.id, { worktreePath: null });
-        cleanup = ` Deleted its worktree; branch ${w.branch} is kept.`;
-      } catch (e) {
-        this.log('worktree remove failed', { runId: run.id, agentId: w.id, error: e });
-        cleanup = ` It is ended, but deleting its worktree ${w.worktreePath} failed: ${(e as Error).message.split('\n')[0]}.`;
-      }
-    } else if (w.worktreePath) {
-      cleanup = ` Its worktree ${w.worktreePath} and branch ${w.branch} are kept (not merged).`;
+  /** endAgent's worktree removal (caller holds the lead repository lock). Returns the sentence for the reply. */
+  private async removeAgentWorktree(w: AgentDTO, lead: AgentDTO): Promise<string> {
+    if (this.workerInFlight(w.id)) return ` Its worktree ${w.worktreePath} was kept: ${w.id} is still running.`;
+    try {
+      if (!w.branch) throw new Error(`${w.worktreePath} has no recorded branch; it was left in place`);
+      await this.d.git.removeOwnedWorktree(lead.cwd, w.worktreePath!, w.branch);
+      this.d.store.updateAgent(w.id, { worktreePath: null });
+      return ` Deleted its worktree; branch ${w.branch} is kept.`;
+    } catch (e) {
+      this.log('worktree remove failed', { runId: w.runId, agentId: w.id, error: e });
+      return ` It is ended, but deleting its worktree ${w.worktreePath} failed: ${(e as Error).message.split('\n')[0]}.`;
     }
-    const dropped = cancelled ? ` ${cancelled} undelivered message(s) to it were cancelled.` : '';
-    return `Ended ${w.id}; its worker slot is free.${dropped}${cleanup}`;
   }
 
   /** Whether the agent's CloudCLI session is running a turn. false also when it never had a session or a turn. */
@@ -638,35 +650,33 @@ export class Broker {
   }
 
   /**
-   * Ends a run (the user, from the tab). Under the lead repository's lock, so it never interleaves with a merge:
-   *  1. stop barrier (no await): pending gates expire, queued messages are cancelled, the run and its agents end,
-   *     so nothing can start a new turn;
-   *  2. with `removeWorktrees`, each worktree is deleted only if its agent is provably not running a turn and the
-   *     path is still that agent's worktree of the lead repository. Anything else is kept and returned.
-   * Calling it again on an ended run retries the cleanup.
+   * Ends a run (the user, from the tab):
+   *  1. the stop intent is persisted (runs.ending_at) at once: from then on nothing starts a turn or a spawn in it,
+   *     even across a broker restart (recover() completes the stop);
+   *  2. under the lead repository's lock, so it never interleaves with a merge, the synchronous stop barrier:
+   *     pending gates expire, queued messages are cancelled, the run and its agents end;
+   *  3. with `removeWorktrees`, each worktree is deleted only if its agent is provably not running a turn (CloudCLI is
+   *     asked outside the lock) and, re-checked under the lock, the path is still that agent's worktree of the lead
+   *     repository. Anything else is kept and returned. Calling endRun again on an ended run retries this step.
    */
   async endRun(runId: string, removeWorktrees: boolean): Promise<{ failedWorktrees: FailedWorktree[] }> {
     const { store } = this.d;
     const run = store.run(runId) ?? fail(`No run ${runId}`);
     const lead = store.agent(run.leadAgentId)!;
-    this.ending.set(run.id, (this.ending.get(run.id) ?? 0) + 1);
-    try {
-      return await this.withLeadRepo(lead, () => this.endRunLocked(run.id, lead, removeWorktrees));
-    } finally {
-      const left = (this.ending.get(run.id) ?? 1) - 1;
-      if (left > 0) this.ending.set(run.id, left); else this.ending.delete(run.id);
+    store.markEnding(run.id);
+    const stopped = await this.withLeadRepo(lead, async () => this.stopRun(run.id));
+    const failedWorktrees = removeWorktrees ? await this.removeRunWorktrees(run.id, lead) : [];
+    if (stopped) {
+      store.addEvent(run.id, null, 'run_ended', failedWorktrees.length ? { removeWorktrees, failedWorktrees } : { removeWorktrees });
     }
+    if (failedWorktrees.length) this.log('run worktrees kept', { runId: run.id, failedWorktrees });
+    return { failedWorktrees };
   }
 
-  private async endRunLocked(runId: string, lead: AgentDTO, removeWorktrees: boolean): Promise<{ failedWorktrees: FailedWorktree[] }> {
-    const { store } = this.d;
-    const stopped = this.stopRun(runId);
-    const failedWorktrees = removeWorktrees ? await this.removeRunWorktrees(runId, lead) : [];
-    if (stopped) {
-      store.addEvent(runId, null, 'run_ended', failedWorktrees.length ? { removeWorktrees, failedWorktrees } : { removeWorktrees });
-    }
-    if (failedWorktrees.length) this.log('run worktrees kept', { runId, failedWorktrees });
-    return { failedWorktrees };
+  /** Whether turns, spawns, gate decisions and merges may still happen in this run. */
+  private runOpen(runId: string): boolean {
+    const run = this.d.store.run(runId);
+    return !!run && run.status === 'active' && !run.ending;
   }
 
   /** The stop barrier of endRun. Synchronous on purpose. False when the run had already ended. */
@@ -695,16 +705,23 @@ export class Broker {
     const failed: FailedWorktree[] = [];
     for (const a of store.agents(runId)) {
       if (!a.worktreePath) continue; // includes a merged worker whose post-merge removal failed
-      const busy = await this.stillWorking(a);
+      const busy = await this.stillWorking(a); // CloudCLI HTTP: never under the repository lock
       if (busy) { failed.push({ agentId: a.id, path: a.worktreePath, reason: busy }); continue; }
-      try {
-        if (!a.branch) throw new Error(`${a.worktreePath} has no recorded branch; it was left in place`);
-        await git.removeOwnedWorktree(lead.cwd, a.worktreePath, a.branch);
-        store.updateAgent(a.id, { worktreePath: null });
-      } catch (e) {
-        this.log('worktree remove failed', { runId, agentId: a.id, error: e });
-        failed.push({ agentId: a.id, path: a.worktreePath, reason: (e as Error).message.split('\n')[0] });
-      }
+      const kept = await this.withLeadRepo(lead, async (): Promise<string | null> => {
+        const cur = store.agent(a.id);
+        if (!cur?.worktreePath || cur.worktreePath !== a.worktreePath) return null; // removed or changed meanwhile
+        if (this.workerInFlight(cur.id)) return 'still running';
+        try {
+          if (!cur.branch) throw new Error(`${cur.worktreePath} has no recorded branch; it was left in place`);
+          await git.removeOwnedWorktree(lead.cwd, cur.worktreePath, cur.branch);
+          store.updateAgent(cur.id, { worktreePath: null });
+          return null;
+        } catch (e) {
+          this.log('worktree remove failed', { runId, agentId: cur.id, error: e });
+          return (e as Error).message.split('\n')[0];
+        }
+      });
+      if (kept) failed.push({ agentId: a.id, path: a.worktreePath, reason: kept });
     }
     return failed;
   }
@@ -873,7 +890,7 @@ export class Broker {
     if (this.leased(id)) return; // its blocked tool call will hand these over
     const agent = store.agent(id);
     if (!agent || NO_DELIVERY.has(agent.status)) return;
-    if (store.run(agent.runId)?.status !== 'active' || this.ending.has(agent.runId)) return;
+    if (!this.runOpen(agent.runId)) return;
     const msgs = store.undelivered(id);
     if (!msgs.length) return;
     // Results wake the lead once, when no worker is still working. Anything needing a reaction
@@ -938,6 +955,11 @@ export class Broker {
     const detached: AgentDTO[] = [];
     // No turn row survives a restart: whatever happens in CloudCLI now, this process never sees its end or usage.
     store.interruptOpenTurns(this.openTurns);
+    // An endRun that the previous process did not finish: complete the stop (cleanup stays retryable from the tab).
+    for (const run of store.markedRuns()) {
+      if (run.status === 'active') this.stopRun(run.id);
+      if (!store.hasEvent(run.id, 'run_ended')) store.addEvent(run.id, null, 'run_ended', { recovered: true });
+    }
     for (const a of store.activeRunAgents()) {
       if (a.role === 'lead' || store.busy.has(a.id) || this.dispatches.has(a.id)) continue;
       const inFlight = store.dispatching(a.id);
