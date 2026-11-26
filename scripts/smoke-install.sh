@@ -7,14 +7,20 @@ REPO="${1:-$ROOT}"
 REF="${2:-$(git -C "$ROOT" rev-parse HEAD)}"
 TMP="$(mktemp -d)"
 SERVER_PID=""
+LAUNCHER_PID=""
 cleanup() {
   if [[ -n "$SERVER_PID" ]]; then
-    # The broker runs in its own process group (setsid), so this also reaches anything it spawned.
-    kill -TERM -- "-$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-    for _ in $(seq 1 50); do kill -0 -- "-$SERVER_PID" 2>/dev/null || break; sleep 0.1; done
+    # The broker leads its own process group (setsid), so this also reaches anything it spawned.
+    # Never `wait` without a bound: if a signal does not land, CI must fail, not hang.
+    kill -TERM -- "-$SERVER_PID" 2>/dev/null || kill -TERM "$SERVER_PID" 2>/dev/null || true
+    for _ in $(seq 1 50); do kill -0 -- "-$SERVER_PID" 2>/dev/null || kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.1; done
     kill -KILL -- "-$SERVER_PID" 2>/dev/null || true
+    kill -KILL "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
+  fi
+  if [[ -n "$LAUNCHER_PID" ]]; then
+    kill -KILL "$LAUNCHER_PID" 2>/dev/null || true
+    LAUNCHER_PID=""
   fi
   cd "$ROOT"
   rm -rf -- "$TMP"
@@ -54,8 +60,14 @@ BROKER_ENV=(env -i PATH="$TMP/bin:$PATH" HOME="$TMP/home" NODE_ENV=production CO
 ' "$TMP/data/coagent.db"
 
 # Launch exactly as CloudCLI does: a scrubbed environment, in a new process group so cleanup can kill all of it.
-setsid "${BROKER_ENV[@]}" node dist/server.js >"$TMP/server.out" 2>"$TMP/server.err" &
-SERVER_PID=$!
+# `setsid` forks when its caller already leads a process group (as on GitHub runners), so `$!` is not the broker.
+# The process inside the new session writes its own pid, then execs the broker under that same pid.
+setsid bash -c 'echo $$ >"$1"; shift; exec "$@"' smoke "$TMP/server.pid" \
+  "${BROKER_ENV[@]}" node dist/server.js >"$TMP/server.out" 2>"$TMP/server.err" &
+LAUNCHER_PID=$!
+for _ in $(seq 1 50); do [[ -s "$TMP/server.pid" ]] && break; sleep 0.1; done
+SERVER_PID="$(cat "$TMP/server.pid" 2>/dev/null || true)"
+[[ "$SERVER_PID" =~ ^[0-9]+$ ]] || { echo "broker did not report its pid" >&2; exit 1; }
 [[ "$(ps -o pgid= -p "$SERVER_PID" | tr -d ' ')" == "$SERVER_PID" ]] \
   || { echo "broker is not its own process group leader" >&2; exit 1; }
 
