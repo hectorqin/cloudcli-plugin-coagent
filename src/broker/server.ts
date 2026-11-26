@@ -228,9 +228,12 @@ export async function start() {
       console.log(JSON.stringify({ ready: true, port: addr.port }));
       writeLog('info', 'broker listening', { port: addr.port, instance });
       if (store.getJson('autoRegister', true)) {
-        ensureRegistered(shimPath).then((r) => { registration = r; writeLog('info', 'MCP registration complete', { registration: r }); },
-          (e) => writeLog('error', 'MCP registration failed', { error: e }));
-      } else registration = { claude: 'auto-register disabled', codex: 'auto-register disabled' };
+        ensureRegistered(shimPath).then((r) => { registration = r; writeLog('info', 'MCP and skill registration complete', { registration: r }); },
+          (e) => writeLog('error', 'MCP and skill registration failed', { error: e }));
+      } else registration = {
+        claude: 'auto-register disabled', codex: 'auto-register disabled',
+        'claude-skill': 'auto-register disabled', 'codex-skill': 'auto-register disabled',
+      };
       setInterval(() => { void broker.tick(); }, 3000).unref();
     } catch (e) { reportStartupFailure(e, server); }
   });

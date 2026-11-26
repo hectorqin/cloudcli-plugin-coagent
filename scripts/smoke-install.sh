@@ -31,7 +31,7 @@ NODE_ENV=production npm install --omit=dev --ignore-scripts
 NODE_ENV=production npm run build
 npm run check:release
 
-for artifact in dist/index.js dist/server.js dist/mcp-shim.js; do
+for artifact in dist/index.js dist/server.js dist/mcp-shim.js skills/coagent/SKILL.md; do
   [[ -s "$artifact" ]] || { echo "missing build artifact: $artifact" >&2; exit 1; }
 done
 
@@ -77,6 +77,8 @@ done
 # Registration starts right after readiness; give it a moment to (wrongly) happen before checking.
 sleep 1
 [[ ! -e "$TMP/stub-calls" ]] || { cat "$TMP/stub-calls" >&2; echo "broker ran registration despite autoRegister=false" >&2; exit 1; }
+[[ ! -e "$TMP/home/.claude/skills/coagent" && ! -e "$TMP/home/.agents/skills/coagent" ]] \
+  || { echo "broker installed skills despite autoRegister=false" >&2; exit 1; }
 backups=("$TMP"/data/backups/coagent-*.db)
 [[ ${#backups[@]} -eq 1 && -s "${backups[0]}" ]] || { echo "expected one pre-migration backup" >&2; exit 1; }
 

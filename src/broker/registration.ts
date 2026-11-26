@@ -12,11 +12,19 @@ export const TOOL_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 export interface RegistrationPaths {
   claudeJson: string;
   codexToml: string;
+  claudeSkill: string;
+  codexSkill: string;
+  sourceSkill?: string;
 }
 const defaultPaths = (): RegistrationPaths => ({
   claudeJson: path.join(os.homedir(), '.claude.json'),
   codexToml: path.join(os.homedir(), '.codex', 'config.toml'),
+  claudeSkill: path.join(os.homedir(), '.claude', 'skills', MCP_NAME),
+  codexSkill: path.join(os.homedir(), '.agents', 'skills', MCP_NAME),
 });
+
+export const SKILL_MARKER = '.coagent-owned';
+const SKILL_MARKER_CONTENT = 'Managed by the CloudCLI CoAgent plugin.\n';
 
 const tomlStr = (s: string) => JSON.stringify(s); // TOML basic strings share JSON's escaping for our inputs
 
@@ -57,12 +65,48 @@ function claudeEntryMatches(file: string, node: string, shim: string): boolean {
   }
 }
 
-function writeAtomic(file: string, text: string) {
+function writeAtomic(file: string, text: string, backup = true) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  if (fs.existsSync(file) && !fs.existsSync(`${file}.coagent.bak`)) fs.copyFileSync(file, `${file}.coagent.bak`);
-  const tmp = `${file}.coagent.tmp`;
-  fs.writeFileSync(tmp, text);
-  fs.renameSync(tmp, file);
+  if (backup && fs.existsSync(file) && !fs.existsSync(`${file}.coagent.bak`)) fs.copyFileSync(file, `${file}.coagent.bak`);
+  const tmp = `${file}.coagent.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  try {
+    fs.writeFileSync(tmp, text, { flag: 'wx' });
+    fs.renameSync(tmp, file);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+export const skillSourcePath = (shim: string) => path.resolve(path.dirname(shim), '..', 'skills', MCP_NAME, 'SKILL.md');
+
+/** Install only into a new directory or one carrying our ownership marker. */
+export function installSkill(source: string, directory: string): string {
+  const marker = path.join(directory, SKILL_MARKER);
+  const target = path.join(directory, 'SKILL.md');
+  if (fs.existsSync(directory) && !fs.existsSync(marker)) {
+    return 'skipped: user-managed skill';
+  }
+  fs.mkdirSync(directory, { recursive: true });
+  // Claim ownership before the content write, so an interrupted first install can repair itself next time.
+  fs.writeFileSync(marker, SKILL_MARKER_CONTENT);
+  const content = fs.readFileSync(source, 'utf8');
+  if (fs.existsSync(target) && fs.lstatSync(target).isFile() && fs.readFileSync(target, 'utf8') === content) return 'registered';
+  // Atomic rename replaces a hostile/stale SKILL.md symlink instead of following it.
+  writeAtomic(target, content, false);
+  return 'registered (updated)';
+}
+
+/** Remove only files we own, preserving any user files that share the directory. */
+export function removeSkill(directory: string): string {
+  if (!fs.existsSync(directory)) return 'removed';
+  const marker = path.join(directory, SKILL_MARKER);
+  if (!fs.existsSync(marker)) return 'skipped: user-managed skill';
+  fs.rmSync(path.join(directory, 'SKILL.md'), { force: true });
+  fs.rmSync(marker, { force: true });
+  try { fs.rmdirSync(directory); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOTEMPTY') throw e;
+  }
+  return 'removed';
 }
 
 /**
@@ -94,6 +138,11 @@ export async function ensureRegistered(shim: string, node = process.execPath, p 
   } catch (e) {
     status.codex = `failed: ${(e as Error).message.split('\n')[0]}`;
   }
+  const sourceSkill = p.sourceSkill ?? skillSourcePath(shim);
+  for (const [key, directory] of [['claude-skill', p.claudeSkill], ['codex-skill', p.codexSkill]] as const) {
+    try { status[key] = installSkill(sourceSkill, directory); }
+    catch (e) { status[key] = `failed: ${(e as Error).message.split('\n')[0]}`; }
+  }
   return status;
 }
 
@@ -112,6 +161,10 @@ export async function unregister(p = defaultPaths()): Promise<Record<string, str
     status.codex = 'removed';
   } catch (e) {
     status.codex = `not removed: ${(e as Error).message.split('\n')[0]}`;
+  }
+  for (const [key, directory] of [['claude-skill', p.claudeSkill], ['codex-skill', p.codexSkill]] as const) {
+    try { status[key] = removeSkill(directory); }
+    catch (e) { status[key] = `not removed: ${(e as Error).message.split('\n')[0]}`; }
   }
   return status;
 }

@@ -34,8 +34,9 @@ CloudCLI requires Node.js 22.13 or newer for CoAgent's `node:sqlite` database.
 To install, open CloudCLI **Settings → Plugins**, choose the git URL option, and enter this repository's URL. CloudCLI
 clones the repository into `~/.claude-code-ui/plugins/`, runs `npm install`, and then runs `npm run build`. Open the new
 CoAgent tab, create an API key under **Settings → API Keys**, paste it into the tab, and save it. The broker registers
-the MCP shim automatically; the tab also has explicit **Register MCP** and **Unregister MCP** actions.
-**Unregister MCP** also turns automatic registration off, so a restart does not re-register; **Register MCP** turns it
+the MCP shim and CoAgent skill automatically; the tab also has explicit **Register MCP + skill** and
+**Unregister MCP + skill** actions. **Unregister MCP + skill** also turns automatic registration off, so a restart does
+not re-register; **Register MCP + skill** turns it
 back on. The tab header shows the current setting.
 
 To upgrade, use the plugin update action in **Settings → Plugins**. CloudCLI fast-forwards its shallow clone of the
@@ -54,11 +55,20 @@ CoAgent writes the following user-level state:
 
 - `~/.claude.json`: `mcpServers.coagent`, managed through `claude mcp add-json -s user` / `claude mcp remove -s user`.
 - `~/.codex/config.toml`: `[mcp_servers.coagent]` (the original file is backed up once as `config.toml.coagent.bak`).
+- `~/.claude/skills/coagent/SKILL.md`: the Claude `/coagent` skill.
+- `~/.agents/skills/coagent/SKILL.md`: the Codex `$coagent` skill (CloudCLI and Codex also discover this global source).
 - `~/.cloudcli-coagent/`: the database, migration backups, runtime discovery file, and broker log.
 
-To uninstall safely, first click **Unregister MCP** in the CoAgent tab. Then remove the plugin in **Settings → Plugins**.
+Skill directories include a `.coagent-owned` marker. `SKILL.md` is managed content, so edits to it are overwritten on
+registration. Delete `.coagent-owned` to take ownership: future registration and unregistration then report
+`skipped: user-managed skill` and leave the directory untouched. Existing unmarked user-authored skills are likewise
+left untouched. Unregistration removes only the managed `SKILL.md` and marker, preserving other files in the directory.
+
+To uninstall safely, first click **Unregister MCP + skill** in the CoAgent tab. Then remove the plugin in **Settings → Plugins**.
 If the tab is no longer available, run `claude mcp remove -s user coagent` and remove only the
-`[mcp_servers.coagent]` section from `~/.codex/config.toml`. You can also delete the one-time
+`[mcp_servers.coagent]` section from `~/.codex/config.toml`. You may also remove
+`~/.claude/skills/coagent/` and `~/.agents/skills/coagent/` if their `.coagent-owned` marker is present. Never remove
+an unmarked directory, because it belongs to the user. You can also delete the one-time
 `~/.codex/config.toml.coagent.bak` after confirming the remaining config is correct. Finally, after preserving anything
 you need, delete `~/.cloudcli-coagent/` to remove all run data and backups. Restart existing Claude and Codex sessions
 so their tool lists are refreshed.
@@ -75,8 +85,13 @@ views are not required for the core tab workflow; unsupported hosts fall back to
 
 ## Use
 
-In any CloudCLI Claude/Codex session: *"Plan this and delegate it to sub-agents."* The session calls `submit_plan` and
-becomes the lead. Approve the plan in the tab; workers appear there; approve merges when the lead requests them.
+In any CloudCLI session, invoke `/coagent <task>` in Claude or `$coagent <task>` in Codex. The session calls
+`submit_plan` and becomes the lead. You can also ask it to “plan this and delegate it to sub-agents.” Approve the plan
+in the tab; workers appear there; approve merges when the lead requests them.
+
+The globally discovered skill may also appear in plain Claude Code or other hosts, but CoAgent runs require its MCP
+tools and therefore work only in CloudCLI Claude/Codex sessions. If `submit_plan` is unavailable, the skill stops and
+explains this requirement.
 
 ## Caveats
 
