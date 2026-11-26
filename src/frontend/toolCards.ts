@@ -5,7 +5,7 @@
 import type { AgentDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
 import { mountDiff } from './diffView.js';
 import { CTX_CAVEAT, cardUsageText } from './usage.js';
-import { cleanupTarget } from './workspaceCleanup.js';
+import { cleanupTarget, recordedCleanupStatus } from './workspaceCleanup.js';
 import { utcClock } from './clock.js';
 
 export interface ToolContext {
@@ -204,7 +204,7 @@ export function agentsFor(ctx: ToolContext, run: RunDetailDTO | null): AgentDTO[
   return [];
 }
 
-interface CleanupState { pending: boolean; done: boolean; result: string }
+interface CleanupState { pending: boolean; result: string }
 interface ResumeState { pending: boolean; result: string }
 interface CleanupView {
   archiveProject: boolean; deleteProject: boolean; archiveSession: boolean; deleteSession: boolean;
@@ -218,12 +218,17 @@ function cleanupHtml(worker: AgentDTO | undefined, run: RunDetailDTO | null, cle
   const archive = target.kind === 'project' ? cleanup.archiveProject : cleanup.archiveSession;
   const del = target.kind === 'project' ? cleanup.deleteProject : cleanup.deleteSession;
   const state = cleanup.state?.(worker.id);
+  const recorded = recordedCleanupStatus(worker, run);
+  const status = recorded === 'deleted' || state?.result === 'Deleted' ? 'deleted'
+    : recorded === 'archived' || state?.result === 'Archived' ? 'archived' : null;
   const disabled = state?.pending ? ' disabled' : '';
-  const controls = state?.done ? '' : `${archive ? `<button class="primary" data-clean="archive" data-agent="${esc(worker.id)}"${disabled}>Archive worker session</button>` : ''}
-    ${del ? `<button class="danger" data-clean="delete" data-agent="${esc(worker.id)}"${disabled}>Delete</button>` : ''}`;
-  const hint = !archive && !del ? `<span class="m">Archive it from the sidebar${target.kind === 'project'
+  const controls = `${archive && !status ? `<button class="primary" data-clean="archive" data-agent="${esc(worker.id)}"${disabled}>Archive worker session</button>` : ''}
+    ${del && status !== 'deleted' ? `<button class="danger" data-clean="delete" data-agent="${esc(worker.id)}"${disabled}>Delete</button>` : ''}`;
+  const hint = !status && !archive && !del ? `<span class="m">Archive it from the sidebar${target.kind === 'project'
     ? ` (the project is under ${esc(run.run.projectPath.split('/').filter(Boolean).at(-1) ?? 'repo')} → worktrees)` : ''}</span>` : '';
-  return `<div class="cat-a"><div class="row">${controls}${hint}</div>${state?.result ? `<div class="m">${esc(state.result)}</div>` : ''}</div>`;
+  const result = state?.result && state.result !== 'Archived' && state.result !== 'Deleted' ? state.result
+    : status === 'deleted' ? 'Deleted' : status === 'archived' ? 'Archived' : '';
+  return `<div class="cat-a"><div class="row">${controls}${hint}${result ? `<span class="m">${esc(result)}</span>` : ''}</div></div>`;
 }
 
 export function cardHtml(ctx: ToolContext, state: StateDTO | null, cleanup: CleanupView = {
@@ -344,8 +349,8 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
     if (!clean || !state?.current) return;
     const worker = state.current.agents.find((a) => a.id === clean.dataset.agent);
     const target = worker ? cleanupTarget(worker, state.current) : null;
-    const cleanup = worker ? cleanups.get(worker.id) ?? { pending: false, done: false, result: '' } : null;
-    if (!worker || !target || !cleanup || cleanup.pending || cleanup.done) return;
+    const cleanup = worker ? cleanups.get(worker.id) ?? { pending: false, result: '' } : null;
+    if (!worker || !target || !cleanup || cleanup.pending || cleanup.result === 'Deleted') return;
     const action = clean.dataset.clean as 'archive' | 'delete';
     if (action === 'delete' && !confirm(`Delete worker ${target.kind} ${worker.id} (${target.value})? Its sessions and transcripts will be permanently removed.`)) return;
     cleanup.pending = true;
@@ -358,7 +363,6 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
         cleanup.result = `Error: ${String((result as { error?: unknown }).error ?? 'cleanup failed')}`;
       } else {
         cleanup.result = action === 'archive' ? 'Archived' : 'Deleted';
-        cleanup.done = true;
         void Promise.resolve().then(() => host.rpc('POST', `runs/${state!.current!.run.id}/workspaces/event`, {
           agentId: worker.id, type: action === 'archive' ? 'workspace_archived' : 'workspace_deleted', kind: target.kind,
         })).catch(() => undefined);
