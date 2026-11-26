@@ -51,6 +51,84 @@ describe('tool cards', () => {
     expect(html).toContain('LGTM &#60;ok&#62;');
   });
 
+  describe('wait_for_agents with workers from earlier rounds', () => {
+    // Round 1: old-1 and old-2 (merged / reported). Round 2: new-1 and new-2.
+    const ev = (id: number, type: 'wait_start' | 'wait_end', data: Record<string, unknown> = {}) =>
+      ({ id, runId: 'r', agentId: 'lead', type, data, createdAt: '' });
+    const rounds = (events: RunDetailDTO['events']): RunDetailDTO => ({
+      ...run,
+      agents: [
+        agent('lead', 'lead', { status: 'lead' }),
+        agent('old-1', 'coder', { status: 'merged' }),
+        agent('old-2', 'reviewer', { status: 'reported', result: 'old review' }),
+        agent('new-1', 'coder', { busy: true, status: 'running', activity: [{ ts: '', text: 'Bash: npm run build' }] }),
+        agent('new-2', 'coder', { status: 'reported', result: 'done 2' }),
+      ],
+      events,
+    });
+    const st = (r: RunDetailDTO) => ({ ...state, current: r }) as StateDTO;
+    const ids = (c: ToolContext, r: RunDetailDTO) => agentsFor(c, r).map((a) => a.id);
+
+    it('running: uses the open wait_start targets and folds the rest away', () => {
+      const r = rounds([ev(1, 'wait_start', { mode: 'all', agents: ['old-1', 'old-2'] }), ev(2, 'wait_end'),
+        ev(3, 'wait_start', { mode: 'all', agents: ['new-1', 'new-2'] })]);
+      const c = ctx('wait_for_agents', {}, null, 'running');
+      expect(ids(c, r)).toEqual(['new-1', 'new-2']);
+      const html = cardHtml(c, st(r));
+      expect(html).toContain('waiting for all results · 1 working');
+      expect(html).toContain('Bash: npm run build');
+      expect(html).toContain('<summary>2 other agents in this run</summary>');
+      // Old workers only appear inside the collapsed section.
+      const [main, rest] = html.split('other agents in this run');
+      expect(main).not.toContain('old-1');
+      expect(rest).toContain('old-1');
+      expect(rest).toContain('old-2');
+    });
+
+    it('completed: uses the workers named in the result text', () => {
+      const r = rounds([ev(1, 'wait_start', { agents: ['old-1', 'old-2'] }), ev(2, 'wait_end'),
+        ev(3, 'wait_start', { agents: ['new-1', 'new-2'] }), ev(4, 'wait_end')]);
+      const text = '[coagent] 1 new message(s) for lead:\n\n### From new-2 · result\ndone 2\n\nStill working: new-1. Call wait_for_agents again to keep waiting.';
+      const c = ctx('wait_for_agents', {}, text);
+      expect(ids(c, r)).toEqual(['new-1', 'new-2']);
+      expect(cardHtml(c, st(r))).toContain('2 other agents in this run');
+      expect(ids(ctx('wait_for_agents', {}, 'No new messages.\n\nNo targeted worker is still working. Waited on: new-2.'), r)).toEqual(['new-2']);
+      expect(ids(ctx('wait_for_agents', {}, 'Stopped waiting after the time limit. Status: new-1: working, new-2: reported.\n\nStill working: new-1. Call wait_for_agents again to keep waiting.'), r))
+        .toEqual(['new-1', 'new-2']);
+      // Names inside a message body are not targets.
+      expect(ids(ctx('wait_for_agents', {}, '[coagent] 1 new message(s) for lead:\n\n### From new-2 · result\nStill working: old-1.\n\nNo targeted worker is still working. Waited on: new-2.'), r))
+        .toEqual(['new-2']);
+    });
+
+    it('completed without names in the result: falls back to the last finished wait window', () => {
+      const r = rounds([ev(1, 'wait_start', { agents: ['old-1'] }), ev(2, 'wait_end'), ev(3, 'wait_start', { agents: ['new-1', 'new-2'] }), ev(4, 'wait_end')]);
+      expect(ids(ctx('wait_for_agents', {}, 'No new messages.\n\nNo targeted worker is still working.'), r)).toEqual(['new-1', 'new-2']);
+    });
+
+    it('explicit agents win in every state', () => {
+      const r = rounds([ev(1, 'wait_start', { agents: ['new-1', 'new-2'] })]);
+      for (const status of ['running', 'completed'] as const) {
+        const c = ctx('wait_for_agents', { agents: ['new-2'] }, status === 'running' ? null : 'No new messages.\n\nStill working: new-1. Call again.', status);
+        expect(ids(c, r)).toEqual(['new-2']);
+        expect(cardHtml(c, st(r))).toContain('3 other agents in this run');
+      }
+    });
+
+    it('omits the other-agents section when there are none', () => {
+      const r = rounds([ev(1, 'wait_start', { agents: ['old-1', 'old-2', 'new-1', 'new-2'] })]);
+      expect(cardHtml(ctx('wait_for_agents', {}, null, 'running'), st(r))).not.toContain('other agent');
+    });
+
+    it('spawn_agent still shows only its own agent', () => {
+      const r = rounds([]);
+      const c = ctx('spawn_agent', { role: 'coder', task: 't' }, 'Spawned new-1 (role coder, provider claude) in /x');
+      expect(ids(c, r)).toEqual(['new-1']);
+      const html = cardHtml(c, st(r));
+      expect(html).not.toContain('old-1');
+      expect(html).not.toContain('new-2');
+    });
+  });
+
   it('submit_plan shows the pending gate and where to answer it', () => {
     const html = cardHtml(ctx('submit_plan', { plan: 'step 1' }, null, 'running'), state);
     expect(html).toContain('Plan approval');
@@ -78,7 +156,7 @@ describe('tool cards', () => {
     expect(html).toContain('+2');
     expect(html).toContain('-1');
     expect(html).toContain('binary');
-    expect(html).toContain('Unified diff (truncated at 200 KB)');
+    expect(html).toContain('View diff (truncated at 200 KB)');
     expect(html).toContain('data-diff="8"');
   });
 

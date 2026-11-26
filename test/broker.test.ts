@@ -568,6 +568,9 @@ describe('wait_for_agents and batched results', () => {
     expect(done.pending).toBeFalsy();
     expect(done.text).toMatch(/A done[\s\S]*B done/);
     expect(done.text).toMatch(/No targeted worker is still working/);
+    expect(done.text).toContain(`Waited on: ${a.id}, ${b.id}.`); // the chat card reads its workers from here
+    const starts = store.events(store.agent(a.id)!.runId).filter((e) => e.type === 'wait_start');
+    expect(starts.at(-1)!.data.agents).toEqual([a.id, b.id]);
     // Consumed by the wait, so never pushed to the lead as a separate turn.
     expect(cc.calls.filter((c) => c.sessionId === 'lead-app' && /A done/.test(c.message))).toHaveLength(0);
   });

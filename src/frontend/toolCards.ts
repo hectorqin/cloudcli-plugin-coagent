@@ -3,6 +3,7 @@
  * spawn_agent / wait_for_agents read like native subagent calls: one row per worker with live status and activity.
  */
 import type { AgentDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
+import { mountDiff } from './diffView.js';
 import { CTX_CAVEAT, cardUsageText } from './usage.js';
 
 export interface ToolContext {
@@ -64,7 +65,9 @@ const CSS = `
 .cat-act div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cat-files{margin-top:5px;border:1px solid var(--line);border-radius:5px;overflow:hidden}.cat-file{display:flex;gap:7px;padding:2px 6px;border-top:1px solid var(--line);font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}.cat-file:first-child{border-top:0}.cat-file .path{flex:1;min-width:0;overflow-wrap:anywhere}.cat-file .plus{color:var(--ok)}.cat-file .minus{color:var(--bad)}
 .cat pre{white-space:pre-wrap;word-break:break-word;margin:4px 0 0;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:280px;overflow:auto}
+.cat-others>.cat-a{padding-left:0;padding-right:0}.cat-others>.cat-a:last-child{padding-bottom:0}
 .cat details>summary{cursor:pointer;color:var(--muted);font-size:12px}
+.cat .cad-host{max-height:70vh;overflow:auto}
 .cat button{font:inherit;font-size:12px;padding:1px 8px;border-radius:6px;border:1px solid var(--line);background:transparent;color:var(--fg);cursor:pointer;margin-left:auto}
 .cat-h button{margin-left:0}
 .cat button:hover{border-color:var(--accent);color:var(--accent)}
@@ -103,6 +106,53 @@ function agentRow(a: AgentDTO, opts: { activity: boolean }): string {
     ${a.result ? `<details><summary>Result</summary><pre>${esc(a.result)}</pre></details>` : ''}</div>`;
 }
 
+const workersOf = (run: RunDetailDTO) => run.agents.filter((a) => a.role !== 'lead');
+
+/** wait_start windows of the run's lead, oldest first (`end` null = still waiting). */
+function waitWindows(run: RunDetailDTO): { agents: string[]; end: number | null }[] {
+  const windows: { agents: string[]; end: number | null }[] = [];
+  for (const e of run.events) {
+    if (e.agentId !== run.run.leadAgentId) continue;
+    if (e.type === 'wait_start') {
+      windows.push({ agents: Array.isArray(e.data.agents) ? e.data.agents.map(String) : [], end: null });
+    } else if (e.type === 'wait_end') {
+      const open = windows.findLast((w) => w.end === null);
+      if (open) open.end = e.id;
+    }
+  }
+  return windows;
+}
+
+/**
+ * Worker ids named in a finished wait_for_agents result: the senders of the delivered messages, plus the broker's tail
+ * paragraph ("Still working: …" / "Waited on: …") and the time-limit status line. Only the tail is searched for those,
+ * so a message body cannot add names.
+ */
+export function waitResultIds(text: string): string[] {
+  const ids = [...text.matchAll(/^### From (\S+) · /gm)].map((m) => m[1]);
+  const tail = text.slice(text.lastIndexOf('\n\n') + 1);
+  for (const m of tail.matchAll(/(?:Still working|Waited on): ([^\n]*?)\.(?:\s|$)/g)) ids.push(...m[1].split(','));
+  const status = text.startsWith('Stopped waiting') ? text.match(/Status: ([^\n]*?)\.(?:\s|$)/)?.[1] : undefined;
+  if (status) ids.push(...status.split(', ').map((x) => x.split(':')[0]));
+  return [...new Set(ids.map((x) => x.trim()).filter(Boolean))];
+}
+
+/**
+ * Ids of the workers one wait_for_agents call is about: its explicit `agents`; while running, the targets of the lead's
+ * open wait window; once finished, the workers its result names, else the last finished wait window's targets.
+ * null = unknown (the card falls back to the run's active workers).
+ */
+export function waitTargetIds(ctx: ToolContext, run: RunDetailDTO): string[] | null {
+  const explicit = Array.isArray(input(ctx).agents) ? (input(ctx).agents as unknown[]).map(String).filter(Boolean) : [];
+  if (explicit.length) return explicit;
+  const windows = waitWindows(run);
+  if (ctx.status === 'running') return windows.findLast((w) => w.end === null)?.agents ?? null;
+  const known = new Set(workersOf(run).map((a) => a.id));
+  const named = waitResultIds(resultText(ctx.toolResult)).filter((id) => known.has(id));
+  if (named.length) return named;
+  return windows.findLast((w) => w.end !== null)?.agents ?? null;
+}
+
 /** The workers a call is about, resolved against the run the current session belongs to. */
 export function agentsFor(ctx: ToolContext, run: RunDetailDTO | null): AgentDTO[] {
   if (!run) return [];
@@ -113,8 +163,10 @@ export function agentsFor(ctx: ToolContext, run: RunDetailDTO | null): AgentDTO[
     return run.agents.filter((a) => a.id === id);
   }
   if (name === 'wait_for_agents') {
-    const wanted = Array.isArray(input(ctx).agents) ? (input(ctx).agents as unknown[]).map(String) : null;
-    return run.agents.filter((a) => a.role !== 'lead' && (wanted ? wanted.includes(a.id) : true));
+    const ids = waitTargetIds(ctx, run);
+    // Unknown (e.g. the first poll has not been recorded yet): the broker's default, every unfinished worker.
+    if (!ids) return workersOf(run).filter((a) => a.busy || (a.status !== 'merged' && a.status !== 'ended'));
+    return workersOf(run).filter((a) => ids.includes(a.id));
   }
   if (name === 'request_merge') return run.agents.filter((a) => a.id === input(ctx).worker);
   return [];
@@ -142,10 +194,13 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null): string {
     }
     case 'wait_for_agents': {
       const agents = agentsFor(ctx, run);
+      const others = run ? workersOf(run).filter((a) => !agents.includes(a)) : [];
       const mode = args.mode === 'any' ? 'first result' : 'all results';
       const working = agents.filter((a) => a.busy || a.status === 'starting' || a.status === 'running').length;
       const sub = ctx.status === 'running' ? `waiting for ${mode} · ${working} working` : `waited for ${mode}`;
-      return head('Waiting on agents', sub) + agents.map((a) => agentRow(a, { activity: ctx.status === 'running' })).join('') + resultBlock;
+      const rest = others.length ? `<div class="cat-a"><details class="cat-others"><summary>${others.length} other agent${others.length === 1 ? '' : 's'} in this run</summary>`
+        + `${others.map((a) => agentRow(a, { activity: false })).join('')}</details></div>` : '';
+      return head('Waiting on agents', sub) + agents.map((a) => agentRow(a, { activity: ctx.status === 'running' })).join('') + rest + resultBlock;
     }
     case 'submit_plan':
     case 'request_merge': {
@@ -161,7 +216,7 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null): string {
       const review = kind === 'merge' && gate?.snapshot ? `<div class="cat-a"><div class="m">Reviewed commit ${esc(gate.snapshot.workerHead.slice(0, 10))}</div>
         <div class="cat-files">${gate.snapshot.files.map((f) => `<div class="cat-file"><span>${esc(f.status)}</span><span class="path">${f.oldPath ? `${esc(f.oldPath)} → ` : ''}${esc(f.path)}</span>${f.binary
           ? '<span>binary</span>' : `<span class="plus">+${f.additions ?? 0}</span><span class="minus">-${f.deletions ?? 0}</span>`}</div>`).join('')}</div>
-        <details data-diff="${gate.id}"><summary>Unified diff${gate.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details></div>` : '';
+        <details data-diff="${gate.id}"><summary>View diff${gate.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details></div>` : '';
       return head(title, gate?.comment ? `comment: ${gate.comment}` : '', badge)
         + `<div class="cat-a"><details ${st === 'pending' ? 'open' : ''}><summary>${kind === 'plan' ? 'Plan' : 'Note'}</summary><pre>${esc(body)}</pre></details></div>`
         + review + hint + resultBlock;
@@ -208,15 +263,11 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
   root.addEventListener('toggle', (ev) => {
     const el = ev.target as HTMLDetailsElement;
     if (!el.matches('details[data-diff]') || !el.open || el.dataset.loaded) return;
-    el.dataset.loaded = 'loading';
-    const pre = document.createElement('pre');
-    pre.textContent = 'Loading diff…';
-    el.append(pre);
-    void host.rpc('GET', `gates/${el.dataset.diff}/diff`).then((raw) => {
-      const data = raw as { diff: string; truncated: boolean };
-      pre.textContent = data.diff + (data.truncated ? '\n\n[diff truncated]' : '');
-      el.dataset.loaded = 'true';
-    }, (e) => { pre.textContent = `Could not load diff: ${(e as Error).message}`; delete el.dataset.loaded; });
+    el.dataset.loaded = 'true';
+    const id = Number(el.dataset.diff);
+    const gate = state?.current?.gates.find((g) => g.id === id);
+    void mountDiff(el, host.rpc, id, { dark: ctx.theme === 'dark', snapshotFiles: gate?.snapshot?.files })
+      .then((ok) => { if (!ok) delete el.dataset.loaded; });
   }, true);
 
   draw();

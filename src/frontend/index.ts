@@ -1,5 +1,6 @@
 /** CoAgent tab. Bundled into one ES module (the host imports it from a Blob URL). */
 import type { AgentDTO, GateDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
+import { mountDiff } from './diffView.js';
 import { buildTimeline, type Ref, type Row, type Timeline, type Tone, USER_LANE } from './timeline.js';
 import { drawerUsageHtml, laneUsageHtml, runUsageHtml, runUsageText } from './usage.js';
 
@@ -82,6 +83,8 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   let diagnosticsOpen = false;
   let diagnostics: unknown = null;
   const drafts = new Map<string, string>();
+  /** Gate diffs the user opened: kept open across re-renders (the diff itself is cached by diffView). */
+  const openDiffs = new Set<number>();
 
   const applyTheme = () => root.classList.toggle('dark', api.context.theme === 'dark');
   applyTheme();
@@ -122,6 +125,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       el.value = drafts.get(el.dataset.draft!) ?? '';
       el.addEventListener('input', () => drafts.set(el.dataset.draft!, el.value));
     }
+    for (const el of root.querySelectorAll<HTMLDetailsElement>('details[data-diff]')) if (openDiffs.has(Number(el.dataset.diff))) el.open = true;
     const sc = root.querySelector<HTMLElement>('.scroll');
     if (sc) sc.scrollLeft = keepLeft;
     container.scrollTop = firstPaint || atBottom ? container.scrollHeight : keepTop;
@@ -302,7 +306,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     const review = g.snapshot ? `<div class="sub">Reviewed worker ${esc(g.snapshot.workerHead.slice(0, 10))} · base ${esc(g.snapshot.mergeBase.slice(0, 10))}</div>
       <div class="files">${g.snapshot.files.map((f) => `<div class="file"><span>${esc(f.status)}</span><span class="path">${f.oldPath ? `${esc(f.oldPath)} → ` : ''}${esc(f.path)}</span>${f.binary
         ? '<span>binary</span>' : `<span class="plus">+${f.additions ?? 0}</span><span class="minus">-${f.deletions ?? 0}</span>`}</div>`).join('')}</div>
-      <details data-diff="${g.id}"><summary>Unified diff${g.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details>` : '';
+      <details data-diff="${g.id}"><summary>View diff${g.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details>` : '';
     return `<div class="row"><b class="grow">${title}</b>${close}</div><pre>${esc(g.payload)}</pre>${review}${actions}`;
   }
 
@@ -400,16 +404,15 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   root.addEventListener('click', onClick);
   const onToggle = (ev: Event) => {
     const el = ev.target as HTMLDetailsElement;
-    if (!el.matches('details[data-diff]') || !el.open || el.dataset.loaded) return;
-    el.dataset.loaded = 'loading';
-    const pre = document.createElement('pre');
-    pre.textContent = 'Loading diff…';
-    el.append(pre);
-    void api.rpc('GET', `gates/${el.dataset.diff}/diff`).then((raw) => {
-      const data = raw as { diff: string; truncated: boolean };
-      pre.textContent = data.diff + (data.truncated ? '\n\n[diff truncated]' : '');
-      el.dataset.loaded = 'true';
-    }, (e) => { pre.textContent = `Could not load diff: ${(e as Error).message}`; delete el.dataset.loaded; });
+    if (!el.matches('details[data-diff]')) return;
+    const id = Number(el.dataset.diff);
+    if (!el.open) { openDiffs.delete(id); return; }
+    openDiffs.add(id);
+    if (el.dataset.loaded) return;
+    el.dataset.loaded = 'true';
+    const gate = state?.current?.gates.find((g) => g.id === id);
+    void mountDiff(el, api.rpc.bind(api), id, { dark: api.context.theme === 'dark', snapshotFiles: gate?.snapshot?.files })
+      .then((ok) => { if (!ok) delete el.dataset.loaded; });
   };
   root.addEventListener('toggle', onToggle, true);
 

@@ -885,7 +885,7 @@ export class Broker {
     const still = targets.filter((t) => !finished(t)).map((t) => t.id);
     const tail = still.length
       ? `\n\nStill working: ${still.join(', ')}. Call wait_for_agents again to keep waiting.`
-      : '\n\nNo targeted worker is still working.';
+      : `\n\nNo targeted worker is still working.${targets.length ? ` Waited on: ${targets.map((t) => t.id).join(', ')}.` : ''}`;
     if (!targets.length && !inbox.length) return 'There are no active workers to wait for.';
     if (a.give_up === true && !inbox.length) return `Stopped waiting after the time limit. Status: ${status}.${tail}`;
     return `${inbox.length ? formatInbox(leadId, inbox) : 'No new messages.'}${tail}`;
