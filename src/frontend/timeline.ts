@@ -65,6 +65,9 @@ export function buildTimeline(d: RunDetailDTO): Timeline {
           : { kind: 'node', ts: e.createdAt, lane, label: `merge failed: ${String(e.data.reason ?? '')}`, tone: 'error', shape: 'dot', ref };
         break;
       case 'agent_ended': row = { kind: 'node', ts: e.createdAt, lane, label: 'ended', tone: 'muted', shape: 'square', ref }; break;
+      case 'workspace_archived': row = { kind: 'node', ts: e.createdAt, lane, label: 'workspace archived', tone: 'muted', shape: 'square', ref }; break;
+      case 'workspace_deleted': row = { kind: 'node', ts: e.createdAt, lane, label: 'workspace deleted', tone: 'muted', shape: 'square', ref }; break;
+      case 'branches_deleted': row = { kind: 'node', ts: e.createdAt, lane, label: `deleted ${Array.isArray(e.data.deleted) ? e.data.deleted.length : 0} merged branch(es)`, tone: 'muted', shape: 'square', ref }; break;
       case 'recovered': {
         const label = e.data.status === 'interrupted' ? 'interrupted (broker restart)'
           : e.data.status === 'resumed' ? 'resumed'

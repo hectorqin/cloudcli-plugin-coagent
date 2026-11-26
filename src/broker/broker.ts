@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import type {
   AgentDTO, GateDTO, MergeSnapshot, MergeSnapshotData, MessageDTO, Provider, RunDetailDTO, StateDTO, ToolRequest, ToolResponse,
 } from '../shared/protocol.js';
@@ -631,6 +633,74 @@ export class Broker {
     }
     store.endRun(run.id);
     store.addEvent(run.id, null, 'run_ended', { removeWorktrees });
+  }
+
+  /** User-requested cleanup, deliberately separate from endRun: branches are never removed automatically. */
+  async deleteMergedBranches(runId: string, byAgentId: string) {
+    const { store, git } = this.d;
+    const run = store.run(runId) ?? fail(`No run ${runId}`);
+    if (byAgentId !== run.leadAgentId) fail(`Only the lead (${run.leadAgentId}) can delete run branches.`, 403);
+    const lead = store.agent(run.leadAgentId)!;
+    const deleted: { agentId: string; branch: string }[] = [];
+    const skipped: { agentId: string; branch: string; reason: string }[] = [];
+    const repoKey = await git.commonDir(lead.cwd);
+    await withRepoMutex(repoKey, async () => {
+      const head = await git.head(lead.cwd);
+      for (const worker of store.agents(run.id).filter((a) => a.branch)) {
+        const branch = worker.branch!;
+        if (worker.status !== 'merged') {
+          skipped.push({ agentId: worker.id, branch, reason: worker.status === 'ended' ? 'worker ended without being merged' : 'worker is not merged' });
+          continue;
+        }
+        let tip: string;
+        try { tip = await git.resolve(lead.cwd, branch); } catch {
+          skipped.push({ agentId: worker.id, branch, reason: 'branch does not exist' });
+          continue;
+        }
+        if (!(await git.isAncestor(lead.cwd, tip, head))) {
+          skipped.push({ agentId: worker.id, branch, reason: 'branch is not fully merged into the lead HEAD' });
+          continue;
+        }
+        const result = await git.deleteBranch(lead.cwd, branch);
+        if (result.ok) deleted.push({ agentId: worker.id, branch });
+        else skipped.push({ agentId: worker.id, branch, reason: result.reason });
+      }
+    });
+    store.addEvent(run.id, byAgentId, 'branches_deleted', { deleted, skipped });
+    return { deleted, skipped };
+  }
+
+  recordWorkspaceEvent(runId: string, agentId: string, type: 'workspace_archived' | 'workspace_deleted', kind: 'project' | 'session') {
+    const { store } = this.d;
+    const run = store.run(runId) ?? fail(`No run ${runId}`);
+    const agent = store.agent(agentId) ?? fail(`No agent ${agentId}`);
+    if (agent.runId !== run.id) fail(`${agentId} is not part of run ${run.id}`);
+    const lead = store.agent(run.leadAgentId)!;
+    const canonical = (value: string) => {
+      const resolved = path.resolve(value);
+      try { return fs.realpathSync(resolved); } catch { return resolved; }
+    };
+    if (agent.id === run.leadAgentId) fail('The lead project and session cannot be cleaned up.');
+    if (kind === 'session') {
+      const allowedStatus = run.status === 'ended' || ['reported', 'idle', 'ended'].includes(agent.status);
+      if (agent.branch || !allowedStatus || !agent.appSessionId || agent.appSessionId === lead.appSessionId) {
+        fail('Only finished read-only worker sessions can be cleaned up.');
+      }
+      store.addEvent(run.id, agent.id, type, { kind, sessionId: agent.appSessionId });
+      return { ok: true };
+    }
+    const projectPath = canonical(agent.cwd);
+    const leadPath = canonical(lead.cwd);
+    const repoPath = canonical(run.projectPath);
+    const container = `${repoPath}-worktrees`;
+    const relative = path.relative(container, projectPath);
+    const allowedStatus = run.status === 'ended' || agent.status === 'merged' || agent.status === 'ended';
+    if (!agent.branch || !allowedStatus || projectPath === leadPath || projectPath === repoPath
+      || !relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+      fail('Only merged/ended writer projects can be cleaned up.');
+    }
+    store.addEvent(run.id, agent.id, type, { kind, projectPath });
+    return { ok: true };
   }
 
   // ── state for the tab ─────────────────────────────────────────────

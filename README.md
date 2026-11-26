@@ -93,6 +93,26 @@ The globally discovered skill may also appear in plain Claude Code or other host
 tools and therefore work only in CloudCLI Claude/Codex sessions. If `submit_plan` is unavailable, the skill stops and
 explains this requirement.
 
+## Cleaning up
+
+Merging a writer removes its git worktree but deliberately keeps its CloudCLI project, sessions, transcripts, and
+branch. After the merge, its approval card and the CoAgent agent/gate drawers offer **Archive worker session** and
+**Delete** when the host supports project cleanup. Archive hides the project while preserving sessions so it can be
+restored from the sidebar archive view; Delete requires confirmation and permanently removes the project, sessions,
+and transcripts. Finished read-only planner/reviewer workers share the lead project, so cleanup targets only their
+individual session (`archiveSession` / `deleteSession`) and never the shared project or lead session.
+
+After ending a run, the tab offers **Archive all worker sessions** (writer projects plus individual read-only sessions)
+and **Delete merged branches**. Branch cleanup is
+explicit and conservative: it considers only workers recorded as merged, requires their tips to be ancestors of the
+lead's current `HEAD`, and uses `git branch -d`. Unmerged, ended-unmerged, missing, or still-checked-out branches are
+reported as skipped and are left intact. On vanilla CloudCLI, project cleanup functions are unavailable and the UI
+points to the worker project under the repository's sidebar worktree group instead.
+
+The tab only shows branch cleanup to the lead session, but this is a UI guard rather than a security boundary: every
+tab request is already authorized as the CloudCLI user. Git's ancestry check and `branch -d` are the deletion safety
+boundary.
+
 ## Caveats
 
 - Sessions started through CloudCLI's Agent API run with permissions bypassed. That covers every worker turn and

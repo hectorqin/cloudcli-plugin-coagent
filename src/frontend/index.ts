@@ -3,6 +3,7 @@ import type { AgentDTO, GateDTO, RunDetailDTO, StateDTO } from '../shared/protoc
 import { mountDiff } from './diffView.js';
 import { buildTimeline, type Ref, type Row, type Timeline, type Tone, USER_LANE } from './timeline.js';
 import { drawerUsageHtml, laneUsageHtml, runUsageHtml, runUsageText } from './usage.js';
+import { cleanupTarget, safeWorkerProject } from './workspaceCleanup.js';
 
 interface PluginContext {
   theme: 'dark' | 'light';
@@ -13,6 +14,10 @@ interface PluginAPI {
   readonly context: PluginContext;
   onContextChange(cb: (ctx: PluginContext) => void): () => void;
   rpc(method: string, path: string, body?: unknown): Promise<unknown>;
+  archiveProject?(projectPath: string): Promise<{ ok: true } | { ok: false; error: unknown }>;
+  deleteProject?(projectPath: string): Promise<unknown>;
+  archiveSession?(sessionId: string): Promise<{ ok: true } | { ok: false; error: unknown }>;
+  deleteSession?(sessionId: string): Promise<unknown>;
 }
 
 const POLL_MS = 2000;
@@ -83,6 +88,9 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   let diagnosticsOpen = false;
   let diagnostics: unknown = null;
   const drafts = new Map<string, string>();
+  const cleanupResults = new Map<string, string>();
+  const cleanupPending = new Set<string>();
+  let endPanelRun: string | null = null;
   /** Gate diffs the user opened: kept open across re-renders (the diff itself is cached by diffView). */
   const openDiffs = new Set<number>();
 
@@ -191,9 +199,32 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     const tl = buildTimeline(d);
     const ended = d.run.status === 'ended';
     const pending = d.gates.filter((g) => g.status === 'pending');
+    const isLead = state!.me === d.run.leadAgentId;
+    const targets = d.agents.filter((a) => cleanupTarget(a, d));
+    const writers = d.agents.filter((a) => safeWorkerProject(a, d));
+    const writerCount = writers.length;
+    const archivable = targets.filter((a) => cleanupTarget(a, d)!.kind === 'project'
+      ? typeof api.archiveProject === 'function' : typeof api.archiveSession === 'function');
+    const repo = d.run.projectPath.split('/').filter(Boolean).at(-1) ?? 'repo';
+    const endedActions = ended && isLead ? `${archivable.length && !cleanupResults.has('archive-all') ? `<button class="primary" data-act="archive-all"${cleanupPending.has('archive-all') ? ' disabled' : ''}>Archive all worker sessions</button>` : ''}
+      ${targets.length && !archivable.length ? `<span class="sub">Archive worker projects/sessions from the sidebar (${esc(repo)} → worktrees)</span>` : ''}
+      ${cleanupResults.get('archive-all') ? `<span class="sub">${esc(cleanupResults.get('archive-all'))}</span>` : ''}` : '';
+    const branchAction = isLead && writerCount ? `<button data-act="delete-branches"${cleanupPending.has('branches') ? ' disabled' : ''}>Delete merged branches</button>${cleanupResults.get('branches') ? `<span class="sub">${esc(cleanupResults.get('branches'))}</span>` : ''}` : '';
+    const afterEnd = { ...d, run: { ...d.run, status: 'ended' as const } };
+    const endArchivable = afterEnd.agents.some((a) => {
+      const target = cleanupTarget(a, afterEnd);
+      return target?.kind === 'project' ? typeof api.archiveProject === 'function' : !!target && typeof api.archiveSession === 'function';
+    });
+    const endPanel = !ended && isLead && endPanelRun === d.run.id ? `<div class="card" style="margin:0 16px 8px"><b>End run ${esc(d.run.id)}</b>
+      <div class="sub">Choose cleanup to run after the collaboration ends.</div>
+      ${d.agents.some((a) => a.worktreePath && a.status !== 'merged') ? '<label><input style="width:auto" type="checkbox" data-end-option="worktrees"> Delete unmerged worktrees</label>' : ''}
+      ${endArchivable ? '<label><input style="width:auto" type="checkbox" data-end-option="archive"> Archive all worker sessions</label>' : ''}
+      ${writerCount ? '<label><input style="width:auto" type="checkbox" data-end-option="branches"> Delete merged branches (safe only)</label>' : ''}
+      <div class="row" style="margin-top:8px"><button class="danger" data-act="confirm-end" data-id="${esc(d.run.id)}">End run</button><button data-act="cancel-end">Cancel</button></div></div>` : '';
     const top = `<div class="top">${header(`${selectedRun ? '<button data-act="back">All runs</button>' : ''}
-        ${ended ? '<span class="badge">ended</span>' : `<button class="danger" data-act="end" data-id="${esc(d.run.id)}">End run</button>`}`)}
+        ${ended ? `<span class="badge">ended</span>${endedActions}` : `<button class="danger" data-act="end" data-id="${esc(d.run.id)}">End run</button>`}${branchAction}`)}
       <div class="sub" style="padding:0 16px 8px">Run <b>${esc(d.run.id)}</b> · ${esc(d.run.projectPath)}${runUsageHtml(d.run.usage)}</div>
+      ${endPanel}
       ${pending.map((g) => `<div class="pending"><span class="grow">Waiting for you: <b>${g.kind === 'plan'
         ? `plan #${g.id} from ${esc(g.requestedBy)}` : `merge ${esc(g.subjectAgent)} (#${g.id})`}</b></span>
         <button class="primary" data-act="select" data-type="gate" data-id="${g.id}">Review</button></div>`).join('')}
@@ -323,11 +354,14 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       <div class="files">${g.snapshot.files.map((f) => `<div class="file"><span>${esc(f.status)}</span><span class="path">${f.oldPath ? `${esc(f.oldPath)} → ` : ''}${esc(f.path)}</span>${f.binary
         ? '<span>binary</span>' : `<span class="plus">+${f.additions ?? 0}</span><span class="minus">-${f.deletions ?? 0}</span>`}</div>`).join('')}</div>
       <details data-diff="${g.id}"><summary>View diff${g.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details>` : '';
-    return `<div class="row"><b class="grow">${title}</b>${close}</div><pre>${esc(g.payload)}</pre>${review}${actions}`;
+    const worker = g.kind === 'merge' ? state?.current?.agents.find((a) => a.id === g.subjectAgent) : undefined;
+    const cleanup = g.status === 'approved' && worker?.status === 'merged' ? workspaceActions(worker) : '';
+    return `<div class="row"><b class="grow">${title}</b>${close}</div><pre>${esc(g.payload)}</pre>${review}${actions}${cleanup}`;
   }
 
   function agentDetail(a: AgentDTO, ended: boolean, close: string): string {
     const canMsg = !ended && a.status !== 'merged' && a.status !== 'ended';
+    const cleanup = state?.current && cleanupTarget(a, state.current) ? workspaceActions(a) : '';
     return `<div class="row"><b class="grow">${esc(a.id)} <span class="sub">${esc(a.role)} · ${esc(a.provider)}</span>
         <span class="badge b-${esc(a.status)}">${esc(a.status)}</span></b>
         ${a.appSessionId ? `<button data-act="go" data-id="${esc(a.appSessionId)}">Go to session</button>
@@ -341,7 +375,70 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       ${canMsg ? `<div class="row" style="margin-top:8px"><input class="grow" style="width:auto" data-draft="msg-${esc(a.id)}" placeholder="Message ${esc(a.id)}…">
         <button data-act="msg" data-id="${esc(a.id)}">Send</button></div>` : ''}
       ${canMsg && a.role !== 'lead' && !a.busy ? `<div class="row" style="margin-top:8px"><span class="grow sub">Ending frees its worker slot; it stops receiving messages.</span>
-        <button class="danger" data-act="end-agent" data-id="${esc(a.id)}" data-wt="${a.worktreePath ? '1' : ''}">End agent</button></div>` : ''}`;
+        <button class="danger" data-act="end-agent" data-id="${esc(a.id)}" data-wt="${a.worktreePath ? '1' : ''}">End agent</button></div>` : ''}${cleanup}`;
+  }
+
+  function workspaceActions(a: AgentDTO): string {
+    const target = state?.current ? cleanupTarget(a, state.current) : null;
+    if (!target) return '';
+    const archive = target.kind === 'project' ? typeof api.archiveProject === 'function' : typeof api.archiveSession === 'function';
+    const del = target.kind === 'project' ? typeof api.deleteProject === 'function' : typeof api.deleteSession === 'function';
+    const repo = state?.current?.run.projectPath.split('/').filter(Boolean).at(-1) ?? 'repo';
+    const result = cleanupResults.get(a.id);
+    const done = result === 'Archived' || result === 'Deleted';
+    const disabled = cleanupPending.has(a.id) ? ' disabled' : '';
+    return `<div class="row" style="margin-top:8px">${archive && !done ? `<button class="primary" data-act="archive" data-id="${esc(a.id)}"${disabled}>Archive worker session</button>` : ''}
+      ${del && !done ? `<button class="danger" data-act="delete-project" data-id="${esc(a.id)}"${disabled}>Delete</button>` : ''}
+      ${!archive && !del ? `<span class="sub">Archive it from the sidebar${target.kind === 'project' ? ` (the project is under ${esc(repo)} → worktrees)` : ''}</span>` : ''}
+      ${result ? `<span class="sub ${result.startsWith('Error:') ? 'err' : ''}">${esc(result)}</span>` : ''}</div>`;
+  }
+
+  async function cleanWorkspace(a: AgentDTO, action: 'archive' | 'delete', detail = state?.current): Promise<boolean> {
+    const d = detail;
+    const target = d ? cleanupTarget(a, d) : null;
+    if (!d || !target || cleanupPending.has(a.id)) return false;
+    cleanupPending.add(a.id);
+    render();
+    try {
+      const result = await Promise.resolve().then(() => action === 'archive'
+        ? target.kind === 'project' ? api.archiveProject!(target.value) : api.archiveSession!(target.value)
+        : target.kind === 'project' ? api.deleteProject!(target.value) : api.deleteSession!(target.value));
+      if (result && typeof result === 'object' && 'ok' in result && !(result as { ok: boolean }).ok) {
+        cleanupResults.set(a.id, `Error: ${String((result as { error?: unknown }).error ?? 'cleanup failed')}`);
+        return false;
+      } else {
+        cleanupResults.set(a.id, action === 'archive' ? 'Archived' : 'Deleted');
+        void Promise.resolve().then(() => api.rpc('POST', `runs/${a.runId}/workspaces/event`, {
+          agentId: a.id, type: action === 'archive' ? 'workspace_archived' : 'workspace_deleted', kind: target.kind,
+        })).catch(() => undefined);
+        return true;
+      }
+    } catch (e) { cleanupResults.set(a.id, `Error: ${(e as Error).message}`); return false; }
+    finally { cleanupPending.delete(a.id); render(); }
+  }
+
+  async function archiveAll(d: RunDetailDTO) {
+    if (!api.archiveProject || cleanupPending.has('archive-all')) return;
+    cleanupPending.add('archive-all');
+    cleanupResults.set('archive-all', 'Archiving worker sessions…');
+    render();
+    const targets = d.agents.filter((a) => {
+      const target = cleanupTarget(a, d);
+      const supported = target?.kind === 'project' ? !!api.archiveProject : target?.kind === 'session' ? !!api.archiveSession : false;
+      return supported && !['Archived', 'Deleted'].includes(cleanupResults.get(a.id) ?? '');
+    });
+    const outcomes = await Promise.all(targets.map((a) => cleanWorkspace(a, 'archive', d)));
+    const ok = outcomes.filter(Boolean).length;
+    cleanupResults.set('archive-all', `Archive all: ${ok} archived${targets.length - ok ? `; ${targets.length - ok} failed` : ''}.`);
+    cleanupPending.delete('archive-all');
+    render();
+  }
+
+  const branchResultText = (result: unknown) => {
+    const value = result as { deleted?: unknown[]; skipped?: { branch?: unknown; reason?: unknown }[] };
+    const skipped = Array.isArray(value?.skipped) ? value.skipped : [];
+    return `deleted ${Array.isArray(value?.deleted) ? value.deleted.length : 0}${skipped.length
+      ? `; skipped: ${skipped.map((x) => `${String(x.branch ?? '?')} — ${String(x.reason ?? 'unknown reason')}`).join('; ')}` : ''}`;
   }
 
   // ── events ───────────────────────────────────────────────────────
@@ -375,9 +472,55 @@ export function mount(container: HTMLElement, api: PluginAPI) {
         break;
       }
       case 'end': {
-        if (!confirm(`End run ${id}? Agents stop receiving messages.`)) return;
-        const removeWorktrees = confirm('Also delete the unmerged worktrees of this run? (Branches are kept.)');
-        void act(() => api.rpc('POST', `runs/${id}/end`, { removeWorktrees }));
+        if (state?.me !== state?.current?.run.leadAgentId) break;
+        endPanelRun = id;
+        render();
+        break;
+      }
+      case 'cancel-end': endPanelRun = null; render(); break;
+      case 'confirm-end': {
+        const current = state?.current;
+        if (!current || state?.me !== current.run.leadAgentId || current.run.id !== id) break;
+        const checked = (name: string) => root.querySelector<HTMLInputElement>(`[data-end-option="${name}"]`)?.checked === true;
+        const removeWorktrees = checked('worktrees');
+        const archive = checked('archive');
+        const branches = checked('branches');
+        endPanelRun = null;
+        void act(async () => {
+          await api.rpc('POST', `runs/${id}/end`, { removeWorktrees });
+          if (archive) await archiveAll({ ...current, run: { ...current.run, status: 'ended' } });
+          if (branches) {
+            const result = await api.rpc('POST', `runs/${id}/branches/delete-merged`, { agentId: state!.me });
+            cleanupResults.set('branches', branchResultText(result));
+          }
+        });
+        break;
+      }
+      case 'archive': {
+        const a = state?.current?.agents.find((x) => x.id === id);
+        if (a?.branch && a.status === 'merged' && api.archiveProject) void cleanWorkspace(a, 'archive');
+        break;
+      }
+      case 'delete-project': {
+        const a = state?.current?.agents.find((x) => x.id === id);
+        const target = a && state?.current ? cleanupTarget(a, state.current) : null;
+        const supported = target?.kind === 'project' ? !!api.deleteProject : target?.kind === 'session' ? !!api.deleteSession : false;
+        if (!a || !target || !supported) break;
+        if (confirm(`Delete worker ${target.kind} ${a.id} (${target.value})? Its sessions and transcripts will be permanently removed.`)) void cleanWorkspace(a, 'delete');
+        break;
+      }
+      case 'archive-all': {
+        if (state?.current) void archiveAll(state.current);
+        break;
+      }
+      case 'delete-branches': {
+        const d = state?.current;
+        if (!d || state?.me !== d.run.leadAgentId || cleanupPending.has('branches')) break;
+        cleanupPending.add('branches'); render();
+        void act(async () => {
+          const result = await api.rpc('POST', `runs/${d.run.id}/branches/delete-merged`, { agentId: state!.me });
+          cleanupResults.set('branches', branchResultText(result));
+        }).finally(() => { cleanupPending.delete('branches'); render(); });
         break;
       }
       case 'end-agent': {

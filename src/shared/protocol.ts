@@ -174,7 +174,8 @@ export interface GateDTO {
 
 export type EventType =
   | 'run_started' | 'run_ended' | 'spawned' | 'turn_start' | 'turn_end' | 'gate_opened' | 'gate_decided' | 'merge'
-  | 'wait_start' | 'wait_end' | 'recovered' | 'agent_ended';
+  | 'wait_start' | 'wait_end' | 'recovered' | 'agent_ended'
+  | 'workspace_archived' | 'workspace_deleted' | 'branches_deleted';
 
 /** Timeline facts that are not messages. `agentId` is the lane the event belongs to (null = the user). */
 export interface EventDTO {

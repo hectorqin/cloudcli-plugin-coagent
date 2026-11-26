@@ -176,6 +176,19 @@ export const Git = {
     const common = await git(worktreePath, 'rev-parse', '--path-format=absolute', '--git-common-dir');
     await git(path.dirname(common), 'worktree', 'remove', worktreePath);
   },
+
+  /** Delete a local branch only when Git's own merged-branch safety check permits it. */
+  async deleteBranch(cwd: string, branch: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    try {
+      await git(cwd, 'branch', '-d', branch);
+      return { ok: true };
+    } catch (e) {
+      const failure = e as Error & { stderr?: string };
+      const detail = failure.stderr?.trim() || failure.message;
+      const reason = detail.split('\n').find((line) => line.trim())?.trim() ?? 'git branch -d failed';
+      return { ok: false, reason };
+    }
+  },
 };
 
 export type GitOps = typeof Git;

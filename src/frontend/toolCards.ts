@@ -5,6 +5,7 @@
 import type { AgentDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
 import { mountDiff } from './diffView.js';
 import { CTX_CAVEAT, cardUsageText } from './usage.js';
+import { cleanupTarget } from './workspaceCleanup.js';
 
 export interface ToolContext {
   toolName: string;
@@ -19,6 +20,10 @@ export interface ToolContext {
 export interface ToolHost {
   rpc(method: string, path: string, body?: unknown): Promise<unknown>;
   openSession(sessionId: string): void;
+  archiveProject?(projectPath: string): Promise<{ ok: true } | { ok: false; error: unknown }>;
+  deleteProject?(projectPath: string): Promise<unknown>;
+  archiveSession?(sessionId: string): Promise<{ ok: true } | { ok: false; error: unknown }>;
+  deleteSession?(sessionId: string): Promise<unknown>;
 }
 
 const POLL_MS = 2000;
@@ -179,7 +184,30 @@ export function agentsFor(ctx: ToolContext, run: RunDetailDTO | null): AgentDTO[
   return [];
 }
 
-export function cardHtml(ctx: ToolContext, state: StateDTO | null): string {
+interface CleanupState { pending: boolean; done: boolean; result: string }
+interface CleanupView {
+  archiveProject: boolean; deleteProject: boolean; archiveSession: boolean; deleteSession: boolean;
+  state?: (agentId: string) => CleanupState | undefined;
+}
+
+function cleanupHtml(worker: AgentDTO | undefined, run: RunDetailDTO | null, cleanup: CleanupView): string {
+  if (!worker || !run) return '';
+  const target = cleanupTarget(worker, run);
+  if (!target) return '';
+  const archive = target.kind === 'project' ? cleanup.archiveProject : cleanup.archiveSession;
+  const del = target.kind === 'project' ? cleanup.deleteProject : cleanup.deleteSession;
+  const state = cleanup.state?.(worker.id);
+  const disabled = state?.pending ? ' disabled' : '';
+  const controls = state?.done ? '' : `${archive ? `<button class="primary" data-clean="archive" data-agent="${esc(worker.id)}"${disabled}>Archive worker session</button>` : ''}
+    ${del ? `<button class="danger" data-clean="delete" data-agent="${esc(worker.id)}"${disabled}>Delete</button>` : ''}`;
+  const hint = !archive && !del ? `<span class="m">Archive it from the sidebar${target.kind === 'project'
+    ? ` (the project is under ${esc(run.run.projectPath.split('/').filter(Boolean).at(-1) ?? 'repo')} → worktrees)` : ''}</span>` : '';
+  return `<div class="cat-a"><div class="row">${controls}${hint}</div>${state?.result ? `<div class="m">${esc(state.result)}</div>` : ''}</div>`;
+}
+
+export function cardHtml(ctx: ToolContext, state: StateDTO | null, cleanup: CleanupView = {
+  archiveProject: false, deleteProject: false, archiveSession: false, deleteSession: false,
+}): string {
   const name = shortName(ctx.toolName);
   const run = state?.current ?? null;
   const args = input(ctx);
@@ -207,7 +235,7 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null): string {
       const sub = ctx.status === 'running' ? `waiting for ${mode} · ${working} working` : `waited for ${mode}`;
       const rest = others.length ? `<div class="cat-a"><details class="cat-others"><summary>${others.length} other agent${others.length === 1 ? '' : 's'} in this run</summary>`
         + `${others.map((a) => agentRow(a, { activity: false })).join('')}</details></div>` : '';
-      return head('Waiting on agents', sub) + agents.map((a) => agentRow(a, { activity: ctx.status === 'running' })).join('') + rest + resultBlock;
+      return head('Waiting on agents', sub) + agents.map((a) => agentRow(a, { activity: ctx.status === 'running' }) + cleanupHtml(a, run, cleanup)).join('') + rest + resultBlock;
     }
     case 'submit_plan':
     case 'request_merge': {
@@ -226,7 +254,8 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null): string {
         <details data-diff="${gate.id}"><summary>View diff${gate.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details></div>` : '';
       return head(title, gate?.comment ? `comment: ${gate.comment}` : '', badge)
         + `<div class="cat-a"><details ${st === 'pending' ? 'open' : ''}><summary>${kind === 'plan' ? 'Plan' : 'Note'}</summary><pre>${esc(body)}</pre></details></div>`
-        + review + hint + resultBlock;
+        + review + hint + (kind === 'merge' && st === 'approved'
+          ? cleanupHtml(run?.agents.find((a) => a.id === gate?.subjectAgent), run, cleanup) : '') + resultBlock;
     }
     case 'send_message':
       return head('Message', `→ ${String(args.to ?? '')}: ${clip(String(args.body ?? ''), 120)}`) + resultBlock;
@@ -243,6 +272,7 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
   let state: StateDTO | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let alive = true;
+  const cleanups = new Map<string, CleanupState>();
   const root = document.createElement('div');
   root.className = 'cat';
   container.append(root);
@@ -251,7 +281,11 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
   function draw() {
     const keep = openDetails();
     root.classList.toggle('dark', ctx.theme === 'dark');
-    root.innerHTML = cardHtml(ctx, state);
+    root.innerHTML = cardHtml(ctx, state, {
+      archiveProject: typeof host.archiveProject === 'function', deleteProject: typeof host.deleteProject === 'function',
+      archiveSession: typeof host.archiveSession === 'function', deleteSession: typeof host.deleteSession === 'function',
+      state: (id) => cleanups.get(id),
+    });
     root.querySelectorAll('details').forEach((d, i) => { if (keep.has(i)) d.open = true; });
   }
   const live = () => ctx.status === 'running'
@@ -266,6 +300,30 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
   root.addEventListener('click', (ev) => {
     const btn = (ev.target as Element).closest<HTMLElement>('[data-open]');
     if (btn) host.openSession(btn.dataset.open!);
+    const clean = (ev.target as Element).closest<HTMLButtonElement>('[data-clean]');
+    if (!clean || !state?.current) return;
+    const worker = state.current.agents.find((a) => a.id === clean.dataset.agent);
+    const target = worker ? cleanupTarget(worker, state.current) : null;
+    const cleanup = worker ? cleanups.get(worker.id) ?? { pending: false, done: false, result: '' } : null;
+    if (!worker || !target || !cleanup || cleanup.pending || cleanup.done) return;
+    const action = clean.dataset.clean as 'archive' | 'delete';
+    if (action === 'delete' && !confirm(`Delete worker ${target.kind} ${worker.id} (${target.value})? Its sessions and transcripts will be permanently removed.`)) return;
+    cleanup.pending = true;
+    cleanups.set(worker.id, cleanup);
+    draw();
+    void Promise.resolve().then(() => action === 'archive'
+      ? target.kind === 'project' ? host.archiveProject!(target.value) : host.archiveSession!(target.value)
+      : target.kind === 'project' ? host.deleteProject!(target.value) : host.deleteSession!(target.value)).then((result) => {
+      if (result && typeof result === 'object' && 'ok' in result && !(result as { ok: boolean }).ok) {
+        cleanup.result = `Error: ${String((result as { error?: unknown }).error ?? 'cleanup failed')}`;
+      } else {
+        cleanup.result = action === 'archive' ? 'Archived' : 'Deleted';
+        cleanup.done = true;
+        void Promise.resolve().then(() => host.rpc('POST', `runs/${state!.current!.run.id}/workspaces/event`, {
+          agentId: worker.id, type: action === 'archive' ? 'workspace_archived' : 'workspace_deleted', kind: target.kind,
+        })).catch(() => undefined);
+      }
+    }, (e) => { cleanup.result = `Error: ${(e as Error).message}`; }).finally(() => { cleanup.pending = false; draw(); });
   });
   root.addEventListener('toggle', (ev) => {
     const el = ev.target as HTMLDetailsElement;
