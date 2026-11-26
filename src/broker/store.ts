@@ -153,6 +153,12 @@ export const MIGRATIONS: readonly MigrationItem[] = [
     indexes: {},
   },
   TURNS_MIGRATION,
+  {
+    // Set by endRun before it waits for the repository lock: the persisted stop intent (see Broker.endRun/recover).
+    table: 'runs',
+    columns: { ending_at: 'TEXT' },
+    indexes: {},
+  },
 ];
 
 const SCHEMA_TABLES = [...SCHEMA.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
@@ -290,7 +296,7 @@ export class Store {
 
   diagnostics(now = Date.now()) {
     const expected: Record<string, string[]> = {
-      runs: ['id', 'lead_agent_id', 'project_path', 'status', 'plan_status', 'created_at', 'ended_at'],
+      runs: ['id', 'lead_agent_id', 'project_path', 'status', 'plan_status', 'created_at', 'ended_at', 'ending_at'],
       agents: ['id', 'run_id', 'role', 'provider', 'status', 'created_at'],
       messages: ['id', 'run_id', 'to_agent', 'kind', 'body', 'created_at', 'delivered_at', 'gate_id',
         'delivery_state', 'attempts', 'lease_until'],
@@ -323,6 +329,7 @@ export class Store {
       stuckBusy: [...this.busySince.entries()].filter(([, since]) => now - since > 30 * 60_000)
         .map(([agentId, since]) => ({ agentId, since: new Date(since).toISOString() })),
       undelivered: { total: Number(undelivered.count), byAgent: undeliveredByAgent },
+      endingRuns: this.endingRuns(),
     };
   }
   private ts() { return this.now().toISOString(); }
@@ -363,6 +370,23 @@ export class Store {
   setPlanStatus(runId: string, st: PlanStatus) {
     this.db.prepare('UPDATE runs SET plan_status = ? WHERE id = ?').run(st, runId);
   }
+  /** Persists the intent to end an active run (no-op otherwise). From now on nothing may start a turn in it. */
+  markEnding(runId: string) {
+    this.db.prepare("UPDATE runs SET ending_at = COALESCE(ending_at, ?) WHERE id = ? AND status = 'active'").run(this.ts(), runId);
+  }
+  /** Runs that endRun has marked, active (stop not finished) or ended: what recovery must complete. */
+  markedRuns(): RunDTO[] {
+    return (this.db.prepare('SELECT * FROM runs WHERE ending_at IS NOT NULL').all() as Row[]).map((r) => this.toRun(r));
+  }
+  /** Active runs whose stop has not finished yet, oldest first, with their age on this store's clock. */
+  endingRuns(): { runId: string; endingAt: string; ageMs: number }[] {
+    const now = this.now().getTime();
+    return (this.db.prepare("SELECT id, ending_at FROM runs WHERE status = 'active' AND ending_at IS NOT NULL ORDER BY ending_at")
+      .all() as Row[]).map((r) => ({ runId: String(r.id), endingAt: String(r.ending_at), ageMs: Math.max(0, now - Date.parse(String(r.ending_at))) }));
+  }
+  hasEvent(runId: string, type: EventType): boolean {
+    return !!this.db.prepare('SELECT 1 FROM events WHERE run_id = ? AND type = ? LIMIT 1').get(runId, type);
+  }
   endRun(runId: string) {
     this.db.prepare("UPDATE runs SET status = 'ended', ended_at = ? WHERE id = ?").run(this.ts(), runId);
     this.db.prepare("UPDATE agents SET status = 'ended' WHERE run_id = ? AND status NOT IN ('merged')").run(runId);
@@ -377,6 +401,13 @@ export class Store {
   }
   agent(id: string): AgentDTO | null {
     const r = this.db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as Row | undefined;
+    return r ? this.toAgent(r) : null;
+  }
+  /** The session's agent in its most recent run, active or ended. */
+  latestAgentByProviderSession(provider: Provider, providerSessionId: string): AgentDTO | null {
+    const r = this.db.prepare(`SELECT a.* FROM agents a JOIN runs r ON r.id = a.run_id
+      WHERE a.provider = ? AND a.provider_session_id = ? ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1`)
+      .get(provider, providerSessionId) as Row | undefined;
     return r ? this.toAgent(r) : null;
   }
   agentByProviderSession(provider: Provider, providerSessionId: string): AgentDTO | null {
@@ -429,7 +460,7 @@ export class Store {
   }
   agentsWithUndelivered(): string[] {
     return (this.db.prepare(`SELECT DISTINCT m.to_agent AS id FROM messages m JOIN runs r ON r.id = m.run_id
-      WHERE m.delivery_state = 'queued' AND r.status = 'active'`).all() as Row[]).map((r) => String(r.id));
+      WHERE m.delivery_state = 'queued' AND r.status = 'active' AND r.ending_at IS NULL`).all() as Row[]).map((r) => String(r.id));
   }
   /** The first message ever addressed to an agent (a worker's task). */
   firstMessageId(agentId: string): number | null {
@@ -529,8 +560,10 @@ export class Store {
       AND subject_agent IS ?`).get(runId, kind, subjectAgent) as Row | undefined;
     return r ? toGate(r) : null;
   }
-  decideGate(id: number, status: GateStatus, comment: string | null) {
-    this.db.prepare('UPDATE gates SET status = ?, comment = ?, decided_at = ? WHERE id = ?').run(status, comment, this.ts(), id);
+  /** pending → a terminal status. False when the gate was already decided (a decision is never overwritten). */
+  decideGate(id: number, status: GateStatus, comment: string | null): boolean {
+    return Number(this.db.prepare("UPDATE gates SET status = ?, comment = ?, decided_at = ? WHERE id = ? AND status = 'pending'")
+      .run(status, comment, this.ts(), id).changes) > 0;
   }
 
   // ── events ────────────────────────────────────────────────────────
@@ -676,6 +709,7 @@ export class Store {
     return {
       id: String(r.id), leadAgentId: String(r.lead_agent_id), projectPath: String(r.project_path),
       status: String(r.status) as RunDTO['status'], planStatus: String(r.plan_status) as PlanStatus, createdAt: String(r.created_at),
+      ...(r.ending_at != null && String(r.status) === 'active' ? { ending: true } : {}),
       usage: usage ? usage.get(String(r.id)) ?? emptyRunUsage() : this.runUsage(String(r.id)),
     };
   }

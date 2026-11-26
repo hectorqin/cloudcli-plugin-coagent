@@ -34,6 +34,9 @@ const fakeBroker = {
     return { deleted: [{ agentId: 'coder-1', branch: `coagent/${runId}/coder-1` }], skipped: [] };
   },
   recordWorkspaceEvent: () => ({ ok: true }),
+  endRun: async (id: string, removeWorktrees: boolean) => ({
+    failedWorktrees: removeWorktrees ? [{ agentId: 'coder-1', path: `/wt/${id}`, reason: 'still running' }] : [],
+  }),
 } as unknown as Broker;
 
 describe('broker HTTP hardening and diagnostics', () => {
@@ -166,6 +169,13 @@ describe('broker HTTP hardening and diagnostics', () => {
     expect((await request('POST', '/registration', {
       headers: { 'x-plugin-secret-apikey': 'tab-key' }, body: '{"action":"invalid"}',
     })).status).toBe(400);
+  });
+
+  it('the end-run route reports worktrees it could not delete', async () => {
+    const headers = { 'x-plugin-secret-apikey': 'tab-key' };
+    expect(await request('POST', '/runs/r-1/end', { headers, body: '{"removeWorktrees":true}' })).toMatchObject({
+      status: 200, body: { ok: true, failedWorktrees: [{ agentId: 'coder-1', path: '/wt/r-1', reason: 'still running' }] },
+    });
   });
 
   it('requires a fresh, unexpired, one-time setup nonce', async () => {

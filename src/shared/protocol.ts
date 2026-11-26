@@ -55,7 +55,8 @@ export type AgentStatus = 'lead' | 'starting' | 'running' | 'idle' | 'reported' 
  */
 export type DeliveryState = 'queued' | 'dispatching' | 'delivered' | 'cancelled';
 export type GateKind = 'plan' | 'merge';
-export type GateStatus = 'pending' | 'approved' | 'rejected' | 'expired';
+/** 'failed': the user approved a merge, but git could not merge it (nothing changed; the lead may request again). */
+export type GateStatus = 'pending' | 'approved' | 'rejected' | 'expired' | 'failed';
 
 export interface MergeSnapshotFile {
   path: string;
@@ -87,6 +88,8 @@ export interface RunDTO {
   leadAgentId: string;
   projectPath: string;
   status: RunStatus;
+  /** endRun has started on this active run: nothing new may start in it. */
+  ending?: boolean;
   planStatus: PlanStatus;
   createdAt: string;
   /** Totals over every turn the broker ran in this run (lead and workers). */

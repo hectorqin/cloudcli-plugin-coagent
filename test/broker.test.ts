@@ -4,8 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { Broker, MAX_WORKERS } from '../src/broker/broker.js';
-import type { CloudCli, SendInput, SendResult, SessionInfo } from '../src/broker/cloudcli.js';
+import { Broker, ENDING_RETRY_MS, MAX_WORKERS } from '../src/broker/broker.js';
+import { HttpCloudCli, type CloudCli, type SendInput, type SendResult, type SessionInfo } from '../src/broker/cloudcli.js';
 import { Git } from '../src/broker/git.js';
 import { filePrompts } from '../src/broker/prompts.js';
 import { MIGRATIONS, pendingMigrations, Store } from '../src/broker/store.js';
@@ -618,6 +618,29 @@ describe('merge gate', () => {
     (store as unknown as { db: DatabaseSync }).db.prepare('UPDATE agents SET app_session_id = ? WHERE id = ?').run('lead-app', ro.id);
     expect(() => broker.recordWorkspaceEvent(run.id, ro.id, 'workspace_archived', 'session')).toThrow(/finished read-only worker/);
   });
+
+  it('endRun removes a merged worker worktree whose post-merge cleanup failed', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    store.updateAgent(w.id, { status: 'merged' }); // merged, but removing the worktree failed: the path is still recorded
+    await broker.endRun(run.id, true);
+    expect(fs.existsSync(w.worktreePath!)).toBe(false);
+    expect(store.agent(w.id)!.worktreePath).toBeNull();
+  });
+
+  it('endRun expires pending gates and cancels queued messages', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    await call('request_merge', { worker: w.id });
+    const gate = store.gates(run.id).find((g) => g.kind === 'merge')!;
+    expect(gate.status).toBe('pending');
+    store.addMessage(run.id, null, w.id, 'message', 'never delivered');
+    await broker.endRun(run.id, false);
+    expect(store.gate(gate.id)!.status).toBe('expired');
+    expect(store.events(run.id).some((e) => e.type === 'gate_decided' && e.data.gate === gate.id && e.data.status === 'expired')).toBe(true);
+    expect(store.messages(run.id).filter((m) => m.state === 'queued')).toEqual([]);
+    expect(broker.state(null, null).runs.find((r) => r.id === run.id)!.pendingGates).toBe(0);
+  });
 });
 
 describe('wait_for_agents and batched results', () => {
@@ -1163,12 +1186,12 @@ describe('review fixes (rework)', () => {
     const removing = new Promise<void>((r) => { release = r; });
     broker = new Broker({
       store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock,
-      git: { ...Git, removeWorktree: async (p: string) => { await removing; return Git.removeWorktree(p); } },
+      git: { ...Git, removeOwnedWorktree: async (...args: Parameters<typeof Git.removeOwnedWorktree>) => { await removing; return Git.removeOwnedWorktree(...args); } },
     });
     cc.status = () => false;
     store.addMessage(w.runId, null, w.id, 'message', 'late user message');
     const ending = broker.endAgent(w.id, true, store.runs()[0].leadAgentId);
-    await new Promise((x) => setTimeout(x, 0));
+    for (let i = 0; i < 200 && store.agent(w.id)!.status !== 'ended'; i++) await new Promise((x) => setTimeout(x, 5));
     expect(store.agent(w.id)!.status).toBe('ended'); // persisted before the cleanup await
     const before = toWorker(w.id).length;
     await broker.tick();
@@ -1186,7 +1209,7 @@ describe('review fixes (rework)', () => {
     const w = await spawn('coder');
     broker = new Broker({
       store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock,
-      git: { ...Git, removeWorktree: async () => { throw new Error('permission denied'); } },
+      git: { ...Git, removeOwnedWorktree: async () => { throw new Error('permission denied'); } },
     });
     const text = await broker.endAgent(w.id, true, null);
     expect(text).toMatch(/deleting its worktree .* failed: permission denied/);
@@ -1238,6 +1261,545 @@ describe('review fixes (rework)', () => {
     expect((await call('report_result', { summary: 'sneaky' }, caller)).ok).toBe(false);
     expect((await call('send_message', { to: 'lead', body: 'hi' }, caller)).ok).toBe(false);
     expect(store.agent(w.id)!.status).toBe('ended');
+  });
+});
+
+describe('endRun safety (review: stop barrier, repo lock, stale paths)', () => {
+  /** Rebuilds the broker on the same store with some git operations replaced. */
+  const withGit = (over: Partial<typeof Git>) => {
+    broker = new Broker({ store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock, git: { ...Git, ...over } });
+  };
+  const deferred = () => {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+
+  it('a failed removal keeps the path and reports it', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    withGit({ removeOwnedWorktree: async () => { throw new Error('permission denied'); } });
+    const res = await broker.endRun(run.id, true);
+    expect(res.failedWorktrees).toEqual([{ agentId: w.id, path: w.worktreePath, reason: 'permission denied' }]);
+    expect(store.agent(w.id)!.worktreePath).toBe(w.worktreePath);
+    expect(store.run(run.id)!.status).toBe('ended');
+    expect(store.events(run.id).find((e) => e.type === 'run_ended')!.data.failedWorktrees).toEqual(res.failedWorktrees);
+  });
+
+  it('keeps the worktree of a worker whose turn is still in flight, and starts no new turn', async () => {
+    const run = await startApprovedRun();
+    cc.next.push('hold');
+    const r = await broker.handleTool({ tool: 'spawn_agent', args: { role: 'coder', task: 't' }, caller: LEAD });
+    const w = store.agent(r.text.match(/Spawned (\S+)/)![1])!;
+    await Promise.resolve();
+    store.addMessage(run.id, null, w.id, 'message', 'more work');
+    cc.status = () => false; // even if CloudCLI claims idle, this process knows its own turn is still running
+    const res = await broker.endRun(run.id, true);
+    expect(res.failedWorktrees).toEqual([{ agentId: w.id, path: w.worktreePath, reason: 'still running' }]);
+    expect(fs.existsSync(w.worktreePath!)).toBe(true);
+    const sends = cc.calls.length;
+    cc.holds.forEach((release) => release());
+    await broker.settle();
+    await broker.tick();
+    await broker.settle();
+    expect(cc.calls.length).toBe(sends);
+    expect(store.messages(run.id).filter((m) => m.state === 'queued')).toEqual([]);
+    // Once the turn is over, ending again retries the cleanup.
+    cc.status = null;
+    expect((await broker.endRun(run.id, true)).failedWorktrees).toEqual([]);
+    expect(fs.existsSync(w.worktreePath!)).toBe(false);
+  });
+
+  it('keeps the worktree when CloudCLI cannot confirm the session is idle', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    cc.status = () => null;
+    const res = await broker.endRun(run.id, true);
+    expect(res.failedWorktrees).toMatchObject([{ agentId: w.id, reason: expect.stringMatching(/session state unknown/) }]);
+    expect(fs.existsSync(w.worktreePath!)).toBe(true);
+  });
+
+  it('nothing is delivered while endRun waits for the repository lock', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    const sends = cc.calls.length;
+    const hold = deferred();
+    const entered = deferred();
+    // A request_merge holding the repository lock (blocked in commitAll) keeps endRun waiting.
+    withGit({ commitAll: async (...args: Parameters<typeof Git.commitAll>) => { entered.resolve(); await hold.promise; return Git.commitAll(...args); } });
+    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: w.id }, caller: LEAD });
+    await entered.promise;
+    const ending = broker.endRun(run.id, false);
+    store.addMessage(run.id, null, w.id, 'message', 'rework');
+    await broker.tick();
+    await Promise.resolve();
+    expect(cc.calls.length).toBe(sends);
+    hold.resolve();
+    await merging;
+    await ending;
+    await broker.settle();
+    expect(cc.calls.length).toBe(sends);
+    expect(store.messages(run.id).find((m) => m.body === 'rework')!.state).toBe('cancelled');
+  });
+
+  it('endRun waits for an in-progress merge; the merge decision stands and nothing is queued in the ended run', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    fs.writeFileSync(path.join(w.worktreePath!, 'hello.txt'), 'hi');
+    sh(w.worktreePath!, 'add', '.');
+    sh(w.worktreePath!, 'commit', '-qm', 'hello');
+    await call('request_merge', { worker: w.id });
+    const gate = store.gates(run.id).find((g) => g.kind === 'merge')!;
+    const hold = deferred();
+    const entered = deferred();
+    withGit({ merge: async (...args: Parameters<typeof Git.merge>) => { entered.resolve(); await hold.promise; return Git.merge(...args); } });
+    const deciding = broker.decideGate(gate.id, true, null);
+    await entered.promise;
+    const ending = broker.endRun(run.id, true);
+    await Promise.resolve();
+    expect(store.run(run.id)!.status).toBe('active'); // endRun is waiting for the lock
+    hold.resolve();
+    await deciding;
+    await ending;
+    await broker.settle();
+    expect(store.gate(gate.id)!.status).toBe('approved');
+    expect(store.agent(w.id)!.status).toBe('merged');
+    expect(fs.readFileSync(path.join(repo, 'hello.txt'), 'utf8')).toBe('hi');
+    expect(store.run(run.id)!.status).toBe('ended');
+    expect(store.messages(run.id).filter((m) => m.state === 'queued' || m.state === 'dispatching')).toEqual([]);
+  });
+
+  it('an approval queued behind endRun finds the gate expired and does not merge', async () => {
+    const run = await startApprovedRun();
+    const a = await spawn('coder');
+    const b = await spawn('coder');
+    fs.writeFileSync(path.join(a.worktreePath!, 'a.txt'), 'a');
+    sh(a.worktreePath!, 'add', '.');
+    sh(a.worktreePath!, 'commit', '-qm', 'a');
+    await call('request_merge', { worker: a.id });
+    const gate = store.gates(run.id).find((g) => g.kind === 'merge')!;
+    const head = sh(repo, 'rev-parse', 'HEAD');
+    const hold = deferred();
+    const entered = deferred();
+    // A fixed lock key keeps the lock queue in call order (the real lookup runs git, whose timing varies).
+    const key = await Git.commonDir(repo);
+    withGit({
+      commonDir: async () => key,
+      commitAll: async (...args: Parameters<typeof Git.commitAll>) => { entered.resolve(); await hold.promise; return Git.commitAll(...args); },
+    });
+    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: b.id }, caller: LEAD }); // holds the lock
+    await entered.promise;
+    const ending = broker.endRun(run.id, false); // persists 'ending' at once, then waits for the lock
+    const deciding = broker.decideGate(gate.id, true, null);
+    await expect(deciding).rejects.toThrow(/run has ended/); // refused before it can queue for the lock
+    hold.resolve();
+    await Promise.all([merging, ending]);
+    await broker.settle();
+    expect(store.gate(gate.id)!.status).toBe('expired');
+    expect(sh(repo, 'rev-parse', 'HEAD')).toBe(head);
+    expect(store.events(run.id).some((e) => e.type === 'merge')).toBe(false);
+    expect(store.messages(run.id).filter((m) => m.state === 'queued')).toEqual([]);
+  });
+
+  it('gate decisions never overwrite a decided gate', async () => {
+    const run = await startApprovedRun();
+    const gate = store.gates(run.id)[0];
+    expect(store.decideGate(gate.id, 'expired', 'x')).toBe(false);
+    expect(store.gate(gate.id)!.status).toBe('approved');
+  });
+
+  it('does not remove a stale path that now belongs to another repository', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    sh(repo, 'worktree', 'remove', w.worktreePath!);
+    const other = path.join(tmp, 'other');
+    fs.mkdirSync(other);
+    sh(other, 'init', '-q', '-b', 'main');
+    sh(other, 'commit', '-q', '--allow-empty', '-m', 'init');
+    sh(other, 'worktree', 'add', '-q', '-b', w.branch!, w.worktreePath!);
+    const res = await broker.endRun(run.id, true);
+    expect(res.failedWorktrees).toMatchObject([{ agentId: w.id, reason: expect.stringMatching(/is not a worktree of/) }]);
+    expect(fs.existsSync(w.worktreePath!)).toBe(true);
+    expect(sh(other, 'worktree', 'list')).toContain(w.worktreePath!);
+    expect(store.agent(w.id)!.worktreePath).toBe(w.worktreePath);
+  });
+
+  it('does not remove a worktree of the lead repository that is on another branch', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    sh(repo, 'worktree', 'remove', w.worktreePath!);
+    sh(repo, 'worktree', 'add', '-q', '-b', 'someone-else', w.worktreePath!);
+    const res = await broker.endRun(run.id, true);
+    expect(res.failedWorktrees).toMatchObject([{ agentId: w.id, reason: expect.stringMatching(/checked out on someone-else/) }]);
+    expect(fs.existsSync(w.worktreePath!)).toBe(true);
+  });
+
+  it('a worktree that is already gone counts as removed', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    fs.rmSync(w.worktreePath!, { recursive: true, force: true });
+    expect((await broker.endRun(run.id, true)).failedWorktrees).toEqual([]);
+    expect(store.agent(w.id)!.worktreePath).toBeNull();
+    expect(sh(repo, 'worktree', 'list')).not.toContain(w.worktreePath!);
+  });
+
+  it('a lead blocked in gate_wait gets the expiry; one in wait_for_agents stops with reason run_ended', async () => {
+    const r = await call('submit_plan', { plan: 'p' });
+    expect(r.ok).toBe(true);
+    const run = store.runs()[0];
+    const gate = store.gates(run.id)[0];
+    expect((await call('gate_wait', { gate: gate.id })).pending).toBe(true);
+    await broker.endRun(run.id, false);
+    const answer = await call('gate_wait', { gate: gate.id });
+    expect(answer).toMatchObject({ ok: true });
+    expect(answer.pending).toBeFalsy();
+    expect(answer.text).toMatch(/Gate #\d+ EXPIRED: the user ended run .* Nothing was approved/);
+
+    // wait_for_agents on a second run
+    cc.sessions.set('lead2-prov', { appSessionId: 'lead2-app', providerSessionId: 'lead2-prov', provider: 'claude', projectPath: repo });
+    const LEAD2: Caller = { provider: 'claude', providerSessionId: 'lead2-prov', cwd: null };
+    await call('submit_plan', { plan: 'p2' }, LEAD2);
+    const run2 = store.runs().find((x) => x.id !== run.id)!;
+    await broker.decideGate(store.gates(run2.id)[0].id, true, null);
+    await broker.settle();
+    cc.next.push('hold');
+    await broker.handleTool({ tool: 'spawn_agent', args: { role: 'planner', task: 't' }, caller: LEAD2 });
+    await Promise.resolve();
+    expect((await broker.handleTool({ tool: 'wait_for_agents', args: {}, caller: LEAD2 })).pending).toBe(true);
+    await broker.endRun(run2.id, false);
+    const ends = store.events(run2.id).filter((e) => e.type === 'wait_end');
+    expect(ends.map((e) => e.data.reason)).toEqual(['run_ended']);
+    const after = await broker.handleTool({ tool: 'wait_for_agents', args: {}, caller: LEAD2 });
+    expect(after).toMatchObject({ ok: true });
+    expect(after.text).toMatch(/ended run/);
+    await broker.tick();
+    expect(store.events(run2.id).filter((e) => e.type === 'wait_end')).toHaveLength(1); // never "abandoned" later
+    cc.holds.forEach((release) => release());
+    await broker.settle();
+  });
+
+  it('a spawn that finishes creating its worktree after the run ended is rolled back', async () => {
+    const run = await startApprovedRun();
+    const hold = deferred();
+    const entered = deferred();
+    let created = '';
+    withGit({
+      createWorktree: async (...args: Parameters<typeof Git.createWorktree>) => {
+        entered.resolve(); await hold.promise;
+        const res = await Git.createWorktree(...args); created = res.worktreePath; return res;
+      },
+    });
+    const spawning = broker.handleTool({ tool: 'spawn_agent', args: { role: 'coder', task: 't' }, caller: LEAD });
+    await entered.promise;
+    await broker.endRun(run.id, true);
+    hold.resolve();
+    const r = await spawning;
+    expect(r).toMatchObject({ ok: false, text: expect.stringMatching(/run has ended/) });
+    expect(fs.existsSync(created)).toBe(false);
+    expect(store.agents(run.id).filter((a) => a.role !== 'lead')).toEqual([]);
+  });
+});
+
+describe('end_agent / endRun re-review (lock scope, persisted stop)', () => {
+  const withGit = (over: Partial<typeof Git>) => {
+    broker = new Broker({ store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock, git: { ...Git, ...over } });
+  };
+  const deferred = <T = void>() => {
+    let resolve!: (v: T) => void;
+    const promise = new Promise<T>((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+  const commit = (w: { worktreePath: string | null }, file: string) => {
+    fs.writeFileSync(path.join(w.worktreePath!, file), file);
+    sh(w.worktreePath!, 'add', '.');
+    sh(w.worktreePath!, 'commit', '-qm', file);
+  };
+
+  it('end_agent waits for a request_merge that is snapshotting the worktree, then rejects the new gate', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    commit(w, 'a.txt');
+    const hold = deferred();
+    const entered = deferred();
+    withGit({ mergeSnapshot: async (...args: Parameters<typeof Git.mergeSnapshot>) => { entered.resolve(); await hold.promise; return Git.mergeSnapshot(...args); } });
+    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: w.id }, caller: LEAD });
+    await entered.promise;
+    const ending = broker.endAgent(w.id, true, null);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fs.existsSync(w.worktreePath!)).toBe(true); // not removed under the snapshot
+    expect(store.agent(w.id)!.status).not.toBe('ended');
+    hold.resolve();
+    expect((await merging).ok).toBe(true);
+    expect(await ending).toMatch(/Deleted its worktree/);
+    const gate = store.gates(run.id).find((g) => g.kind === 'merge')!;
+    expect(gate.status).toBe('rejected');
+    expect(fs.existsSync(w.worktreePath!)).toBe(false);
+  });
+
+  it('end_agent arriving during a merge approval waits, then finds the worker merged', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    commit(w, 'b.txt');
+    await call('request_merge', { worker: w.id });
+    const gate = store.gates(run.id).find((g) => g.kind === 'merge')!;
+    const hold = deferred();
+    const entered = deferred();
+    withGit({ merge: async (...args: Parameters<typeof Git.merge>) => { entered.resolve(); await hold.promise; return Git.merge(...args); } });
+    const deciding = broker.decideGate(gate.id, true, null);
+    await entered.promise;
+    const ending = broker.endAgent(w.id, true, null);
+    hold.resolve();
+    await deciding;
+    await expect(ending).rejects.toThrow(/already merged/);
+    expect(store.gate(gate.id)!.status).toBe('approved');
+    expect(store.agent(w.id)!.status).toBe('merged');
+    expect(store.events(run.id).filter((e) => e.type === 'gate_decided' && e.data.gate === gate.id).map((e) => e.data.status)).toEqual(['approved']);
+    expect(fs.readFileSync(path.join(repo, 'b.txt'), 'utf8')).toBe('b.txt');
+  });
+
+  it('a merge approval that loses the race to end_agent is refused and merges nothing', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    commit(w, 'c.txt');
+    await call('request_merge', { worker: w.id });
+    const gate = store.gates(run.id).find((g) => g.kind === 'merge')!;
+    const head = sh(repo, 'rev-parse', 'HEAD');
+    await broker.endAgent(w.id, false, null);
+    await expect(broker.decideGate(gate.id, true, null)).rejects.toThrow(/already rejected/);
+    expect(sh(repo, 'rev-parse', 'HEAD')).toBe(head);
+    expect(store.events(run.id).some((e) => e.type === 'merge')).toBe(false);
+  });
+
+  it('endRun asks CloudCLI outside the repository lock: a merge in another run proceeds meanwhile', async () => {
+    const run1 = await startApprovedRun();
+    const a = await spawn('coder');
+    // A second run on the same repository with a merge waiting for approval.
+    cc.sessions.set('lead2-prov', { appSessionId: 'lead2-app', providerSessionId: 'lead2-prov', provider: 'claude', projectPath: repo });
+    const LEAD2: Caller = { provider: 'claude', providerSessionId: 'lead2-prov', cwd: null };
+    await call('submit_plan', { plan: 'p2' }, LEAD2);
+    const run2 = store.runs().find((r) => r.id !== run1.id)!;
+    await broker.decideGate(store.gates(run2.id)[0].id, true, null);
+    await broker.settle();
+    const b = store.agent((await call('spawn_agent', { role: 'coder', task: 't' }, LEAD2)).text.match(/Spawned (\S+)/)![1])!;
+    commit(b, 'd.txt');
+    await call('request_merge', { worker: b.id }, LEAD2);
+    const gate = store.gates(run2.id).find((g) => g.kind === 'merge')!;
+
+    const status = deferred<{ processing: boolean | null }>();
+    const asked = deferred();
+    cc.sessionStatus = async () => { asked.resolve(); return status.promise; };
+    const ending = broker.endRun(run1.id, true);
+    await asked.promise; // endRun is waiting on CloudCLI
+    await broker.decideGate(gate.id, true, null); // would deadlock-wait if endRun held the lock
+    expect(store.agent(b.id)!.status).toBe('merged');
+    status.resolve({ processing: false });
+    expect((await ending).failedWorktrees).toEqual([]);
+    expect(fs.existsSync(a.worktreePath!)).toBe(false);
+  });
+
+  it('a session-status request that hangs times out as unknown', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-status-'));
+    const prev = process.env.COAGENT_API_KEY;
+    process.env.COAGENT_API_KEY = 'ck_test';
+    try {
+      const hang = ((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true });
+      })) as unknown as typeof fetch;
+      const http = new HttpCloudCli({ pluginsConfigPath: path.join(dir, 'none.json'), localServerPath: path.join(dir, 'none.json'), fetchImpl: hang, statusTimeoutMs: 30 });
+      const started = Date.now();
+      expect(await http.sessionStatus('s-1')).toEqual({ processing: null });
+      expect(Date.now() - started).toBeLessThan(2000);
+    } finally {
+      if (prev === undefined) delete process.env.COAGENT_API_KEY; else process.env.COAGENT_API_KEY = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a restart between marking the run ending and the stop: nothing starts, and recovery completes the stop', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    commit(w, 'e.txt');
+    await call('request_merge', { worker: w.id });
+    const gate = store.gates(run.id).find((g) => g.kind === 'merge')!;
+    store.markEnding(run.id); // what endRun persists first; the process dies before stopRun
+    store.addMessage(run.id, null, w.id, 'message', 'queued before the crash');
+
+    // A fresh process on the same database.
+    broker = new Broker({ store, cloudcli: cc, git: Git, prompts: filePrompts(PROMPTS), now: () => clock });
+    expect(store.run(run.id)).toMatchObject({ status: 'active', ending: true });
+    const sends = cc.calls.length;
+    await broker.tick();
+    await broker.settle();
+    expect(cc.calls.length).toBe(sends); // delivery refuses an ending run
+    expect((await call('spawn_agent', { role: 'planner', task: 't' })).text).toMatch(/run has ended/);
+    await expect(broker.decideGate(gate.id, true, null)).rejects.toThrow(/run has ended/);
+
+    await broker.recover();
+    expect(store.run(run.id)!.status).toBe('ended');
+    expect(store.gate(gate.id)!.status).toBe('expired');
+    expect(store.messages(run.id).find((m) => m.body === 'queued before the crash')!.state).toBe('cancelled');
+    expect(store.events(run.id).filter((e) => e.type === 'run_ended').map((e) => e.data)).toEqual([{ recovered: true }]);
+    expect(fs.existsSync(w.worktreePath!)).toBe(true); // cleanup is not automatic; endRun again retries it
+    expect((await broker.endRun(run.id, true)).failedWorktrees).toEqual([]);
+    expect(fs.existsSync(w.worktreePath!)).toBe(false);
+    await broker.recover(); // idempotent: no second run_ended
+    expect(store.events(run.id).filter((e) => e.type === 'run_ended')).toHaveLength(1);
+  });
+
+  it('recovery records a missing run_ended for a run that stopped but crashed during cleanup', async () => {
+    const run = await startApprovedRun();
+    store.markEnding(run.id);
+    store.endRun(run.id); // stopped, but the process died before recording run_ended
+    broker = new Broker({ store, cloudcli: cc, git: Git, prompts: filePrompts(PROMPTS), now: () => clock });
+    await broker.recover();
+    expect(store.events(run.id).filter((e) => e.type === 'run_ended').map((e) => e.data)).toEqual([{ recovered: true }]);
+  });
+
+  it('migrates an older database without runs.ending_at', () => {
+    const file = path.join(tmp, 'old-runs.sqlite');
+    new Store(file).close();
+    const raw = new DatabaseSync(file);
+    raw.exec('ALTER TABLE runs DROP COLUMN ending_at');
+    expect(pendingMigrations(raw)).toEqual(['column runs.ending_at']);
+    raw.close();
+    new Store(file).close();
+    const again = new DatabaseSync(file, { readOnly: true });
+    expect(pendingMigrations(again)).toEqual([]);
+    again.close();
+  });
+});
+
+describe('merge gate outcome (third review)', () => {
+  /** A worker that committed `file`, with its merge gate open. */
+  async function openMerge(file: string, text = 'worker\n') {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    fs.writeFileSync(path.join(w.worktreePath!, file), text);
+    sh(w.worktreePath!, 'add', '.');
+    sh(w.worktreePath!, 'commit', '-qm', file);
+    await call('request_merge', { worker: w.id });
+    return { run, w, gate: store.gates(run.id).find((g) => g.kind === 'merge')! };
+  }
+  const expectFailed = (runId: string, gateId: number, reason: RegExp) => {
+    expect(store.gate(gateId)!.status).toBe('failed');
+    const decided = store.events(runId).filter((e) => e.type === 'gate_decided' && e.data.gate === gateId);
+    expect(decided.map((e) => e.data.status)).toEqual(['failed']);
+    expect(String(decided[0].data.reason)).toMatch(reason);
+    expect(store.events(runId).find((e) => e.type === 'merge')!.data).toMatchObject({ ok: false });
+    expect(store.messages(runId).filter((m) => m.kind === 'gate' && m.body.includes(`merge FAILED`))).toHaveLength(1);
+  };
+
+  it('a dirty lead tree fails the merge: the gate is failed, not approved, and the worker stays mergeable', async () => {
+    const { run, w, gate } = await openMerge('shared.txt');
+    fs.writeFileSync(path.join(repo, 'shared.txt'), 'uncommitted lead edit\n'); // would be overwritten
+    const head = sh(repo, 'rev-parse', 'HEAD');
+    await broker.decideGate(gate.id, true, null);
+    await broker.settle();
+    expectFailed(run.id, gate.id, /.+/);
+    expect(sh(repo, 'rev-parse', 'HEAD')).toBe(head);
+    expect(fs.readFileSync(path.join(repo, 'shared.txt'), 'utf8')).toBe('uncommitted lead edit\n');
+    expect(store.agent(w.id)!.status).not.toBe('merged');
+    expect(fs.existsSync(w.worktreePath!)).toBe(true);
+    // Not stuck: the lead can request the merge again once the tree is clean.
+    fs.rmSync(path.join(repo, 'shared.txt'));
+    expect((await call('request_merge', { worker: w.id })).text).toMatch(/submitted as gate/);
+  });
+
+  it('a conflict fails the merge and lists the conflicting files', async () => {
+    const { run, gate } = await openMerge('README.md', 'worker\n');
+    fs.writeFileSync(path.join(repo, 'README.md'), 'lead\n');
+    sh(repo, 'commit', '-qam', 'lead edit');
+    await broker.decideGate(gate.id, true, null);
+    await broker.settle();
+    expectFailed(run.id, gate.id, /merge conflict/);
+    expect(store.messages(run.id).find((m) => m.body.includes('merge FAILED'))!.body).toMatch(/- README.md/);
+    expect(sh(repo, 'status', '--porcelain')).toBe('');
+  });
+
+  it('a merge that throws fails the gate and still tells the lead', async () => {
+    const { run, w, gate } = await openMerge('t.txt');
+    broker = new Broker({
+      store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock,
+      git: { ...Git, merge: async () => { throw new Error('fatal: bad object deadbeef\nmore detail'); } },
+    });
+    const decided = await broker.decideGate(gate.id, true, null);
+    await broker.settle();
+    expect(decided.status).toBe('failed');
+    expectFailed(run.id, gate.id, /^fatal: bad object deadbeef$/);
+    expect(store.agent(w.id)!.status).not.toBe('merged');
+  });
+
+  it('a successful merge is approved exactly once', async () => {
+    const { run, gate } = await openMerge('ok.txt');
+    await broker.decideGate(gate.id, true, null);
+    await broker.settle();
+    expect(store.gate(gate.id)!.status).toBe('approved');
+    expect(store.events(run.id).filter((e) => e.type === 'gate_decided' && e.data.gate === gate.id).map((e) => e.data.status)).toEqual(['approved']);
+  });
+});
+
+describe('stalled ending runs (third review)', () => {
+  /** Backdates a run's ending_at, as if endRun had marked it `ms` ago. */
+  const age = (runId: string, ms: number) => (store as unknown as { db: DatabaseSync }).db
+    .prepare('UPDATE runs SET ending_at = ? WHERE id = ?').run(new Date(Date.now() - ms).toISOString(), runId);
+
+  it('the state marks the run ending and diagnostics list it with its age', async () => {
+    const run = await startApprovedRun();
+    store.markEnding(run.id);
+    age(run.id, 90_000);
+    expect(broker.state(null, run.id).runs.find((r) => r.id === run.id)).toMatchObject({ status: 'active', ending: true });
+    const diag = store.diagnostics();
+    expect(diag.endingRuns).toEqual([{ runId: run.id, endingAt: expect.any(String), ageMs: expect.any(Number) }]);
+    expect(diag.endingRuns[0].ageMs).toBeGreaterThanOrEqual(90_000);
+  });
+
+  it('tick finishes a stop stalled longer than ENDING_RETRY_MS, and never clears ending_at', async () => {
+    const run = await startApprovedRun();
+    await call('submit_plan', { plan: 'v2' }); // a pending gate the stop must expire
+    const gate = store.gates(run.id).find((g) => g.status === 'pending')!;
+    store.markEnding(run.id); // endRun marked it, then died before stopRun (no restart)
+    age(run.id, ENDING_RETRY_MS - 5_000);
+    await broker.tick();
+    await broker.settle();
+    expect(store.run(run.id)!.status).toBe('active'); // not yet: it may still be legitimately waiting for the lock
+    age(run.id, ENDING_RETRY_MS + 5_000);
+    await broker.tick();
+    await broker.settle();
+    expect(store.run(run.id)!.status).toBe('ended');
+    expect(store.gate(gate.id)!.status).toBe('expired');
+    expect(store.events(run.id).filter((e) => e.type === 'run_ended').map((e) => e.data)).toEqual([{ recovered: true, retried: true }]);
+    const raw = (store as unknown as { db: DatabaseSync }).db.prepare('SELECT ending_at FROM runs WHERE id = ?').get(run.id) as { ending_at: string | null };
+    expect(raw.ending_at).not.toBeNull();
+    await broker.tick();
+    await broker.settle();
+    expect(store.events(run.id).filter((e) => e.type === 'run_ended')).toHaveLength(1);
+  });
+
+  it('tick leaves a run alone while an endRun for it is in progress in this process', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    // Hold the repository lock with a request_merge blocked in commitAll, so endRun waits for it.
+    let release!: () => void;
+    const hold = new Promise<void>((r) => { release = r; });
+    let entered!: () => void;
+    const inside = new Promise<void>((r) => { entered = r; });
+    broker = new Broker({
+      store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock,
+      git: { ...Git, commitAll: async (...args: Parameters<typeof Git.commitAll>) => { entered(); await hold; return Git.commitAll(...args); } },
+    });
+    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: w.id }, caller: LEAD });
+    await inside;
+    const ending = broker.endRun(run.id, false);
+    await new Promise((r) => setTimeout(r, 10));
+    age(run.id, ENDING_RETRY_MS + 60_000);
+    await broker.tick(); // must not queue a second stop behind the waiting endRun
+    expect(store.run(run.id)!.status).toBe('active');
+    release();
+    await merging;
+    await ending;
+    await broker.settle();
+    expect(store.run(run.id)!.status).toBe('ended');
+    expect(store.events(run.id).filter((e) => e.type === 'run_ended').map((e) => e.data)).toEqual([{ removeWorktrees: false }]);
   });
 });
 

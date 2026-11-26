@@ -244,7 +244,7 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null, cleanup: Clea
       const gate = run?.gates.find((g) => g.id === gateId)
         ?? [...(run?.gates ?? [])].reverse().find((g) => g.kind === kind && (kind === 'plan' || g.subjectAgent === args.worker));
       const st = gate?.status ?? (ctx.status === 'running' ? 'pending' : 'unknown');
-      const badge = `<span class="cat-b ${st === 'approved' ? 'ok' : st === 'rejected' || st === 'expired' ? 'bad' : 'run'}">${st === 'pending' ? '<span class="cat-dot"></span>' : ''}${esc(st)}</span>`;
+      const badge = `<span class="cat-b ${st === 'approved' ? 'ok' : st === 'rejected' || st === 'expired' || st === 'failed' ? 'bad' : 'run'}">${st === 'pending' ? '<span class="cat-dot"></span>' : ''}${esc(st)}</span>`;
       const title = kind === 'plan' ? 'Plan approval' : `Merge approval · ${String(args.worker ?? '')}`;
       const body = String(kind === 'plan' ? args.plan ?? '' : args.note ?? gate?.payload ?? '');
       const hint = st === 'pending' ? '<div class="cat-a m">Waiting for you: answer the form below, or in the CoAgent tab.</div>' : '';

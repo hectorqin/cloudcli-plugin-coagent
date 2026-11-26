@@ -170,6 +170,29 @@ export const Git = {
     }
   },
 
+  /**
+   * Removes `worktreePath` only if it is still a linked worktree of `repoCwd`'s repository checked out on `branch`.
+   * A stored path can be stale: the directory may since belong to another repository or run, so anything else is
+   * refused (throws) and left alone. 'gone' = nothing is on disk any more (a stale registration is pruned).
+   */
+  async removeOwnedWorktree(repoCwd: string, worktreePath: string, branch: string): Promise<'removed' | 'gone'> {
+    const entries = parseWorktreeList(await git(repoCwd, 'worktree', 'list', '--porcelain'));
+    const target = canonical(worktreePath);
+    const index = entries.findIndex((e) => canonical(e.path) === target);
+    const exists = fs.existsSync(worktreePath);
+    if (index < 0) {
+      if (!exists) return 'gone';
+      throw new Error(`${worktreePath} is not a worktree of ${repoCwd}; it was left in place`);
+    }
+    if (index === 0) throw new Error(`${worktreePath} is the main working tree of ${repoCwd}; it was left in place`);
+    if (entries[index].branch !== branch) {
+      throw new Error(`${worktreePath} is checked out on ${entries[index].branch ?? 'a detached HEAD'}, not ${branch}; it was left in place`);
+    }
+    if (!exists) { await git(repoCwd, 'worktree', 'prune'); return 'gone'; }
+    await git(repoCwd, 'worktree', 'remove', worktreePath);
+    return 'removed';
+  },
+
   async removeWorktree(worktreePath: string): Promise<void> {
     const root = await Git.repoRoot(worktreePath);
     if (!root) return;
@@ -190,5 +213,26 @@ export const Git = {
     }
   },
 };
+
+/** One entry of `git worktree list --porcelain`. */
+export interface WorktreeEntry { path: string; branch: string | null }
+
+export function parseWorktreeList(porcelain: string): WorktreeEntry[] {
+  const out: WorktreeEntry[] = [];
+  for (const block of porcelain.split(/\n\s*\n/)) {
+    let wt: string | null = null;
+    let branch: string | null = null;
+    for (const line of block.split('\n')) {
+      if (line.startsWith('worktree ')) wt = line.slice('worktree '.length);
+      else if (line.startsWith('branch ')) branch = line.slice('branch '.length).replace(/^refs\/heads\//, '');
+    }
+    if (wt) out.push({ path: wt, branch });
+  }
+  return out;
+}
+
+function canonical(p: string): string {
+  try { return fs.realpathSync(p); } catch { return path.resolve(p); }
+}
 
 export type GitOps = typeof Git;
