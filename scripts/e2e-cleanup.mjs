@@ -80,31 +80,6 @@ function ownedDbRows(dbPath, tempRoot) {
   }
 }
 
-function deleteDbRows(dbPath, rows) {
-  const counts = { scheduled_messages: 0, superseded_provider_sessions: 0, sessions: 0, projects: 0 };
-  if (!fs.existsSync(dbPath)) return counts;
-  const db = new DatabaseSync(dbPath);
-  try {
-    db.exec('PRAGMA busy_timeout = 10000');
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      for (const { session_id: id } of rows.sessions) {
-        counts.scheduled_messages += Number(db.prepare('DELETE FROM scheduled_messages WHERE session_id = ?').run(id).changes);
-        counts.superseded_provider_sessions += Number(db.prepare('DELETE FROM superseded_provider_sessions WHERE session_id = ?').run(id).changes);
-        counts.sessions += Number(db.prepare('DELETE FROM sessions WHERE session_id = ?').run(id).changes);
-      }
-      for (const { project_id: id } of rows.projects) counts.projects += Number(db.prepare('DELETE FROM projects WHERE project_id = ?').run(id).changes);
-      db.exec('COMMIT');
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
-  } finally {
-    db.close();
-  }
-  return counts;
-}
-
 /**
  * Exact transcript files to remove: jsonl paths of owned DB rows (Claude or Codex), plus the expected Claude
  * transcript of each of the run's own Claude agents (`<claudeRoot>/<encoded cwd>/<session id>.jsonl`).
@@ -130,6 +105,7 @@ function transcriptCandidates(rows, agents, tempRoot, claudeRoot) {
 export async function cleanupTempRoot({
   tempRoot, tmpDir = os.tmpdir(), dbPath, claudeRoot, codexRoot, broker, sessionStatus, captured = [],
   waitMs = 60_000, pollMs = 2_000, sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  beforeDelete, // test hook: runs between planning and deleting
 }) {
   assertCleanupRoot(tempRoot, tmpDir);
   const problems = [];
@@ -202,12 +178,118 @@ export async function cleanupTempRoot({
     };
   }
 
-  // 4. Delete exactly the planned targets.
-  const counts = deleteDbRows(dbPath, rows);
-  for (const file of plan.files) { fs.rmSync(file); removed.push(file); }
-  for (const dir of [...plan.artifactDirs, ...plan.projectDirs]) { fs.rmSync(dir, { recursive: true }); removed.push(dir); }
-  if (plan.root) { fs.rmSync(plan.root, { recursive: true, force: true }); removed.push(plan.root); }
-  return { ok: true, endedRuns, rows: counts, removed, kept: plan.kept, problems: [], manual: [] };
+  // 4. Delete exactly the planned targets, re-checking each one (things can change between plan and delete).
+  await beforeDelete?.();
+  const done = executeDeletions({ dbPath, rows, plan, claudeRoot, codexRoot, tmpDir });
+  return {
+    ok: done.problems.length === 0, endedRuns, rows: done.counts, removed: done.removed, kept: done.kept, problems: done.problems,
+    manual: done.problems.length ? manualSteps(tempRoot, runs, rows) : [],
+  };
+}
+
+const zeroCounts = () => ({ scheduled_messages: 0, superseded_provider_sessions: 0, sessions: 0, projects: 0 });
+
+/** Problems with any planned filesystem target as it is now (empty = all still valid). */
+function revalidate(plan, { claudeRoot, codexRoot, tmpDir }) {
+  const problems = [];
+  const present = (p) => fs.existsSync(p) || isSymlink(p);
+  for (const file of plan.files) {
+    const root = isInside(claudeRoot, file) ? claudeRoot : codexRoot;
+    if (present(file) && !(safeExisting(root, file) && fs.lstatSync(file).isFile())) problems.push(`changed since it was checked: ${file}`);
+  }
+  for (const dir of [...plan.artifactDirs, ...plan.projectDirs]) {
+    if (present(dir) && !(safeExisting(claudeRoot, dir) && fs.lstatSync(dir).isDirectory())) problems.push(`changed since it was checked: ${dir}`);
+  }
+  if (plan.root && present(plan.root)) {
+    try { assertCleanupRoot(plan.root, tmpDir); } catch (error) { problems.push(error.message); }
+  }
+  return problems;
+}
+
+/** Removes `dir` only if it holds nothing but (recursively) empty directories; rmdir only, never a recursive delete. */
+function removeEmptyTree(dir) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !removeEmptyTree(path.join(dir, entry.name))) return false;
+  }
+  fs.rmdirSync(dir);
+  return true;
+}
+
+/**
+ * Deletes the planned rows and paths. The DB rows are deleted inside one BEGIN IMMEDIATE transaction, each
+ * conditioned on the ownership fields read during planning, and committed only after the filesystem work succeeded.
+ * Any mismatch or change found on the way rolls the rows back and stops: the result is incomplete, never a guess.
+ */
+function executeDeletions({ dbPath, rows, plan, claudeRoot, codexRoot, tmpDir }) {
+  const counts = zeroCounts();
+  const removed = [];
+  const kept = [...plan.kept];
+  const problems = [];
+  const db = fs.existsSync(dbPath) ? new DatabaseSync(dbPath) : null;
+  try {
+    db?.exec('PRAGMA busy_timeout = 10000');
+    db?.exec('BEGIN IMMEDIATE');
+    if (db) {
+      for (const row of rows.sessions) {
+        const n = Number(db.prepare('DELETE FROM sessions WHERE session_id = ? AND project_path = ? AND jsonl_path IS ?')
+          .run(row.session_id, row.project_path, row.jsonl_path ?? null).changes);
+        if (n !== 1) { problems.push(`CloudCLI session ${row.session_id} changed since it was checked`); continue; }
+        counts.sessions += n;
+        counts.scheduled_messages += Number(db.prepare('DELETE FROM scheduled_messages WHERE session_id = ?').run(row.session_id).changes);
+      }
+      for (const row of rows.superseded) {
+        counts.superseded_provider_sessions += Number(db.prepare('DELETE FROM superseded_provider_sessions WHERE session_id = ? AND jsonl_path IS ?')
+          .run(row.session_id, row.jsonl_path ?? null).changes);
+      }
+      for (const row of rows.projects) {
+        const n = Number(db.prepare('DELETE FROM projects WHERE project_id = ? AND project_path = ?').run(row.project_id, row.project_path).changes);
+        if (n !== 1) problems.push(`CloudCLI project ${row.project_id} changed since it was checked`);
+        else counts.projects += n;
+      }
+    }
+    if (!problems.length) problems.push(...revalidate(plan, { claudeRoot, codexRoot, tmpDir }));
+    if (!problems.length) {
+      // Each target is checked again right before it goes.
+      for (const file of plan.files) {
+        if (!fs.existsSync(file) && !isSymlink(file)) continue; // already gone
+        const root = isInside(claudeRoot, file) ? claudeRoot : codexRoot;
+        if (!(safeExisting(root, file) && fs.lstatSync(file).isFile())) { problems.push(`changed while deleting: ${file}`); break; }
+        fs.rmSync(file);
+        removed.push(file);
+      }
+    }
+    if (!problems.length) {
+      for (const dir of plan.artifactDirs) {
+        if (!fs.existsSync(dir) && !isSymlink(dir)) continue;
+        if (!(safeExisting(claudeRoot, dir) && fs.lstatSync(dir).isDirectory())) { problems.push(`changed while deleting: ${dir}`); break; }
+        fs.rmSync(dir, { recursive: true }); // a planned per-session artifact dir (rm does not follow symlinks inside)
+        removed.push(dir);
+      }
+    }
+    if (!problems.length) {
+      for (const dir of plan.projectDirs) {
+        if (!fs.existsSync(dir)) continue;
+        if (!safeExisting(claudeRoot, dir)) { problems.push(`changed while deleting: ${dir}`); break; }
+        if (removeEmptyTree(dir)) removed.push(dir); else kept.push(dir); // something new appeared: keep it
+      }
+    }
+    if (!problems.length && plan.root && fs.existsSync(plan.root)) {
+      assertCleanupRoot(plan.root, tmpDir);
+      fs.rmSync(plan.root, { recursive: true, force: true });
+      removed.push(plan.root);
+    }
+    if (problems.length) {
+      db?.exec('ROLLBACK');
+      return { counts: zeroCounts(), removed, kept: [...kept, ...(plan.root && fs.existsSync(plan.root) ? [plan.root] : [])], problems };
+    }
+    db?.exec('COMMIT');
+    return { counts, removed, kept, problems };
+  } catch (error) {
+    try { db?.exec('ROLLBACK'); } catch { /* not in a transaction */ }
+    return { counts: zeroCounts(), removed, kept, problems: [...problems, `cleanup failed: ${error.message}`] };
+  } finally {
+    db?.close();
+  }
 }
 
 /**

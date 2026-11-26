@@ -37,4 +37,6 @@ export function cleanupTempRoot(opts: {
   waitMs?: number;
   pollMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /** Test hook: runs between planning and deleting. */
+  beforeDelete?: () => void | Promise<void>;
 }): Promise<CleanupResult>;

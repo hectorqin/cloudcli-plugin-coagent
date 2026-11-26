@@ -35,7 +35,9 @@ runs, pass or fail, from the moment the temp root exists, and only touches that 
 4. Otherwise it deletes the CloudCLI rows (`sessions`, `superseded_provider_sessions`, `scheduled_messages`,
    `projects`) whose project path is inside the root, and the exact transcript files named by those rows or by the
    run's own Claude agents. A Claude project dir is removed only if no file is left in it. It never scans by name
-   prefix and never follows a symlink. Finally it removes the root.
+   prefix and never follows a symlink. Finally it removes the root. Each target is checked again right before it
+   goes. The rows are deleted in one transaction, only if their project and transcript paths are unchanged, and
+   committed after the files. Any change found on the way rolls the rows back and reports the cleanup as incomplete.
 
 It prints `PASS`/`FAIL` per provider, the removed and kept paths, and a `SUMMARY` line.
 
@@ -63,7 +65,8 @@ approval (the same task as Part 1 is fine). Keep the lead chat, the CoAgent tab 
   and updates the worker status and up to three recent activity lines without a reload. When the worker reports,
   the card settles on the result.
 - [ ] Pass  [ ] Fail — **Plan and merge cards.** Expected: `submit_plan` / `request_merge` cards show the gate state
-  (pending → approved/rejected/expired). The merge card lists the changed files, including `hello.txt`.
+  (pending → approved/rejected/expired/failed). The merge card lists the changed files, including `hello.txt`.
+  A merge that git could not complete (conflict, dirty lead tree) shows `failed`, never `approved`.
 - [ ] Pass  [ ] Fail — **Fallback.** Expected: with the stock (unpatched) CloudCLI, the same calls fall back to the
   default tool display and the flow still completes.
 
@@ -115,6 +118,8 @@ Notes: ______________________________________________________________________
 - [ ] Pass  [ ] Fail — **End run.** Expected: ending the run (optionally deleting unmerged worktrees) marks it ended;
   any pending gate becomes `expired` and the run list shows no pending approvals for it. A lead waiting on a gate or
   in `wait_for_agents` is told the run ended. If a worker is still mid-turn, its worktree is kept (not deleted).
+  While the stop is in progress, the run shows **Ending…**, and End run, approve/reject, messages and End agent are
+  disabled. Diagnostics list the ending run with its age, and the broker finishes a stop stuck for over 30 s.
 
 Notes: ______________________________________________________________________
 

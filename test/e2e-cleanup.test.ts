@@ -231,6 +231,74 @@ describe('e2e cleanup', () => {
     expect(res.manual.length).toBeGreaterThan(0);
   });
 
+  describe('races between planning and deleting', () => {
+    function setup() {
+      const dir = path.join(claudeRoot, claudeProjectDirName(repo));
+      const lead = write(path.join(dir, 'lead-sess.jsonl'));
+      addSession('lead-sess', repo, lead);
+      const codex = write(path.join(codexRoot, 'rollout-ok.jsonl'));
+      addSession('coder-codex', path.join(tempRoot, 'repo-worktrees', 'wt'), codex);
+      return { dir, lead, codex };
+    }
+    const nothingDeleted = (res: Awaited<ReturnType<typeof cleanupTempRoot>>, files: string[]) => {
+      expect(res.ok).toBe(false);
+      expect(res.rows).toEqual({ scheduled_messages: 0, superseded_provider_sessions: 0, sessions: 0, projects: 0 });
+      expect(count('sessions')).toBe(2);
+      expect(count('projects')).toBe(2);
+      for (const f of files) expect(fs.existsSync(f), f).toBe(true);
+      expect(fs.existsSync(tempRoot)).toBe(true);
+      expect(res.kept).toContain(tempRoot);
+      expect(res.manual.length).toBeGreaterThan(0);
+    };
+
+    it('a transcript swapped for a symlink after planning: rows rolled back, nothing deleted', async () => {
+      const { lead, codex } = setup();
+      const precious = write(path.join(base, 'outside', 'precious.jsonl'), 'precious');
+      const res = await cleanupTempRoot({ ...opts(fakeBroker().broker), beforeDelete: () => {
+        fs.rmSync(codex);
+        fs.symlinkSync(precious, codex);
+      } });
+      expect(res.problems.join('\n')).toMatch(/changed since it was checked: .*rollout-ok\.jsonl/);
+      nothingDeleted(res, [lead, codex]);
+      expect(fs.readFileSync(precious, 'utf8')).toBe('precious');
+      expect(res.removed).toEqual([]);
+    });
+
+    it('a CloudCLI row whose ownership fields changed after planning: rows rolled back, nothing deleted', async () => {
+      const { lead, codex } = setup();
+      const res = await cleanupTempRoot({ ...opts(fakeBroker().broker), beforeDelete: () => {
+        const d = db();
+        d.prepare('UPDATE sessions SET jsonl_path = ? WHERE session_id = ?').run('/somewhere/else.jsonl', 'lead-sess');
+        d.close();
+      } });
+      expect(res.problems.join('\n')).toMatch(/session lead-sess changed since it was checked/);
+      nothingDeleted(res, [lead, codex]);
+      expect(res.removed).toEqual([]);
+    });
+
+    it('a file that appears in a planned project dir keeps the dir and that file', async () => {
+      const { dir, lead, codex } = setup();
+      let late = '';
+      const res = await cleanupTempRoot({ ...opts(fakeBroker().broker), beforeDelete: () => {
+        late = write(path.join(dir, 'memory', 'late-note.md'));
+      } });
+      expect(res.ok).toBe(true);
+      expect(fs.existsSync(lead)).toBe(false);
+      expect(fs.existsSync(codex)).toBe(false);
+      expect(fs.readFileSync(late, 'utf8')).toBe('x');
+      expect(res.kept).toContain(dir);
+      expect(fs.existsSync(tempRoot)).toBe(false);
+    });
+
+    it('a planned file that vanished meanwhile is not an error', async () => {
+      const { lead } = setup();
+      const res = await cleanupTempRoot({ ...opts(fakeBroker().broker), beforeDelete: () => fs.rmSync(lead) });
+      expect(res.ok).toBe(true);
+      expect(count('sessions')).toBe(0);
+      expect(fs.existsSync(tempRoot)).toBe(false);
+    });
+  });
+
   it('safeExisting rejects paths outside the root or through a symlink', () => {
     const inside = write(path.join(claudeRoot, 'd', 'f.jsonl'));
     expect(safeExisting(claudeRoot, inside)).toBe(fs.realpathSync(inside));
