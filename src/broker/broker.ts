@@ -6,9 +6,10 @@ import type {
 } from '../shared/protocol.js';
 import { SUPPORTED_PROVIDERS } from '../shared/protocol.js';
 import type { CloudCli } from './cloudcli.js';
-import type { GitOps } from './git.js';
+import type { GitOps, WorkingTreeSnapshot } from './git.js';
 import type { Prompts } from './prompts.js';
 import type { Store } from './store.js';
+import { DEFAULT_QUOTA_BACKOFF_MINUTES, detectQuota, formatUtc, type QuotaHit } from './quota.js';
 import { extractUsage, type TurnUsage } from './usage.js';
 
 export const MAX_WORKERS = 4;
@@ -26,8 +27,13 @@ const LEASE_MS = 15_000;
  */
 export const DISPATCH_LEASE_MS = 120_000;
 const FINISHED_STATUSES = new Set(['idle', 'reported', 'merged', 'error', 'ended', 'interrupted']);
-/** Statuses that never receive pushed turns (an interrupted worker waits for the lead to decide). */
-const NO_DELIVERY = new Set(['merged', 'ended', 'interrupted']);
+/**
+ * Statuses that never receive pushed turns: an interrupted worker waits for the lead to decide; a paused one waits for
+ * its resume time (messages to it stay queued until then).
+ */
+const NO_DELIVERY = new Set(['merged', 'ended', 'interrupted', 'paused']);
+/** Statuses the tab's Resume action applies to (a paused worker resumes early). */
+const RESUMABLE = new Set(['paused', 'error', 'interrupted']);
 const ORPHAN_NOTE = 'Their turn may have partially executed (files half-edited, commands run), so their task was NOT '
   + 're-sent automatically.';
 
@@ -129,6 +135,8 @@ export class Broker {
   private endRunsInProgress = new Map<string, number>();
   /** Runs whose stalled stop tick() is finishing right now. */
   private finishing = new Set<string>();
+  /** Workers being handed off right now: no new turn may start for them while their worktree is copied. */
+  private handingOff = new Set<string>();
   private checkingDetached = false;
   private now: () => number;
   private log: (...args: unknown[]) => void;
@@ -147,6 +155,15 @@ export class Broker {
       if (!SUPPORTED_PROVIDERS.includes(p as Provider)) fail(`unsupported provider "${p}" for role "${role}"`);
     }
     this.d.store.setJson('roleProviders', map);
+  }
+  /** Wait before auto-resuming a worker paused by a quota error whose text gives no reset time. */
+  quotaBackoffMinutes(): number {
+    const v = this.d.store.getJson<number>('quotaBackoffMinutes', DEFAULT_QUOTA_BACKOFF_MINUTES);
+    return Number.isFinite(v) && v > 0 ? v : DEFAULT_QUOTA_BACKOFF_MINUTES;
+  }
+  setQuotaBackoffMinutes(v: unknown) {
+    if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0 || v > 7 * 24 * 60) fail('quotaBackoffMinutes must be a number of minutes (> 0, at most a week)');
+    this.d.store.setJson('quotaBackoffMinutes', v);
   }
 
   // ── MCP tools ─────────────────────────────────────────────────────
@@ -262,7 +279,7 @@ export class Broker {
         if (!target || target.runId !== run.id) fail(`No agent "${toRaw}" in this run. Use list_agents.`);
         if (target!.status === 'merged' || target!.status === 'ended') fail(`${to} is ${target!.status} and no longer receives messages.`);
         if (to === agent.id) fail('You cannot message yourself.');
-        const wait = this.slotWait(target!);
+        const wait = this.slotWait(target!) ?? this.pausedWait(target!);
         store.addMessage(run.id, agent.id, to, 'message', str(a.body, 'body'));
         this.resume(target!);
         this.kick();
@@ -298,6 +315,7 @@ export class Broker {
         if (w!.status === 'merged') fail(`${wid} is already merged.`);
         if (w!.status === 'ended') fail(`${wid} was ended.`);
         if (w!.status === 'interrupted') fail(`${wid} is interrupted; resume or rework it before requesting a merge.`);
+        if (w!.status === 'paused') fail(`${wid} is paused by a provider limit mid-task; let it resume (or handoff_agent it) before requesting a merge.`);
         if (this.workerInFlight(wid)) fail(`${wid} is still running; wait for it to finish before requesting a merge.`);
         const note = typeof a.note === 'string' && a.note.trim() ? a.note.trim() : (w!.result ?? '(no summary)');
         const worktreePath = w!.worktreePath!;
@@ -339,6 +357,14 @@ export class Broker {
         return this.endAgent(wid, a.remove_worktree === true, lead.id);
       }
 
+      case 'handoff_agent': {
+        requireLead();
+        const wid = str(a.worker, 'worker');
+        const provider = str(a.provider, 'provider') as Provider;
+        const note = typeof a.note === 'string' && a.note.trim() ? a.note.trim() : null;
+        return this.handoffAgent(run.id, lead, wid, provider, note);
+      }
+
       case 'gate_wait':
       case 'gate_decide': {
         requireLead();
@@ -362,6 +388,7 @@ export class Broker {
       case 'list_agents': {
         const rows = store.agents(run.id).map((x) =>
           `- ${x.id}${x.id === agent.id ? ' (you)' : ''}: role=${x.role} provider=${x.provider} status=${x.status}`
+          + `${x.status === 'paused' && x.resumeAt ? ` (auto-resume at ${formatUtc(Date.parse(x.resumeAt))})` : ''}`
           + `${store.busy.has(x.id) ? ' [running]' : ''} cwd=${x.cwd}${x.branch ? ` branch=${x.branch}` : ''}`);
         return `Run ${run.id} (plan: ${run.planStatus})\n${rows.join('\n')}`;
       }
@@ -539,7 +566,7 @@ export class Broker {
     const a = store.agent(agentId) ?? fail(`No agent ${agentId}`);
     if (!this.runOpen(a.runId)) fail('This run has ended.', 409);
     if (a.status === 'merged' || a.status === 'ended') fail(`${a.id} is ${a.status} and no longer receives messages.`);
-    const wait = this.slotWait(a);
+    const wait = this.slotWait(a) ?? this.pausedWait(a);
     store.addMessage(a.runId, null, a.id, 'message', str(body, 'body'));
     this.resume(a);
     this.kick();
@@ -554,12 +581,12 @@ export class Broker {
 
   /**
    * Whether a worker takes one of the MAX_WORKERS slots: it is working (or its turn outlived a restart), it is
-   * interrupted, it has work queued or in flight, or it is a writer whose unmerged worktree could still be merged.
+   * interrupted or paused (it will continue), it has work queued or in flight, or it is a writer whose unmerged worktree could still be merged.
    * Finished read-only workers without pending messages, and ended/merged workers, hold none.
    */
   private holdsSlot(a: AgentDTO, countPending = true): boolean {
     if (a.role === 'lead' || GONE.has(a.status)) return false;
-    if (a.busy || this.detached.has(a.id) || ['starting', 'running', 'interrupted'].includes(a.status)) return true;
+    if (a.busy || this.detached.has(a.id) || ['starting', 'running', 'interrupted', 'paused'].includes(a.status)) return true;
     if (a.branch && a.worktreePath) return true;
     return countPending && this.d.store.pendingCount(a.id) > 0;
   }
@@ -582,6 +609,90 @@ export class Broker {
     this.d.store.addEvent(a.runId, a.id, 'recovered', { status: 'resumed' });
   }
 
+  /** A message to a paused worker waits for its resume. null when it is not paused. */
+  private pausedWait(a: AgentDTO): string | null {
+    if (a.status !== 'paused') return null;
+    return `${a.id} is paused by a provider ${a.pauseReason ?? 'limit'} until ${a.resumeAt ? formatUtc(Date.parse(a.resumeAt)) : 'its quota resets'}; `
+      + 'the message is delivered when it resumes in its session.';
+  }
+
+  /**
+   * A worker's turn failed on a provider usage/rate limit: pause it until the quota resets (or the configured backoff)
+   * instead of marking it failed. `nudge`: CloudCLI had accepted the turn, so the resume must tell it that the turn was
+   * cut off. Messages carried by a turn that was never accepted are back in the queue and are simply delivered then.
+   */
+  private pause(agent: AgentDTO, hit: QuotaHit, error: string, nudge: boolean) {
+    const { store } = this.d;
+    const guessed = hit.resetAt === null;
+    const at = hit.resetAt ?? this.now() + this.quotaBackoffMinutes() * 60_000;
+    const resumeAt = new Date(at).toISOString();
+    const lead = store.run(agent.runId)!.leadAgentId;
+    store.transaction(() => {
+      store.pauseAgent(agent.id, resumeAt, hit.reason, nudge, error);
+      store.addEvent(agent.runId, agent.id, 'paused', { reason: hit.reason, resumeAt, guessed, error });
+      store.addMessage(agent.runId, null, lead, 'system',
+        `${agent.id} paused (${hit.reason}), auto-resume at ${formatUtc(at)}${guessed
+          ? ` (the error gives no reset time, so the broker retries after ${this.quotaBackoffMinutes()} min)` : ''}.\n`
+        + `Provider error: ${error}\n`
+        + `It keeps its worker slot and resumes in its own session; messages to it are delivered then. Usually just `
+        + `call wait_for_agents again. To continue now on another provider, call handoff_agent; or end_agent it.`);
+    });
+    this.backoff.delete(agent.id);
+    this.log('worker paused', { runId: agent.runId, agentId: agent.id, reason: hit.reason, resumeAt });
+  }
+
+  /**
+   * Continues a paused, failed or interrupted worker in its own session (tick() for a due pause, or the user's Resume
+   * button). It goes idle and, when it was cut off mid-turn, gets one resume message. That message is an ordinary
+   * delivery: never repeated, and if this turn hits the limit again the worker is paused again with a fresh time.
+   */
+  resumeWorker(agentId: string, by: 'auto' | 'user'): string {
+    const { store } = this.d;
+    const a = store.agent(agentId) ?? fail(`No agent ${agentId}`, 404);
+    if (!this.runOpen(a.runId)) fail('This run has ended.', 409);
+    if (a.role === 'lead') fail('The lead cannot be resumed this way.', 400);
+    if (!RESUMABLE.has(a.status)) fail(`${a.id} is ${a.status}; only paused, failed or interrupted workers can be resumed.`, 409);
+    if (this.workerInFlight(a.id) || this.handingOff.has(a.id)) fail(`${a.id} is busy; try again when its turn is over.`, 409);
+    const reason = a.status === 'paused' ? a.pauseReason ?? 'provider limit'
+      : a.status === 'interrupted' ? 'interrupted' : `error: ${clipLine(a.lastError ?? 'unknown error', 200)}`;
+    const nudge = a.status !== 'paused' || store.pauseNudge(a.id);
+    store.transaction(() => {
+      store.clearPause(a.id, 'idle');
+      if (nudge) store.addMessage(a.runId, null, a.id, 'system', resumeText(a, reason));
+      store.addEvent(a.runId, a.id, 'resumed', { by, from: a.status, reason, nudge });
+    });
+    this.backoff.delete(a.id);
+    this.deliver(a.id);
+    return `Resumed ${a.id} in its own session${nudge ? '' : ' (its queued messages are delivered now)'}.`;
+  }
+
+  /** The user cancelled a paused worker's auto-resume: it becomes interrupted and the lead decides. */
+  cancelAutoResume(agentId: string): string {
+    const { store } = this.d;
+    const a = store.agent(agentId) ?? fail(`No agent ${agentId}`, 404);
+    if (!this.runOpen(a.runId)) fail('This run has ended.', 409);
+    if (a.status !== 'paused') fail(`${a.id} is ${a.status}, not paused.`, 409);
+    const lead = store.run(a.runId)!.leadAgentId;
+    store.transaction(() => {
+      store.clearPause(a.id, 'interrupted');
+      store.addEvent(a.runId, a.id, 'resume_cancelled', { by: 'user', reason: a.pauseReason });
+      store.addMessage(a.runId, null, lead, 'system',
+        `The user cancelled the auto-resume of ${a.id} (paused by a provider ${a.pauseReason ?? 'limit'}). It is now `
+        + 'interrupted and waits for you: send_message it to continue in its session, handoff_agent it to another '
+        + 'provider, or end_agent it.');
+    });
+    this.kick();
+    return `Cancelled the auto-resume of ${a.id}; the lead was told.`;
+  }
+
+  /** tick(): resumes every paused worker whose time has come (never in a run that is ending or ended). */
+  private resumeDue() {
+    for (const { id, runId } of this.d.store.pausedDue(new Date(this.now()))) {
+      if (!this.runOpen(runId) || this.workerInFlight(id) || this.handingOff.has(id)) continue;
+      try { this.resumeWorker(id, 'auto'); } catch (e) { this.log('auto-resume failed', { runId, agentId: id, error: e }); }
+    }
+  }
+
   /**
    * Ends one worker (lead tool `end_agent`, or the user from the tab): it stops receiving messages and frees its
    * slot. Its worktree is only deleted when asked; its branch is always kept. `by` null = the user.
@@ -595,6 +706,7 @@ export class Broker {
       if (w.id === run.leadAgentId) fail('The lead cannot be ended this way; end the run instead.');
       if (GONE.has(w.status)) fail(`${w.id} is already ${w.status}.`);
       if (store.busy.has(w.id)) fail(`${w.id} is in the middle of a turn; wait for it to finish, then end it.`);
+      if (this.handingOff.has(w.id)) fail(`${w.id} is being handed off right now.`);
       return { w, run };
     };
     const first = check();
@@ -618,9 +730,11 @@ export class Broker {
         if (gate && store.decideGate(gate.id, 'rejected', `${w.id} was ended`)) {
           store.addEvent(run.id, by, 'gate_decided', { gate: gate.id, kind: 'merge', subject: w.id, status: 'rejected', comment: 'worker ended' });
         }
-        store.updateAgent(w.id, { status: 'ended' });
+        store.clearPause(w.id, 'ended'); // also cancels a pending auto-resume
         cancelled = store.cancelQueued(w.id);
-        store.addEvent(run.id, w.id, 'agent_ended', { by: by ?? 'user', removeWorktree, cancelled });
+        store.addEvent(run.id, w.id, 'agent_ended', {
+          by: by ?? 'user', removeWorktree, cancelled, ...(w.status === 'paused' ? { cancelledResume: true } : {}),
+        });
         if (by === null) {
           store.addMessage(run.id, null, run.leadAgentId, 'system',
             `The user ended ${w.id}. It no longer receives messages and no longer counts as a worker.`);
@@ -633,6 +747,112 @@ export class Broker {
       const dropped = cancelled ? ` ${cancelled} undelivered message(s) to it were cancelled.` : '';
       return `Ended ${w.id}; its worker slot is free.${dropped}${cleanup}`;
     });
+  }
+
+  /**
+   * Lead tool `handoff_agent`: moves a stopped worker's job to a new worker of the same role on `provider`, automating
+   * what a lead would otherwise do by hand (end the old worker, spawn a new one, carry over its branch and changes).
+   *  - Refused while the worker runs a turn (here, or per CloudCLI's session status).
+   *  - Writers: under the repository lock, the old worktree's full content (commits, uncommitted and untracked files)
+   *    is captured without modifying it; the new worktree starts at the old HEAD and gets the uncommitted content,
+   *    verified to be the identical tree. Any failure leaves everything as it was.
+   *  - Read-only roles just start on `provider` in the lead's directory.
+   * Then, in one transaction: the old worker ends (worktree and branch kept, slot freed, queued messages cancelled,
+   * pending merge gate rejected) and the new one is created with a hand-over task. Event `handoff` {from, to, provider}.
+   */
+  private async handoffAgent(runId: string, lead: AgentDTO, wid: string, provider: Provider, note: string | null): Promise<string> {
+    const { store, git } = this.d;
+    if (!SUPPORTED_PROVIDERS.includes(provider)) fail(`Unsupported provider "${provider}". Use one of: ${SUPPORTED_PROVIDERS.join(', ')}.`);
+    const check = (mine = false) => {
+      const w = store.agent(wid);
+      if (!w || w.runId !== runId) return fail(`No worker "${wid}" in this run.`);
+      if (w.id === lead.id) fail('The lead cannot be handed off.');
+      if (!this.runOpen(runId)) fail('This run has ended.');
+      if (GONE.has(w.status)) fail(`${wid} is ${w.status}; there is nothing to hand off.`);
+      if (this.workerInFlight(wid) || w.status === 'running') {
+        fail(`${wid} is in the middle of a turn; wait for it to finish (or fail or pause), then hand it off.`);
+      }
+      if (!mine && this.handingOff.has(wid)) fail(`${wid} is already being handed off.`);
+      if (!READONLY_ROLES.has(w.role) && (!w.branch || !w.worktreePath)) fail(`${wid} has no worktree to hand off.`);
+      return w;
+    };
+    check();
+    // CloudCLI may still run a turn this process does not know about (e.g. started from its own tab).
+    const processing = await this.processing(check());
+    if (processing === true) fail(`${wid}'s session is still running a turn in CloudCLI; wait for it to finish, then hand it off.`);
+    const old = check(); // re-checked after the await; from here until the end no turn can start for it
+    this.handingOff.add(wid);
+    let out: { id: string; cwd: string; branch: string | null; snap: WorkingTreeSnapshot | null; gate: number | null; carriedMessages: number };
+    try {
+      out = await this.withLeadRepo(lead, async () => {
+        check(true);
+        const id = this.uniqueId(old.role, (x) => !!store.agent(x));
+        let snap: WorkingTreeSnapshot | null = null;
+        let worktreePath: string | null = null;
+        let branch: string | null = null;
+        if (!READONLY_ROLES.has(old.role)) {
+          try { snap = await git.snapshotWorkingTree(old.worktreePath!); } catch (e) {
+            fail(`Could not read the worktree of ${wid} (${old.worktreePath}): ${firstLine(e)}. Nothing was changed.`);
+          }
+          try {
+            ({ worktreePath, branch } = await git.createWorktree(lead.cwd, runId, id, snap!.head));
+          } catch (e) {
+            fail(`Could not create a worktree for the new ${old.role}: ${firstLine(e)}. Nothing was changed.`);
+          }
+          try { await git.restoreWorkingTree(worktreePath!, snap!); } catch (e) {
+            await git.discardWorktree(lead.cwd, worktreePath!, branch!);
+            fail(`Handoff aborted: carrying over the uncommitted changes of ${wid} failed (${firstLine(e)}). `
+              + `Nothing was changed; ${wid} and its worktree ${old.worktreePath} are untouched.`);
+          }
+        }
+        const cwd = worktreePath ?? lead.cwd;
+        try {
+          return store.transaction(() => {
+            const cur = check(true);
+            const undelivered = store.undelivered(cur.id);
+            const pending = store.pendingGate(runId, 'merge', cur.id);
+            const gate = pending && store.decideGate(pending.id, 'rejected', `${cur.id} was handed off to ${id}`) ? pending.id : null;
+            if (gate !== null) {
+              store.addEvent(runId, lead.id, 'gate_decided', { gate, kind: 'merge', subject: cur.id, status: 'rejected', comment: `handed off to ${id}` });
+            }
+            store.clearPause(cur.id, 'ended');
+            const cancelled = store.cancelQueued(cur.id);
+            store.addEvent(runId, cur.id, 'agent_ended', { by: lead.id, removeWorktree: false, cancelled, handoff: id });
+            const used = this.slotHolders(runId);
+            if (used.length >= MAX_WORKERS) {
+              fail(`Worker limit reached (${MAX_WORKERS} in use: ${used.map((x) => `${x.id} ${x.status}`).join(', ')}). `
+                + 'Merge or end_agent a worker first. Nothing was changed.');
+            }
+            const task = handoverTask(cur, { activity: store.activity.get(cur.id) ?? [], undelivered, note, snap, branch });
+            store.createAgent({ id, runId, role: cur.role, provider, cwd, branch, worktreePath, status: 'starting', task });
+            store.addEvent(runId, id, 'spawned', { by: lead.id, role: cur.role, provider, branch, handoffFrom: cur.id });
+            store.addEvent(runId, cur.id, 'handoff', { from: cur.id, to: id, provider, carried: snap?.changed.length ?? 0 });
+            store.addMessage(runId, lead.id, id, 'message', task);
+            return { id, cwd, branch, snap, gate, carriedMessages: undelivered.length };
+          });
+        } catch (e) {
+          if (worktreePath) await git.discardWorktree(lead.cwd, worktreePath, branch!);
+          throw e;
+        }
+      });
+    } finally {
+      this.handingOff.delete(wid);
+    }
+    this.detached.delete(wid);
+    this.backoff.delete(wid);
+    this.deliver(out.id);
+    this.kick();
+    const { id, cwd, branch, snap, gate, carriedMessages } = out;
+    const carried = snap
+      ? ` Its worktree starts at ${wid}'s HEAD ${snap.head.slice(0, 10)}${snap.changed.length
+        ? `, with its ${snap.changed.length} uncommitted path(s) carried over (verified identical)` : ' (it had no uncommitted changes)'}.`
+      : '';
+    return `Handed ${wid} off to ${id} (role ${old.role}, provider ${provider}) in ${cwd}${branch ? ` on branch ${branch}` : ''}.${carried} `
+      + `${wid} is ended and frees its slot${old.worktreePath ? `; its worktree ${old.worktreePath} and branch ${old.branch} are kept` : ''}.`
+      + `${gate !== null ? ` Its pending merge request (gate #${gate}) was rejected; request_merge ${id} when it reports.` : ''}`
+      + `${carriedMessages ? ` ${carriedMessages} undelivered message(s) to ${wid} were included in the hand-over.` : ''}`
+      + `${processing === null ? ` Note: CloudCLI could not confirm that ${wid}'s session is idle; anything it still writes stays in its old worktree.` : ''}`
+      + ' Call wait_for_agents.';
   }
 
   /** endAgent's worktree removal (caller holds the lead repository lock). Returns the sentence for the reply. */
@@ -922,13 +1142,14 @@ export class Broker {
     for (const ids of this.dispatches.values()) store.renewDispatch(ids, until);
     this.sweepOrphans();
     await this.checkDetached();
+    this.resumeDue();
     for (const id of store.agentsWithUndelivered()) this.deliver(id);
   }
 
   /** Pushes an agent's queued messages as one turn if it can take one now (queued → dispatching). */
   private deliver(id: string) {
     const { store } = this.d;
-    if (store.busy.has(id) || this.dispatches.has(id) || this.detached.has(id)) return;
+    if (store.busy.has(id) || this.dispatches.has(id) || this.detached.has(id) || this.handingOff.has(id)) return;
     const b = this.backoff.get(id);
     if (b && b.until > this.now()) return;
     if (this.leased(id)) return; // its blocked tool call will hand these over
@@ -1089,9 +1310,11 @@ export class Broker {
     }
   }
 
+  /** Workers whose result is still expected soon (a paused one may take hours, so it does not hold back results). */
   private activeWorkers(runId: string): AgentDTO[] {
     const { store } = this.d;
-    return store.agents(runId).filter((x) => x.role !== 'lead' && (store.busy.has(x.id) || !FINISHED_STATUSES.has(x.status)));
+    return store.agents(runId).filter((x) => x.role !== 'lead'
+      && (store.busy.has(x.id) || (!FINISHED_STATUSES.has(x.status) && x.status !== 'paused')));
   }
 
   /**
@@ -1123,7 +1346,8 @@ export class Broker {
     const allDone = targets.every(finished);
     const done = a.give_up === true || !targets.length || urgent || allDone || (mode === 'any' && newResults.length > 0);
 
-    const status = targets.map((t) => `${t.id}: ${store.busy.has(t.id) ? 'working' : t.status}`).join(', ');
+    const pausedUntil = (t: AgentDTO) => `paused until ${t.resumeAt ? formatUtc(Date.parse(t.resumeAt)) : 'its quota resets'}`;
+    const status = targets.map((t) => `${t.id}: ${store.busy.has(t.id) ? 'working' : t.status === 'paused' ? pausedUntil(t) : t.status}`).join(', ');
     if (!done) {
       return { text: `Waiting (${mode}) for ${status}.`, pending: true, progress: status };
     }
@@ -1132,10 +1356,15 @@ export class Broker {
     this.leases.delete(leadId);
     store.addEvent(runId, leadId, 'wait_end', { mode, reason: a.give_up ? 'timeout' : urgent ? 'urgent' : 'done' });
     store.markDelivered(inbox.map((m) => m.id));
-    const still = targets.filter((t) => !finished(t)).map((t) => t.id);
+    const paused = targets.filter((t) => !store.busy.has(t.id) && t.status === 'paused');
+    const still = targets.filter((t) => !finished(t) && !paused.includes(t)).map((t) => t.id);
+    const pausedLine = paused.length
+      ? `\n\nPaused by a provider limit (they resume automatically in their own session): ${paused.map((t) => `${t.id} ${pausedUntil(t)}`).join('; ')}. `
+        + 'Usually just call wait_for_agents again; handoff_agent moves one to another provider now.'
+      : '';
     const tail = still.length
-      ? `\n\nStill working: ${still.join(', ')}. Call wait_for_agents again to keep waiting.`
-      : '\n\nNo targeted worker is still working.';
+      ? `${pausedLine}\n\nStill working: ${still.join(', ')}. Call wait_for_agents again to keep waiting.`
+      : pausedLine || '\n\nNo targeted worker is still working.';
     // Authoritative, always last: the chat card lists exactly these workers (the inbox may carry messages from others).
     const waitedOn = `\n\nWaited on: ${targets.length ? targets.map((t) => t.id).join(', ') : 'none'}.`;
     if (!targets.length && !inbox.length) return `There are no active workers to wait for.${waitedOn}`;
@@ -1231,6 +1460,14 @@ export class Broker {
       return false;
     }
     if (res.status === 'error') {
+      // A worker out of provider quota is paused, not failed: it resumes in the same session when the quota resets.
+      // (Only one that was mid-task: a worker that already reported, or was ended meanwhile, is handled as before.)
+      const quota = !isLead && ['running', 'starting', 'idle', 'error'].includes(now.status) ? detectQuota(res.error, this.now()) : null;
+      if (quota) {
+        this.pause(now, quota, res.error, accepted);
+        this.kick();
+        return false;
+      }
       this.log('turn failed', { runId: agent.runId, agentId: agent.id, error: res.error });
       const prev = this.backoff.get(agent.id)?.ms ?? 0;
       const ms = Math.min(BACKOFF_MAX, prev ? prev * 2 : BACKOFF_MIN);
@@ -1276,6 +1513,50 @@ function groupBy<T>(xs: T[], key: (x: T) => string): Map<string, T[]> {
   const m = new Map<string, T[]>();
   for (const x of xs) m.set(key(x), [...(m.get(key(x)) ?? []), x]);
   return m;
+}
+
+const firstLine = (e: unknown) => (e as Error).message.split('\n')[0];
+
+/** The first task of a worker that takes over from `old` (handoff_agent). */
+export function handoverTask(old: AgentDTO, x: {
+  activity: { text: string }[]; undelivered: MessageDTO[]; note: string | null; snap: WorkingTreeSnapshot | null; branch: string | null;
+}): string {
+  const why = old.status === 'paused' ? `it was paused by a provider ${old.pauseReason ?? 'limit'}`
+    : old.status === 'error' ? 'its turn failed' : old.status === 'interrupted' ? 'it was interrupted' : `it was ${old.status}`;
+  const parts = [`You are taking over the work of ${old.id} (${old.role} on ${old.provider}); ${why}.`];
+  if (x.snap) {
+    parts.push(`THE WORK SO FAR IS ALREADY IN YOUR WORKTREE${x.branch ? ` (branch \`${x.branch}\`)` : ''}: it starts at ${old.id}'s `
+      + `last commit ${x.snap.head.slice(0, 10)} (branch \`${old.branch}\`, all of its commits), and ${x.snap.changed.length
+        ? `its ${x.snap.changed.length} uncommitted change(s) were carried over as uncommitted changes:\n${
+          x.snap.changed.slice(0, 40).map((f) => `- ${f}`).join('\n')}${x.snap.changed.length > 40 ? `\n- … and ${x.snap.changed.length - 40} more` : ''}`
+        : 'it had no uncommitted changes'}\n`
+      + 'Start with git status, git diff and git log to see where it stood, then continue from there. Do not redo finished '
+      + `work and do not touch its old worktree (${old.worktreePath}).`);
+  } else {
+    parts.push(`It worked read-only in the same directory you are in (${old.cwd}); nothing of its own needs carrying over.`);
+  }
+  parts.push(`## Original task\n${old.task ?? '(not recorded)'}`);
+  parts.push(`## Its last activity\n${x.activity.length ? x.activity.slice(-12).map((a) => `- ${a.text}`).join('\n')
+    : '(none recorded, e.g. after a broker restart)'}`);
+  if (old.result) parts.push(`## Its last reported result\n${old.result}`);
+  if (old.lastError) parts.push(`## Its last error\n${old.lastError}`);
+  if (x.undelivered.length) {
+    parts.push(`## Messages it never received\n${x.undelivered.map((m) => `### From ${m.from ?? 'user'} · ${m.kind}\n${m.body}`).join('\n\n')}`);
+  }
+  if (x.note) parts.push(`## Notes from the lead\n${x.note}`);
+  parts.push('Continue the task from where it left off; report_result when done.');
+  return parts.join('\n\n');
+}
+
+function clipLine(s: string, n: number): string {
+  const t = s.replace(/\s+/g, ' ').trim();
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+}
+
+/** The message a resumed worker gets in its own session. */
+export function resumeText(a: Pick<AgentDTO, 'branch'>, reason: string): string {
+  const check = a.branch ? 'Check your worktree state (git status / git diff)' : 'Check where you left off';
+  return `[coagent] Your previous turn was interrupted (${reason}). ${check} and continue the task; report_result when done.`;
 }
 
 export function formatInbox(agentId: string, msgs: MessageDTO[]): string {

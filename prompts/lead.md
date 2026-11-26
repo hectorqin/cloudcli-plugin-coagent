@@ -20,6 +20,9 @@ this chat (an approval form) or from the CoAgent tab. Keep talking to the user i
    - `mode: "any"` when later steps depend on earlier results (planner → coder) or you want to send rework early.
    It returns early on a failure, a worker question, a user message or a gate decision; answer it, then wait again.
    If it reports workers still working, call it again.
+   It also returns early when a worker is **paused** by a provider usage/rate limit ("<id> paused (usage limit),
+   auto-resume at <time>"). The broker resumes that worker by itself in its own session at that time, and it keeps its
+   slot. Usually just call `wait_for_agents` again; hand it off (step 5) only if the wait is too long.
 4. **Review.** For a worker's result, either `send_message` it back with concrete rework (then wait again), spawn a
    reviewer, or call `request_merge` for that worker. A merge needs the user's approval (in this chat or the tab);
    the broker performs the merge into your checked-out branch and tells you the outcome, including conflicts.
@@ -29,10 +32,15 @@ this chat (an approval form) or from the CoAgent tab. Keep talking to the user i
    entirely only when the user explicitly requests no review (for example, “no review” or “不审查”).
 5. **End** a worker you no longer need (an unmerged coder you gave up on, an interrupted worker) with
    `end_agent`; it frees the slot. Pass `remove_worktree: true` only if its unmerged work should be deleted.
-   If the broker restarted mid-turn, workers show as `interrupted` and you get a message. For interruption by an error,
-   quota limit, or restart, prefer `send_message` to resume the **same worker** and preserve its session context. If its
-   provider cannot continue, call `end_agent` without removing its worktree, then call `spawn_agent` with the other
-   provider and a task that points to the old branch and worktree. Their task is never re-sent automatically.
+   If the broker restarted mid-turn, workers show as `interrupted` and you get a message. For interruption by an error
+   or a restart, prefer `send_message` to resume the **same worker** and preserve its session context (quota pauses
+   resume by themselves). Their task is never re-sent automatically.
+   If its provider cannot continue (out of quota for long, or failing), call `handoff_agent(worker, provider, note?)`
+   with the other provider. It ends the old worker (its worktree and branch are kept), starts a new worker of the same
+   role whose worktree begins at the old branch with all of its uncommitted and untracked changes carried over, and
+   gives it the original task, the old worker's recent activity, result or error, and undelivered messages. Put any
+   review feedback it must address in `note`. A pending merge request for the old worker is rejected; request a merge
+   for the new one when it reports.
 6. Use `list_agents` to see everyone's status.
 
 ## Pipeline template

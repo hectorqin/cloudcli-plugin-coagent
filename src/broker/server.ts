@@ -83,7 +83,10 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
   const tabAuthorized = (req: http.IncomingMessage) => Object.entries(req.headers).some(
     ([k, v]) => k.startsWith('x-plugin-secret-') && typeof v === 'string' && d.cloudcli.verifyApiKey(v),
   );
-  const config = () => ({ roleProviders: d.broker.roleProviders(), autoRegister: d.store.getJson('autoRegister', true) });
+  const config = () => ({
+    roleProviders: d.broker.roleProviders(), autoRegister: d.store.getJson('autoRegister', true),
+    quotaBackoffMinutes: d.broker.quotaBackoffMinutes(),
+  });
 
   async function route(req: http.IncomingMessage, url: URL): Promise<unknown> {
     const method = req.method ?? 'GET';
@@ -143,6 +146,7 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
       const body = await readJson(req);
       if (body.roleProviders && typeof body.roleProviders === 'object') d.broker.setRoleProviders(body.roleProviders as Record<string, string>);
       if (typeof body.autoRegister === 'boolean') d.store.setJson('autoRegister', body.autoRegister);
+      if (body.quotaBackoffMinutes !== undefined) d.broker.setQuotaBackoffMinutes(body.quotaBackoffMinutes);
       return config();
     }
     if (p === '/registration' && method === 'POST') {
@@ -162,6 +166,13 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
       const body = await readJson(req);
       const note = d.broker.userMessage(match[1], String(body.body ?? ''));
       return { ok: true, ...(note ? { note } : {}) };
+    }
+    // Continue a paused, failed or interrupted worker in its own session (a paused one: "Resume now").
+    if ((match = p.match(/^\/agents\/([\w-]+)\/resume$/)) && method === 'POST') {
+      return { ok: true, text: d.broker.resumeWorker(match[1], 'user') };
+    }
+    if ((match = p.match(/^\/agents\/([\w-]+)\/cancel-resume$/)) && method === 'POST') {
+      return { ok: true, text: d.broker.cancelAutoResume(match[1]) };
     }
     if ((match = p.match(/^\/agents\/([\w-]+)\/end$/)) && method === 'POST') {
       const body = await readJson(req);

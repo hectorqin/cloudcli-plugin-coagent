@@ -59,6 +59,25 @@ describe('buildTimeline', () => {
     ]);
   });
 
+  it('shows pauses, resumes and a handoff arrow from the old lane to the new one', () => {
+    const d = detail();
+    d.agents.push(agent('coder-2', 'coder', { provider: 'codex' }));
+    d.events.push(
+      { id: 8, runId: 'r', agentId: 'coder-1', type: 'paused', data: { reason: 'usage limit', resumeAt: '2026-11-26T19:14:00.000Z' }, createdAt: t(8) },
+      { id: 9, runId: 'r', agentId: 'coder-1', type: 'resumed', data: { by: 'auto' }, createdAt: t(9) },
+      { id: 10, runId: 'r', agentId: 'coder-1', type: 'agent_ended', data: { by: 'lead', handoff: 'coder-2' }, createdAt: t(10) },
+      { id: 11, runId: 'r', agentId: 'coder-2', type: 'spawned', data: { provider: 'codex', handoffFrom: 'coder-1' }, createdAt: t(10) },
+      { id: 12, runId: 'r', agentId: 'coder-1', type: 'handoff', data: { from: 'coder-1', to: 'coder-2', provider: 'codex' }, createdAt: t(10) },
+    );
+    const rows = buildTimeline(d).rows;
+    expect(rows.find((r) => r.kind === 'node' && r.label === 'paused (usage limit) until 19:14 UTC')).toMatchObject({ lane: 2, tone: 'warn' });
+    expect(rows.find((r) => r.kind === 'node' && r.label === 'auto-resumed')).toBeTruthy();
+    expect(rows.find((r) => r.kind === 'node' && r.label === 'ended (handed off)')).toBeTruthy();
+    expect(rows.find((r) => r.kind === 'node' && r.label === 'took over from coder-1 · codex')).toMatchObject({ lane: 3 });
+    expect(rows.find((r) => r.kind === 'arrow' && r.label === 'handoff → coder-2 · codex'))
+      .toMatchObject({ from: 2, to: 3, tone: 'accent', pending: false, ref: { type: 'event', id: 12 } });
+  });
+
   it('closes a dangling bar when the agent is no longer busy', () => {
     const d = detail();
     d.agents[1].busy = false;

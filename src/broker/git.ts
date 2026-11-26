@@ -1,5 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import type { MergeSnapshotData, MergeSnapshotFile } from '../shared/protocol.js';
@@ -10,6 +12,23 @@ export const MAX_UNIFIED_DIFF_BYTES = 200 * 1024;
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await exec('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 });
   return stdout.trim();
+}
+
+/** git with a private index file, so the worktree's real index (staged state) is never touched. */
+async function gitWithIndex(cwd: string, indexFile: string, ...args: string[]): Promise<string> {
+  const { stdout } = await exec('git', args, { cwd, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, GIT_INDEX_FILE: indexFile } });
+  return stdout.trim();
+}
+
+/** The full content of a working tree, as git sees it, captured as a tree object. See Git.snapshotWorkingTree. */
+export interface WorkingTreeSnapshot {
+  /** The commit checked out there. */
+  head: string;
+  /** Tree of HEAD plus every tracked change, deletion and untracked (not ignored) file. Equals headTree when clean. */
+  tree: string;
+  headTree: string;
+  /** Paths that differ from HEAD (modified, added, deleted, untracked). */
+  changed: string[];
 }
 
 function limitedUtf8(text: string, maxBytes: number): { text: string; truncated: boolean } {
@@ -116,10 +135,11 @@ export const Git = {
 
   /**
    * Creates `<repo>-worktrees/coagent-<runId>-<agentId>` on a new branch `coagent/<runId>/<agentId>` from the lead's
-   * HEAD (the same container directory CloudCLI uses for its own worktrees). Run-scoped names never collide across
-   * runs. On failure nothing is left behind.
+   * HEAD (the same container directory CloudCLI uses for its own worktrees), or from `startPoint` (a commit or ref, e.g.
+   * the branch of a worker being handed off). Run-scoped names never collide across runs. On failure nothing is left
+   * behind.
    */
-  async createWorktree(leadCwd: string, runId: string, agentId: string): Promise<{ worktreePath: string; branch: string }> {
+  async createWorktree(leadCwd: string, runId: string, agentId: string, startPoint = 'HEAD'): Promise<{ worktreePath: string; branch: string }> {
     const root = await Git.repoRoot(leadCwd);
     if (!root) throw new Error(`${leadCwd} is not inside a git repository; writing agents need one for worktrees`);
     const container = path.join(path.dirname(root), `${path.basename(root)}-worktrees`);
@@ -129,7 +149,9 @@ export const Git = {
     if (fs.existsSync(worktreePath)) throw new Error(`${worktreePath} already exists`);
     if (await git(root, 'branch', '--list', branch)) throw new Error(`branch ${branch} already exists`);
     try {
-      await git(root, 'worktree', 'add', '-b', branch, worktreePath, 'HEAD');
+      // Resolved in the lead's checkout (HEAD there is the lead's HEAD, not the main checkout's).
+      const start = await Git.resolve(leadCwd, `${startPoint}^{commit}`);
+      await git(root, 'worktree', 'add', '-b', branch, worktreePath, start);
     } catch (e) {
       await Git.discardWorktree(root, worktreePath, branch);
       throw e;
@@ -143,6 +165,47 @@ export const Git = {
     fs.rmSync(worktreePath, { recursive: true, force: true });
     await git(repoCwd, 'worktree', 'prune').catch(() => undefined);
     await git(repoCwd, 'branch', '-D', branch).catch(() => undefined);
+  },
+
+  /**
+   * Captures everything in a working tree (tracked changes, staged or not, deletions, and untracked files that are not
+   * ignored) as a git tree object, through a temporary copy of its index: the worktree, its index and its stash are left
+   * exactly as they were. Ignored files (build output, node_modules, …) are not captured.
+   */
+  async snapshotWorkingTree(cwd: string): Promise<WorkingTreeSnapshot> {
+    const head = await Git.head(cwd);
+    const headTree = await git(cwd, 'rev-parse', `${head}^{tree}`);
+    const realIndex = await git(cwd, 'rev-parse', '--path-format=absolute', '--git-path', 'index');
+    const tmpIndex = path.join(os.tmpdir(), `coagent-index-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
+    try {
+      // Starting from a copy of the real index keeps git's stat cache, so unchanged files are not re-hashed.
+      if (fs.existsSync(realIndex)) fs.copyFileSync(realIndex, tmpIndex);
+      else await gitWithIndex(cwd, tmpIndex, 'read-tree', head);
+      await gitWithIndex(cwd, tmpIndex, 'add', '-A', '--', '.');
+      const tree = await gitWithIndex(cwd, tmpIndex, 'write-tree');
+      const changed = tree === headTree ? [] : nulTokens(await git(cwd, 'diff-tree', '-r', '-z', '--no-renames', '--name-only', headTree, tree));
+      return { head, tree, headTree, changed };
+    } finally {
+      fs.rmSync(tmpIndex, { force: true });
+    }
+  },
+
+  /**
+   * Makes a fresh worktree (checked out at `snapshot.head`, no local changes) hold the snapshot's content as uncommitted
+   * changes: modified/deleted files show as unstaged changes and new files as untracked, as in the original. Then
+   * verifies it: the worktree's own snapshot must be the identical tree. Throws on any difference.
+   */
+  async restoreWorkingTree(cwd: string, snapshot: WorkingTreeSnapshot): Promise<void> {
+    if (await Git.head(cwd) !== snapshot.head) throw new Error(`${cwd} is not checked out at ${snapshot.head.slice(0, 10)}`);
+    if (await git(cwd, 'status', '--porcelain')) throw new Error(`${cwd} is not clean`);
+    if (snapshot.tree !== snapshot.headTree) {
+      await git(cwd, 'read-tree', '-m', '-u', snapshot.headTree, snapshot.tree); // index + files := snapshot
+      await git(cwd, 'reset', '-q'); // index back to HEAD; the files keep the snapshot content
+    }
+    const check = await Git.snapshotWorkingTree(cwd);
+    if (check.tree !== snapshot.tree) {
+      throw new Error(`carried-over files differ from the original (tree ${check.tree.slice(0, 10)} != ${snapshot.tree.slice(0, 10)})`);
+    }
   },
 
   /** Commits anything the agent left uncommitted, so the merge sees all of its work. */

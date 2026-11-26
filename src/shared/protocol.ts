@@ -13,6 +13,7 @@ export type ToolName =
   | 'list_agents'
   | 'wait_for_agents'
   | 'end_agent'
+  | 'handoff_agent'
   // Internal: used by the shim while a lead's tool call blocks on a gate, never exposed to models.
   | 'gate_wait'
   | 'gate_decide';
@@ -45,8 +46,14 @@ export interface ToolResponse {
 
 export type RunStatus = 'active' | 'ended';
 export type PlanStatus = 'none' | 'pending' | 'approved' | 'rejected';
-/** `interrupted`: the broker restarted while this worker had a turn open; the lead decides whether to continue or end it. */
-export type AgentStatus = 'lead' | 'starting' | 'running' | 'idle' | 'reported' | 'merged' | 'error' | 'ended' | 'interrupted';
+/**
+ * `interrupted`: the broker restarted while this worker had a turn open (or the user cancelled its auto-resume); the
+ * lead decides whether to continue or end it. `paused`: its turn hit a provider usage/rate limit; the broker resumes it
+ * in the same session at `resumeAt`. It keeps its worker slot meanwhile. A worker handed off to another provider ends
+ * as `ended` (its `agent_ended` event carries `handoff`).
+ */
+export type AgentStatus = 'lead' | 'starting' | 'running' | 'idle' | 'reported' | 'merged' | 'error' | 'ended' | 'interrupted'
+  | 'paused';
 /**
  * Delivery state of a message. queued → dispatching (a turn carrying it was sent, under a lease) → delivered;
  * a 409 or an error before CloudCLI accepted the turn puts it back to queued. `cancelled`: its recipient was
@@ -142,6 +149,9 @@ export interface AgentDTO {
   task: string | null;
   result: string | null;
   lastError: string | null;
+  /** Paused workers: when the broker resumes it (ISO), and why it paused ("usage limit" / "rate limit"). */
+  resumeAt?: string | null;
+  pauseReason?: string | null;
   busy: boolean;
   /** Most recent things the agent did in turns the broker ran (newest last; in memory only). */
   activity: { ts: string; text: string }[];
@@ -178,7 +188,8 @@ export interface GateDTO {
 export type EventType =
   | 'run_started' | 'run_ended' | 'spawned' | 'turn_start' | 'turn_end' | 'gate_opened' | 'gate_decided' | 'merge'
   | 'wait_start' | 'wait_end' | 'recovered' | 'agent_ended'
-  | 'workspace_archived' | 'workspace_deleted' | 'branches_deleted';
+  | 'workspace_archived' | 'workspace_deleted' | 'branches_deleted'
+  | 'paused' | 'resumed' | 'resume_cancelled' | 'handoff';
 
 /** Timeline facts that are not messages. `agentId` is the lane the event belongs to (null = the user). */
 export interface EventDTO {

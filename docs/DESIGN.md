@@ -35,7 +35,7 @@
 - 注册到用户级 `~/.claude.json`（`mcpServers`）与 `~/.codex/config.toml`（`mcp_servers`）；broker 启动时幂等写入，提供开关。
   - Codex 条目必须带 `default_tools_approval_mode = "approve"`：否则 MCP 工具调用需审批，在非交互（`approval_policy=never`）的 worker 中直接失败（spike 实测）。
 - 启动后读取 `~/.cloudcli-coagent/runtime.json`（端口 + 本地 token）转发给 broker。
-- 工具：`spawn_agent`、`send_message`、`read_inbox`、`report_result`、`submit_plan`、`request_merge`、`list_agents`。
+- 工具：`spawn_agent`、`send_message`、`read_inbox`、`report_result`、`submit_plan`、`request_merge`、`wait_for_agents`、`end_agent`、`handoff_agent`（§15）、`list_agents`。
 - 非协作会话调用时返回「未加入协作」（`spawn_agent` 除外，它触发升级）。
 
 ### 4.1.1 显式启动 skill
@@ -59,7 +59,7 @@ CloudCLI Claude/Codex 会话并停止。每个安装目录带 `.coagent-owned` �
 - 投递状态机：`messages.delivery_state` = `queued → dispatching（attempts+1, lease_until）→ delivered`；`cancelled` 表示收件人已 ended/merged。只有 409 或 CloudCLI 接受 turn 之前的错误才回 `queued`；一旦接受（收到 session-id / turn_start），出错也关闭该投递、worker 置 `error` 并通知 lead，是否重试由 lead 决定。`report_result` 在同一事务里确认该 worker 当前的 dispatch。`delivered_at` 仍表示投递时间。进程内的 turn 每次 tick 续租；租约过期的孤儿投递：worker 的一律关闭（不重发），lead 的回队。
 - 启动恢复（`Broker.recover()`，server 启动时 await，请求和 tick 都等它完成）：对仍标 `starting/running` 的 worker 调 CloudCLI `GET /api/agent/sessions/:id`（fork 新增，`capabilities.sessionStatus`）：`processing=false` → `interrupted`；`true` → 保持 `running` 但不归本进程所有（detached），每 30s 复查，结束且未汇报则置 `idle` 并通知 lead，期间其 `report_result` 照常生效、不推新 turn；未知（宿主无该接口或出错）→ `interrupted`，且 `end_agent remove_worktree` 被拒（该操作只在会话确认空闲时允许）。lead 收到 system 消息（`send_message` 续跑或 `end_agent`），任务从不自动重发；记 `recovered` 事件。
 - **已知限制：lead 的 turn 可能部分重复。** lead 没有 interrupted 状态：broker 在 lead turn 中途崩溃时，该 turn 携带的消息在租约过期后回队并重发一次，若该 turn 已部分执行（例如已 spawn 或发消息），lead 会再看到同一批消息。没有 turns 表/provider run id，无法判断它执行到哪里。
-- 容量：占名额的是正在工作的 worker（starting/running/busy/detached）、`interrupted` 的、有 queued/dispatching 消息的，以及有未合并 worktree 的写角色。给不占名额的 worker 发返工时若已满，消息保持 queued、告知发送方，有空位后才投递。`end_agent`（lead 工具，或 tab 抽屉「End agent」）在任何 await 之前用一个事务置 `ended` 并取消其 queued 消息（停止屏障），之后才清理；清理失败只报告，不会恢复投递。ended/merged 的 agent 除 `list_agents` 外的工具调用一律被拒。`remove_worktree: true` 才删 worktree。
+- 容量：占名额的是正在工作的 worker（starting/running/busy/detached）、`interrupted` 与 `paused`（§15）的、有 queued/dispatching 消息的，以及有未合并 worktree 的写角色。给不占名额的 worker 发返工时若已满，消息保持 queued、告知发送方，有空位后才投递。`end_agent`（lead 工具，或 tab 抽屉「End agent」）在任何 await 之前用一个事务置 `ended` 并取消其 queued 消息（停止屏障），之后才清理；清理失败只报告，不会恢复投递。ended/merged 的 agent 除 `list_agents` 外的工具调用一律被拒。`remove_worktree: true` 才删 worktree。
 - 消息：收件箱模型。agent 可主动 `read_inbox`；agent 一轮结束（空闲）时 broker 将未读消息作为下一轮输入自动投递；409（运行中）则排队重试。
 - 关卡：
   - 计划：lead `submit_plan` → pending → tab 中批准/驳回+意见 → 结果经收件箱回到 lead。
@@ -194,3 +194,22 @@ tab 改为泳道时序图：每个 agent 一条泳道（最左为 You），时�
 - fork 在 tab API 与 tool renderer host 暴露可选的 `archiveProject` / `deleteProject` 和 `archiveSession` / `deleteSession`。合并卡片与 agent/gate 抽屉按 worker 类型和 host 能力显示“Archive worker session”和需确认的 Delete；vanilla host 显示 sidebar 提示。run 结束后的批量归档对 writer 用 project API、对只读 worker 用 session API，逐项且互不阻塞。
 - UI 成功调用 host 后，通过 tab 鉴权的事件路由记录 `workspace_archived` / `workspace_deleted`；失败只显示对应 item 的错误，不阻断其他清理。
 - 分支清理与 `endRun` 分离且从不自动执行。lead 显式调用 `POST /runs/:id/branches/delete-merged`：仅处理状态为 merged 且 tip 是 lead 当前 `HEAD` ancestor 的 worker 分支，并只用 `git branch -d`。未合并、ended-unmerged、缺失或仍被 worktree checkout 的分支均保留并返回原因；结果记录为 `branches_deleted`。这里的“仅 lead”是 tab UI/一致性 guard，不是独立授权边界（tab 请求已经代表本机 CloudCLI 用户）；真正的删除安全边界是 ancestry 检查与 `branch -d`。
+
+## 15. 额度暂停、自动续跑与 handoff（2026-11-26，Q41–Q42）
+
+- **识别（`src/broker/quota.ts`）**：worker turn 的错误文本匹配 usage limit（`usage limit`、`hit your … limit`、`quota exceeded`、`insufficient_quota`…）或 rate limit（`rate limit`/`rate_limit_error`、`too many requests`、独立的 `429`）即视为额度错误。解析重置时间：`try again at 7:13 PM`、`resets 7:10pm (UTC)`、`GMT+2`、IANA 时区、`in 20 minutes` 等，取 `now` 之后最近一次并加 1 分钟余量。**未带时区一律按 UTC**（代码注释说明：broker 无从得知 provider 用的时区；猜早了只会再暂停一次）。读不出时间则用 `quotaBackoffMinutes`（kv，`PUT /config` 可改，默认 30）。lead 的 turn 不受影响（lead 无暂停）。
+- **状态 `paused`**：`agents` 新列 `resume_at`、`pause_reason`、`pause_nudge`（幂等迁移，`MIGRATIONS` 最后一项）。不置 `error`；记 `paused {reason, resumeAt, guessed, error}`；给 lead system 消息 “`<id>` paused (usage limit), auto-resume at `<time>`”。`pause_nudge` = 被打断的 turn 是否已被 CloudCLI 接受：接受过则续跑时要告诉它“上一轮被打断”；未接受（如 HTTP 429）消息已回队，续跑时直接投递即可。
+- **自动续跑**：`tick()` 对到点的 paused worker（`pausedDue`，只看 active 且未 ending 的 run）在同一事务里置 `idle`、清除暂停信息、按需入队一条 system 消息 “[coagent] Your previous turn was interrupted (<reason>). Check your worktree state (git status / git diff) and continue the task; report_result when done.”，记 `resumed {by:'auto'}`，然后按普通投递发给**同一 session**（同 appSessionId）。该消息就是一次普通投递，不会重发；若这一轮又撞额度，按上面规则重新 `paused`（新的 resumeAt）。
+  - `paused` 在 `NO_DELIVERY` 中：期间发给它的消息保持 queued，续跑时随之投递；`send_message` 会告知发送方。
+  - 占名额（`holdsSlot`），但不算“即将出结果”的 active worker，因此不会拖住其他 worker 结果的批量投递。
+  - `end_agent` 置 `ended` 同时清掉 `resume_at`（`agent_ended.cancelledResume`）；`endRun`/ending 的 run 不续跑；`recover()` 只处理 starting/running，paused 原样保留，重启后照样到点续跑。
+  - `request_merge` 拒绝 paused worker。
+- **`wait_for_agents`**：暂停的 system 消息是紧急消息，所以等待会提前返回一次；返回文本列出 “`<id>` paused until `<time>`”，并提示“通常直接再 wait”。paused 不算 finished，所以再次 wait 会一直等到它续跑并完成。lead prompt 与 skill 同步说明。
+- **不自动重试的仍不重试**：`error`/`interrupted` 的 worker 不自动续跑（沿用“已接受的 turn 出错不重试”）。tab 抽屉与 wait/spawn 卡片提供 **Resume**（`POST /agents/:id/resume`，tab 鉴权，发送同一条续跑消息，`resumed {by:'user'}`）；paused 的提供 **Resume now**（同一路由，跳过等待）和 **Cancel auto-resume**（`POST /agents/:id/cancel-resume`：改为 `interrupted`、记 `resume_cancelled`、通知 lead 决定）。
+- **`handoff_agent(worker, provider, note?)`**（仅 lead）：把手工流程（end 旧 worker → spawn 新 worker → 合并旧分支 → `git diff | git apply --3way` 搬未提交改动）自动化。
+  - 拒绝：worker 正在跑 turn（本进程 busy/dispatch/detached 或状态 running），或 CloudCLI `sessionStatus` 说仍在处理；`null`（未知）允许，但回复中注明旧 worktree 之后的写入不会被带走。拒绝已 ended/merged 的 worker。
+  - 写角色：在 lead 仓库锁内，先对旧 worktree 做**内容快照**：复制其 index 到临时文件，用 `GIT_INDEX_FILE` 执行 `git add -A` + `write-tree`，得到包含已跟踪改动（含暂存）、删除、未跟踪且未被忽略文件的 tree，旧 worktree、它的 index 和 stash 都不动。然后 `createWorktree(..., startPoint = 旧 HEAD)`（git 层新增起点参数），在新 worktree 里 `read-tree -m -u HEAD <tree>` + `reset -q`：内容一致，全部变成未提交改动（原来暂存的新文件变为未跟踪，不丢数据）。最后对新 worktree 再做一次快照，**tree hash 必须相同**，否则删除新 worktree/分支并报错，什么都不变。被 `.gitignore` 忽略的文件不搬。
+  - 只读角色：直接在 lead 目录用新 provider 起一个同角色 worker。
+  - 一个事务内：旧 worker 的 pending 合并关卡置 rejected、旧 worker 置 `ended`（保留 worktree 与分支，释放名额，取消其 queued 消息，`agent_ended {handoff: <new>}`）、容量复核、创建新 worker（`spawned {handoffFrom}`）、记 `handoff {from, to, provider, carried}`、入队交接任务。交接任务包含：原始任务、旧 worker 最近约 12 条活动、最后的 result/错误、它未收到的消息、lead 的 `note`，并明确说明“已有工作就在你的 worktree 里”及搬过来的文件清单。复制期间旧 worker 被加入进程内 `handingOff` 集合，`deliver()` 不会给它开新 turn。
+  - 时间线：`handoff` 画成旧泳道 → 新泳道的箭头；新泳道的 spawned 节点显示 “took over from …”。
+- 未实测：真实 CloudCLI 下 Codex/Claude 额度错误经 `/api/agent` SSE 到达的确切形态（按用户提供的两条原文测试）；tab/卡片按钮在真实 UI 中的渲染。

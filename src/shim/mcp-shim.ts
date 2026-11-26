@@ -177,8 +177,9 @@ const TOOLS: { name: ToolName; description: string; shape: z.ZodRawShape }[] = [
     description: 'LEAD ONLY: block until workers finish and get their results in one go, like waiting on subagents. '
       + 'mode "all" (default) returns when every targeted worker is done — use it for independent parallel tasks. '
       + 'mode "any" returns as soon as one worker reports — use it when later steps depend on earlier results or you '
-      + 'want to send rework early. Always returns early on a failure, a worker question, a user message or a gate '
-      + 'decision. If it says workers are still working, call it again.',
+      + 'want to send rework early. Always returns early on a failure, a worker pausing on a usage limit, a worker '
+      + 'question, a user message or a gate decision. If it says workers are still working (or paused: they resume by '
+      + 'themselves), call it again.',
     shape: {
       agents: z.array(z.string()).optional().describe('Worker ids to wait for; default: every active worker.'),
       mode: z.enum(['all', 'any']).optional(),
@@ -214,6 +215,19 @@ const TOOLS: { name: ToolName; description: string; shape: z.ZodRawShape }[] = [
     shape: {
       worker: z.string().describe('Worker agent id'),
       remove_worktree: z.boolean().optional().describe('Also delete its unmerged worktree (default false).'),
+    },
+  },
+  {
+    name: 'handoff_agent',
+    description: 'LEAD ONLY: move a stopped worker (paused by a usage limit, failed, or interrupted) to a NEW worker of the '
+      + 'same role on another provider. A writer\'s new worktree starts at the old branch HEAD with its uncommitted and '
+      + 'untracked changes carried over (verified); the new worker gets the original task, recent activity, last '
+      + 'result/error, undelivered messages and your note. The old worker ends (worktree and branch kept, slot freed, '
+      + 'pending merge request rejected). Refused while the worker is running a turn.',
+    shape: {
+      worker: z.string().describe('Worker agent id to hand off'),
+      provider: z.enum(['claude', 'codex']).describe('Provider for the new worker (usually the other one)'),
+      note: z.string().optional().describe('Anything the new worker should know, e.g. review feedback to address.'),
     },
   },
   {

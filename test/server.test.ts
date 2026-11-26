@@ -29,6 +29,12 @@ const fakeBroker = {
   },
   userMessage: () => 'Waiting for a worker slot.',
   endAgent: async (id: string, removeWorktree: boolean) => `Ended ${id}; remove=${removeWorktree}.`,
+  resumeWorker: (id: string, by: string) => {
+    if (id === 'coder-busy') throw new ToolError('coder-busy is busy; try again when its turn is over.', 409);
+    return `Resumed ${id} by ${by}.`;
+  },
+  cancelAutoResume: (id: string) => `Cancelled the auto-resume of ${id}; the lead was told.`,
+  quotaBackoffMinutes: () => 30,
   deleteMergedBranches: (runId: string, agentId: string) => {
     if (agentId !== 'lead') throw new ToolError('Only the lead can delete run branches.', 403);
     return { deleted: [{ agentId: 'coder-1', branch: `coagent/${runId}/coder-1` }], skipped: [] };
@@ -131,6 +137,20 @@ describe('broker HTTP hardening and diagnostics', () => {
       .toMatchObject({ status: 200, body: { ok: true, note: 'Waiting for a worker slot.' } });
     expect(await request('POST', '/agents/coder-1/end', { headers, body: '{"removeWorktree":true}' }))
       .toMatchObject({ status: 200, body: { ok: true, text: 'Ended coder-1; remove=true.' } });
+  });
+
+  it('resume and cancel-resume are tab-authorized routes and map ToolErrors', async () => {
+    expect((await request('POST', '/agents/coder-1/resume', { body: '{}' })).status).toBe(401);
+    expect((await request('POST', '/agents/coder-1/cancel-resume', { body: '{}' })).status).toBe(401);
+    expect((await request('POST', '/agents/coder-1/resume', { headers: { 'x-plugin-secret-apikey': 'wrong' }, body: '{}' })).status).toBe(401);
+    const headers = { 'x-plugin-secret-apikey': 'tab-key' };
+    expect(await request('POST', '/agents/coder-1/resume', { headers, body: '{}' }))
+      .toMatchObject({ status: 200, body: { ok: true, text: 'Resumed coder-1 by user.' } });
+    expect(await request('POST', '/agents/coder-1/cancel-resume', { headers, body: '{}' }))
+      .toMatchObject({ status: 200, body: { ok: true, text: 'Cancelled the auto-resume of coder-1; the lead was told.' } });
+    expect(await request('POST', '/agents/coder-busy/resume', { headers, body: '{}' }))
+      .toMatchObject({ status: 409, body: { error: 'coder-busy is busy; try again when its turn is over.' } });
+    expect((await request('GET', '/agents/coder-1/resume', { headers })).status).toBe(404);
   });
 
   it('keeps branch deletion tab-authorized and preserves lead-only ToolErrors', async () => {

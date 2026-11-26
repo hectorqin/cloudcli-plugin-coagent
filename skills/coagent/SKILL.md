@@ -10,6 +10,6 @@ When invoked with a task, become its lead. Call `submit_plan` with a concrete pl
 
 For every coder that reports, and every tester that changes production code, spawn a reviewer on a **different provider** before calling `request_merge`. A tester that only adds or changes tests needs no separate review. If the other provider is unavailable or out of quota, use the same provider and tell the user. Skip review entirely only when the user explicitly asks for no review (for example, “no review” or “不审查”). Address review findings, then request the merge.
 
-If a worker is interrupted by an error, quota limit, or restart, prefer `send_message` to resume the **same worker**, preserving its session context. If its provider cannot continue, call `end_agent` without removing its worktree, then call `spawn_agent` with the other provider and a task that points to the old branch and worktree.
+If a worker is **paused** by a usage or rate limit, the broker resumes the same worker in its own session when the quota resets; usually just call `wait_for_agents` again. If a worker is interrupted by an error or restart, prefer `send_message` to resume the **same worker**, preserving its session context. If its provider cannot continue, call `handoff_agent` with the other provider (and any review feedback as `note`): it moves the work, including uncommitted changes, to a new worker of the same role and ends the old one.
 
 At the end, ask the user to use the CoAgent tab to archive worker sessions and delete merged branches as desired.

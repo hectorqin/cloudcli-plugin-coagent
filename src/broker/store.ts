@@ -159,6 +159,13 @@ export const MIGRATIONS: readonly MigrationItem[] = [
     columns: { ending_at: 'TEXT' },
     indexes: {},
   },
+  {
+    // A worker paused by a provider usage/rate limit: when the broker resumes it, why, and whether the resume needs a
+    // "you were interrupted" message (its interrupted turn had been accepted). Persisted so a restart keeps the plan.
+    table: 'agents',
+    columns: { resume_at: 'TEXT', pause_reason: 'TEXT', pause_nudge: 'INTEGER' },
+    indexes: {},
+  },
 ];
 
 const SCHEMA_TABLES = [...SCHEMA.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
@@ -297,7 +304,7 @@ export class Store {
   diagnostics(now = Date.now()) {
     const expected: Record<string, string[]> = {
       runs: ['id', 'lead_agent_id', 'project_path', 'status', 'plan_status', 'created_at', 'ended_at', 'ending_at'],
-      agents: ['id', 'run_id', 'role', 'provider', 'status', 'created_at'],
+      agents: ['id', 'run_id', 'role', 'provider', 'status', 'created_at', 'resume_at', 'pause_reason', 'pause_nudge'],
       messages: ['id', 'run_id', 'to_agent', 'kind', 'body', 'created_at', 'delivered_at', 'gate_id',
         'delivery_state', 'attempts', 'lease_until'],
       gates: ['id', 'run_id', 'kind', 'status', 'created_at', 'worker_head', 'lead_head', 'merge_base',
@@ -435,6 +442,27 @@ export class Store {
     if (!entries.length) return;
     this.db.prepare(`UPDATE agents SET ${entries.map(([k]) => `${cols[k]} = ?`).join(', ')} WHERE id = ?`)
       .run(...entries.map(([, v]) => (v ?? null) as string | null), id);
+  }
+  /** Marks a worker paused until `resumeAt` (ISO). `nudge`: its resume must tell it that a turn was cut off. */
+  pauseAgent(id: string, resumeAt: string, reason: string, nudge: boolean, lastError: string | null) {
+    this.db.prepare(`UPDATE agents SET status = 'paused', resume_at = ?, pause_reason = ?, pause_nudge = ?, last_error = ?
+      WHERE id = ?`).run(resumeAt, reason, nudge ? 1 : 0, lastError, id);
+  }
+  /** Leaves the paused state (or clears stale pause data): sets `status` and forgets the resume plan. */
+  clearPause(id: string, status: AgentStatus) {
+    this.db.prepare('UPDATE agents SET status = ?, resume_at = NULL, pause_reason = NULL, pause_nudge = NULL WHERE id = ?')
+      .run(status, id);
+  }
+  pauseNudge(id: string): boolean {
+    const r = this.db.prepare('SELECT pause_nudge FROM agents WHERE id = ?').get(id) as Row | undefined;
+    return Number(r?.pause_nudge ?? 0) === 1;
+  }
+  /** Paused workers of active runs whose resume time has come (no usage queries: called on every tick). */
+  pausedDue(now: Date): { id: string; runId: string }[] {
+    return (this.db.prepare(`SELECT a.id, a.run_id, a.resume_at FROM agents a JOIN runs r ON r.id = a.run_id
+      WHERE a.status = 'paused' AND r.status = 'active'`).all() as Row[])
+      .filter((r) => !(Date.parse(String(r.resume_at)) > now.getTime())) // a missing/unreadable time is due now
+      .map((r) => ({ id: String(r.id), runId: String(r.run_id) }));
   }
 
   // ── messages ──────────────────────────────────────────────────────
@@ -699,7 +727,8 @@ export class Store {
       id: String(r.id), runId: String(r.run_id), role: String(r.role), provider: String(r.provider) as Provider,
       providerSessionId: s(r.provider_session_id), appSessionId: s(r.app_session_id), cwd: String(r.cwd),
       branch: s(r.branch), worktreePath: s(r.worktree_path), status: String(r.status) as AgentStatus,
-      task: s(r.task), result: s(r.result), lastError: s(r.last_error), busy: this.busy.has(String(r.id)),
+      task: s(r.task), result: s(r.result), lastError: s(r.last_error),
+      resumeAt: s(r.resume_at), pauseReason: s(r.pause_reason), busy: this.busy.has(String(r.id)),
       activity: (this.activity.get(String(r.id)) ?? []).map(({ ts, text }) => ({ ts, text })),
       usage: usage ? usage.get(String(r.id)) ?? emptyAgentUsage() : this.agentUsage(String(r.id)),
     };
