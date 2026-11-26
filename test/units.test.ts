@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
-import { codexBlock, removeCodexSection, upsertCodexToml } from '../src/broker/registration.js';
+import { codexBlock, installSkill, removeCodexSection, removeSkill, SKILL_MARKER, upsertCodexToml } from '../src/broker/registration.js';
 import { pendingMigrations, SKIP_BACKUP_MARKER, Store } from '../src/broker/store.js';
 import { sseEvents } from '../src/broker/cloudcli.js';
 import { callerFrom, protocolMismatch } from '../src/shim/mcp-shim.js';
@@ -34,6 +34,50 @@ describe('codex config.toml registration', () => {
     expect(next).not.toContain('coagent');
     expect(next).toContain('[mcp_servers.other]');
     expect(removeCodexSection(existing)).toBeNull();
+  });
+});
+
+describe('provider skill registration', () => {
+  it('installs both provider paths idempotently, then updates changed content', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-skills-'));
+    try {
+      const source = path.join(home, 'source.md');
+      const claude = path.join(home, '.claude', 'skills', 'coagent');
+      const codex = path.join(home, '.agents', 'skills', 'coagent');
+      fs.writeFileSync(source, '---\nname: coagent\ndescription: test\n---\n\none\n');
+      expect(installSkill(source, claude)).toBe('registered (updated)');
+      expect(installSkill(source, codex)).toBe('registered (updated)');
+      expect(installSkill(source, claude)).toBe('registered');
+      expect(installSkill(source, codex)).toBe('registered');
+      expect(fs.readFileSync(path.join(claude, 'SKILL.md'), 'utf8')).toContain('one');
+      expect(fs.existsSync(path.join(claude, SKILL_MARKER))).toBe(true);
+      expect(fs.existsSync(path.join(codex, SKILL_MARKER))).toBe(true);
+
+      fs.writeFileSync(source, '---\nname: coagent\ndescription: test\n---\n\ntwo\n');
+      expect(installSkill(source, claude)).toBe('registered (updated)');
+      expect(fs.readFileSync(path.join(claude, 'SKILL.md'), 'utf8')).toContain('two');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('refuses to overwrite or remove a foreign skill and removes owned skills', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-skills-'));
+    try {
+      const source = path.join(home, 'source.md');
+      const foreign = path.join(home, '.claude', 'skills', 'coagent');
+      const owned = path.join(home, '.agents', 'skills', 'coagent');
+      fs.writeFileSync(source, 'managed');
+      fs.mkdirSync(foreign, { recursive: true });
+      fs.writeFileSync(path.join(foreign, 'SKILL.md'), 'user content');
+      expect(installSkill(source, foreign)).toMatch(/^failed:/);
+      expect(fs.readFileSync(path.join(foreign, 'SKILL.md'), 'utf8')).toBe('user content');
+      expect(removeSkill(foreign)).toMatch(/^not removed:/);
+      expect(fs.existsSync(foreign)).toBe(true);
+
+      installSkill(source, owned);
+      expect(removeSkill(owned)).toBe('removed');
+      expect(fs.existsSync(owned)).toBe(false);
+      expect(removeSkill(owned)).toBe('removed');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
   });
 });
 

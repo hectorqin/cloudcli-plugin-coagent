@@ -12,11 +12,19 @@ export const TOOL_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 export interface RegistrationPaths {
   claudeJson: string;
   codexToml: string;
+  claudeSkill: string;
+  codexSkill: string;
+  sourceSkill?: string;
 }
 const defaultPaths = (): RegistrationPaths => ({
   claudeJson: path.join(os.homedir(), '.claude.json'),
   codexToml: path.join(os.homedir(), '.codex', 'config.toml'),
+  claudeSkill: path.join(os.homedir(), '.claude', 'skills', MCP_NAME),
+  codexSkill: path.join(os.homedir(), '.agents', 'skills', MCP_NAME),
 });
+
+export const SKILL_MARKER = '.coagent-owned';
+const SKILL_MARKER_CONTENT = 'Managed by the CloudCLI CoAgent plugin.\n';
 
 const tomlStr = (s: string) => JSON.stringify(s); // TOML basic strings share JSON's escaping for our inputs
 
@@ -65,6 +73,30 @@ function writeAtomic(file: string, text: string) {
   fs.renameSync(tmp, file);
 }
 
+/** Install only into a new directory or one carrying our ownership marker. */
+export function installSkill(source: string, directory: string): string {
+  const marker = path.join(directory, SKILL_MARKER);
+  const target = path.join(directory, 'SKILL.md');
+  if (fs.existsSync(directory) && !fs.existsSync(marker)) {
+    return 'failed: existing skill is not managed by coagent';
+  }
+  const content = fs.readFileSync(source, 'utf8');
+  if (fs.existsSync(target) && fs.readFileSync(target, 'utf8') === content
+    && fs.existsSync(marker) && fs.readFileSync(marker, 'utf8') === SKILL_MARKER_CONTENT) return 'registered';
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(target, content);
+  fs.writeFileSync(marker, SKILL_MARKER_CONTENT);
+  return 'registered (updated)';
+}
+
+/** Remove the complete skill directory only when its marker proves ownership. */
+export function removeSkill(directory: string): string {
+  if (!fs.existsSync(directory)) return 'removed';
+  if (!fs.existsSync(path.join(directory, SKILL_MARKER))) return 'not removed: existing skill is not managed by coagent';
+  fs.rmSync(directory, { recursive: true });
+  return 'removed';
+}
+
 /**
  * Registers the shim as a user-level MCP server for Claude and Codex, idempotently.
  * Claude's ~/.claude.json is rewritten by running Claude processes, so we go through `claude mcp` instead of editing it.
@@ -94,6 +126,11 @@ export async function ensureRegistered(shim: string, node = process.execPath, p 
   } catch (e) {
     status.codex = `failed: ${(e as Error).message.split('\n')[0]}`;
   }
+  const sourceSkill = p.sourceSkill ?? path.resolve(path.dirname(shim), '..', 'skills', MCP_NAME, 'SKILL.md');
+  for (const [key, directory] of [['claude-skill', p.claudeSkill], ['codex-skill', p.codexSkill]] as const) {
+    try { status[key] = installSkill(sourceSkill, directory); }
+    catch (e) { status[key] = `failed: ${(e as Error).message.split('\n')[0]}`; }
+  }
   return status;
 }
 
@@ -112,6 +149,10 @@ export async function unregister(p = defaultPaths()): Promise<Record<string, str
     status.codex = 'removed';
   } catch (e) {
     status.codex = `not removed: ${(e as Error).message.split('\n')[0]}`;
+  }
+  for (const [key, directory] of [['claude-skill', p.claudeSkill], ['codex-skill', p.codexSkill]] as const) {
+    try { status[key] = removeSkill(directory); }
+    catch (e) { status[key] = `not removed: ${(e as Error).message.split('\n')[0]}`; }
   }
   return status;
 }

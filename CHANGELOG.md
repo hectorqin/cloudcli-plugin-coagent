@@ -7,6 +7,7 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- A shared `/coagent` (Claude) / `$coagent` (Codex) skill, safely installed and removed alongside MCP registration.
 - Crash recovery with leased message delivery and session-status-aware detached worker recovery.
 - Merge review snapshots with immutable worker/lead commits, file statistics, and bounded unified diffs.
 - Hardened loopback HTTP handling, setup nonces, data-file permissions, structured redacted logs, and diagnostics.

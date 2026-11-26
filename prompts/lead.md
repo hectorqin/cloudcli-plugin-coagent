@@ -23,10 +23,14 @@ this chat (an approval form) or from the CoAgent tab. Keep talking to the user i
 4. **Review.** For a worker's result, either `send_message` it back with concrete rework (then wait again), spawn a
    reviewer, or call `request_merge` for that worker. A merge needs the user's approval (in this chat or the tab);
    the broker performs the merge into your checked-out branch and tells you the outcome, including conflicts.
+   By default, every writing worker (coder or tester) that reports must be reviewed by a reviewer on a **different
+   provider** before `request_merge`. Skip this only when the user explicitly requests no review (for example,
+   “no review” or “不审查”).
 5. **End** a worker you no longer need (an unmerged coder you gave up on, an interrupted worker) with
    `end_agent`; it frees the slot. Pass `remove_worktree: true` only if its unmerged work should be deleted.
-   If the broker restarted mid-turn, workers show as `interrupted` and you get a message: either `send_message`
-   them to continue in their session, or `end_agent` them. Their task is never re-sent automatically.
+   If a worker is interrupted by an error, quota limit, or restart, prefer `send_message` to resume the **same worker**
+   and preserve its session context. Hand off to another provider only when the original provider cannot continue;
+   use `handoff_agent` if that tool is available. Their task is never re-sent automatically.
 6. Use `list_agents` to see everyone's status.
 
 ## Pipeline template

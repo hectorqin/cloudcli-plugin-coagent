@@ -38,6 +38,15 @@
 - 工具：`spawn_agent`、`send_message`、`read_inbox`、`report_result`、`submit_plan`、`request_merge`、`list_agents`。
 - 非协作会话调用时返回「未加入协作」（`spawn_agent` 除外，它触发升级）。
 
+### 4.1.1 显式启动 skill
+
+插件随包发布同一份 `skills/coagent/SKILL.md`，注册时分别安装到
+`~/.claude/skills/coagent/SKILL.md`（Claude：`/coagent`）和
+`~/.agents/skills/coagent/SKILL.md`（Codex：`$coagent`）。CloudCLI 的 Codex provider 也把后者作为全局默认
+skill source。skill 只负责发起 `submit_plan` 并强调跨 provider review 和中断续跑；完整协议仍由工具结果提供。
+每个安装目录带 `.coagent-owned` 标记，只有带标记的目录才会被升级或卸载，避免覆盖用户自建的同名 skill。
+MCP 与 skill 共用 `autoRegister` 开关和 tab 注册/卸载操作。
+
 ### 4.2 `plugin/` 后端 = broker
 
 - 状态：插件自有 SQLite（`~/.cloudcli-coagent/coagent.db`）为唯一事实源。原定的 `.coagent/` markdown 导出**未实现**。

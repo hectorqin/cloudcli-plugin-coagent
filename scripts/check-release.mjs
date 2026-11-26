@@ -4,8 +4,12 @@ import fs from 'node:fs';
 const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
 const source = fs.readFileSync('src/shared/version.ts', 'utf8');
+const skill = fs.readFileSync('skills/coagent/SKILL.md', 'utf8');
 const match = source.match(/export const VERSION = ['"]([^'"]+)['"]/);
 if (!match) throw new Error('src/shared/version.ts does not export a literal VERSION');
+if (!/^---\nname: coagent\ndescription: .+\n---\n/m.test(skill)) {
+  throw new Error('skills/coagent/SKILL.md must have coagent name and description frontmatter');
+}
 
 const versions = { package: pkg.version, manifest: manifest.version, source: match[1] };
 if (new Set(Object.values(versions)).size !== 1) {
