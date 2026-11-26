@@ -6,6 +6,9 @@
  */
 
 export const DEFAULT_QUOTA_BACKOFF_MINUTES = 30;
+/** No pause lasts longer than this: a parsed reset further away (or garbage) falls back to the configured backoff. */
+export const MAX_PAUSE_MS = 7 * 24 * 3_600_000;
+export const MAX_QUOTA_BACKOFF_MINUTES = MAX_PAUSE_MS / 60_000;
 /** Resume a little after the announced reset, so the provider has really reset the counter. */
 const RESET_GRACE_MS = 60_000;
 
@@ -16,25 +19,37 @@ export interface QuotaHit {
   resetAt: number | null;
 }
 
-const USAGE_PATTERNS = [
+/**
+ * Phrases only providers use about the account's own quota: they count wherever the error came from.
+ * Everything else below is generic wording that a tool or an external API can produce too (an agent debugging an HTTP
+ * 429 of some service), so it only counts for the run's terminal failure (see SendResult.terminal).
+ */
+const PROVIDER_USAGE_PATTERNS = [
+  /\bhit your (?:[\w-]+ )*limit\b/i, // "You've hit your usage limit", "hit your 5-hour limit", "hit your weekly limit"
+  /\b\d+-hour limit\b/i,
+  /\binsufficient_quota\b/i,
+];
+const GENERIC_USAGE_PATTERNS = [
   /\busage limit\b/i,
-  /\bhit your (?:[\w-]+ )*limit\b/i, // "hit your 5-hour limit", "hit your weekly limit"
   /\bquota (?:exceeded|exhausted|reached)\b/i,
   /\bexceeded (?:your |the )?(?:current )?quota\b/i,
-  /\binsufficient_quota\b/i,
   /\bout of (?:credits|quota)\b/i,
 ];
-const RATE_PATTERNS = [
+const GENERIC_RATE_PATTERNS = [
   /(?:^|[^a-z])rate[ _-]?limit/i, // rate limit, rate-limited, rate_limit_error
   /\btoo many requests\b/i,
   /(?:^|[^\d.:])429(?:[^\d.:]|$)/, // HTTP 429, not part of a larger number, version or time
 ];
 
-/** null when the error is not about quota or rate limits. `now` anchors the reset time to the next occurrence. */
-export function detectQuota(error: string, now: number): QuotaHit | null {
+/**
+ * null when the error is not about quota or rate limits. `now` anchors the reset time to the next occurrence.
+ * `terminal`: the text is the run's own terminal failure (provider or transport), not some intermediate error event;
+ * only then do generic signatures ("rate limit", "429", "too many requests", "usage limit") count.
+ */
+export function detectQuota(error: string, now: number, opts: { terminal: boolean }): QuotaHit | null {
   const text = error ?? '';
-  const usage = USAGE_PATTERNS.some((p) => p.test(text));
-  if (!usage && !RATE_PATTERNS.some((p) => p.test(text))) return null;
+  const usage = PROVIDER_USAGE_PATTERNS.some((p) => p.test(text)) || (opts.terminal && GENERIC_USAGE_PATTERNS.some((p) => p.test(text)));
+  if (!usage && !(opts.terminal && GENERIC_RATE_PATTERNS.some((p) => p.test(text)))) return null;
   return { reason: usage ? 'usage limit' : 'rate limit', resetAt: parseResetTime(text, now) };
 }
 
@@ -48,6 +63,12 @@ const ZONE_OFFSETS: Record<string, number> = { UTC: 0, GMT: 0, Z: 0 };
  * CloudCLI usually runs on UTC servers. If that guess is early, the resumed turn fails again and simply re-pauses.
  */
 export function parseResetTime(text: string, now: number): number | null {
+  const at = rawResetTime(text, now);
+  // Anything not finite, not in the future, or further than MAX_PAUSE_MS counts as unreadable (→ configured backoff).
+  return at !== null && Number.isFinite(at) && at > now && at - now <= MAX_PAUSE_MS ? at : null;
+}
+
+function rawResetTime(text: string, now: number): number | null {
   const relative = parseRelative(text);
   if (relative !== null) return now + relative + RESET_GRACE_MS;
 
@@ -67,17 +88,41 @@ export function parseResetTime(text: string, now: number): number | null {
 
   const zone = m[4];
   const offsetText = m[5];
-  let offsetMin: number | null = 0; // no timezone given: UTC (see above)
-  if (offsetText) offsetMin = parseOffset(offsetText);
-  else if (zone && zone.toUpperCase() in ZONE_OFFSETS) offsetMin = ZONE_OFFSETS[zone.toUpperCase()];
-  else if (zone) offsetMin = zoneOffsetMinutes(zone, now);
-  if (offsetMin === null) return null;
+  // No timezone given: UTC (see above). Otherwise a fixed offset, or an IANA zone resolved on the target date.
+  let offsetAt: (utcMs: number) => number | null = () => 0;
+  if (offsetText) { const o = parseOffset(offsetText); offsetAt = () => o; }
+  else if (zone && zone.toUpperCase() in ZONE_OFFSETS) { const o = ZONE_OFFSETS[zone.toUpperCase()]; offsetAt = () => o; }
+  else if (zone) offsetAt = (utcMs) => zoneOffsetMinutes(zone, utcMs);
 
-  // Wall-clock hh:mm in that zone, on the zone's current date; if already past, the next day.
-  const zoneNow = new Date(now + offsetMin * 60_000);
-  let at = Date.UTC(zoneNow.getUTCFullYear(), zoneNow.getUTCMonth(), zoneNow.getUTCDate(), hour, minute) - offsetMin * 60_000;
-  if (at <= now) at += 24 * 3_600_000;
-  return at + RESET_GRACE_MS;
+  // hh:mm on the zone's current date; if that has passed, on the next date. Each is resolved with the offset in force
+  // at that wall time, so a DST change between now and the reset is honored.
+  const nowOffset = offsetAt(now);
+  if (nowOffset === null) return null;
+  const today = new Date(now + nowOffset * 60_000);
+  for (let days = 0; days <= 1; days++) {
+    const at = wallTimeToUtc(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + days, hour, minute, offsetAt);
+    if (at === null) return null;
+    if (at > now) return at + RESET_GRACE_MS;
+  }
+  return null;
+}
+
+/**
+ * The UTC instant of a wall-clock time in a zone whose offset may depend on the date (DST), found by iterating:
+ * guess with an offset, look up the offset in force at the guess, repeat until stable. In a spring-forward gap (a wall
+ * time that does not exist) it ends on one side of the gap; in a fall-back overlap, on one of the two instants.
+ */
+function wallTimeToUtc(y: number, mo: number, d: number, h: number, mi: number, offsetAt: (utcMs: number) => number | null): number | null {
+  const wall = Date.UTC(y, mo, d, h, mi); // normalizes d past the month end
+  let guess = wall;
+  for (let i = 0; i < 4; i++) {
+    const off = offsetAt(guess);
+    if (off === null) return null;
+    const next = wall - off * 60_000;
+    if (next === guess) return guess;
+    guess = next;
+  }
+  return guess;
 }
 
 function parseRelative(text: string): number | null {

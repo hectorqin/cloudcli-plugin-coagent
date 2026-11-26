@@ -173,6 +173,13 @@ export const Git = {
    * exactly as they were. Ignored files (build output, node_modules, …) are not captured.
    */
   async snapshotWorkingTree(cwd: string): Promise<WorkingTreeSnapshot> {
+    // A submodule's own changes live in its repository, not in this tree (only its gitlink would be captured), so a
+    // snapshot with dirty submodules would silently miss work: refuse instead.
+    const dirty = await Git.dirtySubmodules(cwd);
+    if (dirty.length) {
+      throw new Error(`submodule(s) with work that cannot be carried over: ${dirty.map((d) => `${d.path} (${d.issues.join(', ')})`).join('; ')}. `
+        + 'Commit (and push) that work inside the submodule and record the submodule commit, or discard it, then retry');
+    }
     const head = await Git.head(cwd);
     const headTree = await git(cwd, 'rev-parse', `${head}^{tree}`);
     const realIndex = await git(cwd, 'rev-parse', '--path-format=absolute', '--git-path', 'index');
@@ -188,6 +195,29 @@ export const Git = {
     } finally {
       fs.rmSync(tmpIndex, { force: true });
     }
+  },
+
+  /**
+   * Submodules of a worktree whose content differs from what the superproject records: new commits checked out,
+   * modified tracked files, or untracked files inside it (`git status --porcelain=v2` submodule flags; nested
+   * submodules show up through their parent's flags).
+   */
+  async dirtySubmodules(cwd: string): Promise<{ path: string; issues: string[] }[]> {
+    const tokens = nulTokens(await git(cwd, 'status', '--porcelain=v2', '-z', '--ignore-submodules=none', '--untracked-files=normal'));
+    const out: { path: string; issues: string[] }[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      const kind = t[0];
+      if (kind === '2') i++; // a rename/copy entry is followed by its original path
+      if (kind !== '1' && kind !== '2') continue;
+      const fields = t.split(' ');
+      const sub = fields[2] ?? '';
+      if (!sub.startsWith('S')) continue;
+      const issues = [sub[1] === 'C' && 'new commits', sub[2] === 'M' && 'modified files', sub[3] === 'U' && 'untracked files']
+        .filter((x): x is string => !!x);
+      if (issues.length) out.push({ path: fields.slice(kind === '1' ? 8 : 9).join(' '), issues });
+    }
+    return out;
   },
 
   /**

@@ -26,7 +26,13 @@ export type SendResult =
   | { status: 'busy' }
   /** The user aborted the run in CloudCLI after it was accepted (not a failure; nothing to retry). */
   | { status: 'aborted'; appSessionId: string | null }
-  | { status: 'error'; error: string };
+  /**
+   * `terminal`: this text is how the run itself failed: the /api/agent response status, the route's own failure
+   * event, or the provider error immediately before a failing terminal `complete`. Not terminal: anything else (an
+   * intermediate error event, a client-side failure). Only terminal failures may be classified as provider quota/rate
+   * limits by their generic wording (src/broker/quota.ts).
+   */
+  | { status: 'error'; error: string; terminal?: boolean };
 
 /** Everything the broker needs from CloudCLI. Faked in tests. */
 export interface CloudCli {
@@ -148,27 +154,9 @@ export class HttpCloudCli implements CloudCli {
     if (res.status === 409) return { status: 'busy' };
     if (!res.ok || !res.body) {
       const text = await res.text().catch(() => '');
-      return { status: 'error', error: `HTTP ${res.status}: ${text.slice(0, 300)}` };
+      return { status: 'error', error: `HTTP ${res.status}: ${text.slice(0, 300)}`, terminal: true };
     }
-
-    let appSessionId: string | null = null;
-    let error: string | null = null;
-    let aborted = false;
-    for await (const event of sseEvents(res.body)) {
-      // A tab aborted the run: the terminal `complete` says so (createCompleteMessage, shared/utils.ts:535-553), and
-      // the route adds { type: 'status', message: 'Run aborted', aborted: true } (agent.routes.ts:834, :1165-1167).
-      if (event.aborted === true && (event.kind === 'complete' || event.type === 'status')) aborted = true;
-      if (event.type === 'session-id' && typeof event.sessionId === 'string') {
-        appSessionId = event.sessionId;
-        onAppSessionId?.(appSessionId);
-      } else if (event.type === 'error' || event.kind === 'error') {
-        error = String(event.error ?? event.message ?? event.content ?? 'unknown error');
-      } else {
-        onEvent?.(event);
-      }
-    }
-    if (aborted) return { status: 'aborted', appSessionId };
-    return error ? { status: 'error', error } : { status: 'ok', appSessionId };
+    return readRun(res.body, onAppSessionId, onEvent);
   }
 
   private sessionStatusSupported: boolean | null = null;
@@ -227,6 +215,56 @@ export class HttpCloudCli implements CloudCli {
   sessionByAppId(appSessionId: string): SessionInfo | null {
     return this.query('SELECT * FROM sessions WHERE session_id = ?', appSessionId);
   }
+}
+
+/**
+ * Reads one /api/agent run stream to its outcome. CloudCLI's contract (shared/utils.js createCompleteMessage): every
+ * provider run ends with exactly one `complete` {exitCode, success, aborted}. A provider failure is reported as a
+ * `kind: 'error'` event sent right before a failing `complete` (claude-runtime / codex-runtime catch blocks); the route
+ * itself reports a run that threw as `{ type: 'error' }` and ends the stream (agent.routes.js). Other error events can
+ * appear mid-turn (e.g. a Codex item error while the agent debugs something) and do not end the run.
+ *  - a successful `complete` → ok, whatever error events came before it;
+ *  - a failing `complete` → error; terminal when an error event immediately preceded it (that is its cause);
+ *  - the route's `{ type: 'error' }` → error, terminal;
+ *  - no `complete` (older hosts) → error if any error event was seen, terminal only if it was the last thing sent.
+ */
+export async function readRun(
+  body: ReadableStream<Uint8Array>, onAppSessionId?: (id: string) => void, onEvent?: (event: Record<string, unknown>) => void,
+): Promise<SendResult> {
+  let appSessionId: string | null = null;
+  let aborted = false;
+  let lastError: string | null = null;
+  /** The error event nothing but status/lifecycle events followed (the candidate cause of the run's end). */
+  let pendingError: string | null = null;
+  let routeError: string | null = null;
+  let complete: Record<string, unknown> | null = null;
+  for await (const event of sseEvents(body)) {
+    // A tab aborted the run: the terminal `complete` says so (createCompleteMessage, shared/utils.ts:535-553), and
+    // the route adds { type: 'status', message: 'Run aborted', aborted: true } (agent.routes.ts:834, :1165-1167).
+    if (event.aborted === true && (event.kind === 'complete' || event.type === 'status')) aborted = true;
+    if (event.type === 'session-id' && typeof event.sessionId === 'string') {
+      appSessionId = event.sessionId;
+      onAppSessionId?.(appSessionId);
+    } else if (event.type === 'error' || event.kind === 'error') {
+      lastError = String(event.error ?? event.content ?? event.message ?? 'unknown error');
+      pendingError = lastError;
+      if (event.type === 'error') routeError = lastError;
+    } else {
+      if (event.kind === 'complete') complete = event;
+      else if (event.kind !== 'status' && event.type !== 'status' && event.type !== 'done') pendingError = null;
+      onEvent?.(event);
+    }
+  }
+  if (aborted) return { status: 'aborted', appSessionId };
+  if (routeError !== null) return { status: 'error', error: routeError, terminal: true };
+  if (complete) {
+    const failed = complete.success === false || (typeof complete.exitCode === 'number' && complete.exitCode !== 0);
+    if (!failed) return { status: 'ok', appSessionId };
+    if (pendingError !== null) return { status: 'error', error: pendingError, terminal: true };
+    return { status: 'error', error: lastError ?? `the run failed (exit code ${String(complete.exitCode ?? 'unknown')})`, terminal: false };
+  }
+  if (lastError === null) return { status: 'ok', appSessionId };
+  return { status: 'error', error: lastError, terminal: pendingError !== null };
 }
 
 /** Minimal SSE parser over a fetch body: yields each `data:` JSON payload. */

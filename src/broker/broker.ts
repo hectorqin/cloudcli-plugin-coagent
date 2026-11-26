@@ -9,7 +9,9 @@ import type { CloudCli } from './cloudcli.js';
 import type { GitOps, WorkingTreeSnapshot } from './git.js';
 import type { Prompts } from './prompts.js';
 import type { Store } from './store.js';
-import { DEFAULT_QUOTA_BACKOFF_MINUTES, detectQuota, formatUtc, type QuotaHit } from './quota.js';
+import {
+  DEFAULT_QUOTA_BACKOFF_MINUTES, detectQuota, formatUtc, MAX_PAUSE_MS, MAX_QUOTA_BACKOFF_MINUTES, type QuotaHit,
+} from './quota.js';
 import { extractUsage, type TurnUsage } from './usage.js';
 
 export const MAX_WORKERS = 4;
@@ -158,11 +160,14 @@ export class Broker {
   }
   /** Wait before auto-resuming a worker paused by a quota error whose text gives no reset time. */
   quotaBackoffMinutes(): number {
-    const v = this.d.store.getJson<number>('quotaBackoffMinutes', DEFAULT_QUOTA_BACKOFF_MINUTES);
-    return Number.isFinite(v) && v > 0 ? v : DEFAULT_QUOTA_BACKOFF_MINUTES;
+    const v = this.d.store.getJson<unknown>('quotaBackoffMinutes', DEFAULT_QUOTA_BACKOFF_MINUTES);
+    // Clamped like a parsed reset time, whatever the stored value is.
+    return typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.min(v, MAX_QUOTA_BACKOFF_MINUTES) : DEFAULT_QUOTA_BACKOFF_MINUTES;
   }
   setQuotaBackoffMinutes(v: unknown) {
-    if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0 || v > 7 * 24 * 60) fail('quotaBackoffMinutes must be a number of minutes (> 0, at most a week)');
+    if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0 || v > MAX_QUOTA_BACKOFF_MINUTES) {
+      fail(`quotaBackoffMinutes must be a number of minutes (> 0, at most ${MAX_QUOTA_BACKOFF_MINUTES})`);
+    }
     this.d.store.setJson('quotaBackoffMinutes', v);
   }
 
@@ -623,8 +628,10 @@ export class Broker {
    */
   private pause(agent: AgentDTO, hit: QuotaHit, error: string, nudge: boolean) {
     const { store } = this.d;
-    const guessed = hit.resetAt === null;
-    const at = hit.resetAt ?? this.now() + this.quotaBackoffMinutes() * 60_000;
+    // Defense in depth: only a finite reset within MAX_PAUSE_MS is used; anything else gets the configured backoff.
+    const usable = hit.resetAt !== null && Number.isFinite(hit.resetAt) && hit.resetAt > this.now() && hit.resetAt - this.now() <= MAX_PAUSE_MS;
+    const guessed = !usable;
+    const at = usable ? hit.resetAt! : this.now() + this.quotaBackoffMinutes() * 60_000;
     const resumeAt = new Date(at).toISOString();
     const lead = store.run(agent.runId)!.leadAgentId;
     store.transaction(() => {
@@ -777,9 +784,21 @@ export class Broker {
       return w;
     };
     check();
-    // CloudCLI may still run a turn this process does not know about (e.g. started from its own tab).
-    const processing = await this.processing(check());
-    if (processing === true) fail(`${wid}'s session is still running a turn in CloudCLI; wait for it to finish, then hand it off.`);
+    // CloudCLI may still run a turn this process does not know about (e.g. started from its own tab). The same policy
+    // as deleting a worktree: only a session CloudCLI confirms idle, or one that never ran, may be handed off, because
+    // a running session could keep writing the old worktree after the snapshot.
+    const idleOrWhy = async (w: AgentDTO): Promise<string | null> => {
+      const processing = await this.processing(w);
+      if (processing === false) return null;
+      return processing
+        ? `${wid}'s session is still running a turn in CloudCLI; wait until it is idle, then hand it off.`
+        : `CloudCLI cannot confirm that ${wid}'s session is idle (this host has no session-status endpoint, or the query `
+          + 'failed), and a running session could keep writing its worktree after the copy. Install the CoAgent CloudCLI '
+          + 'fork (it adds session status), or retry once CloudCLI answers; to continue without a handoff, send_message '
+          + `${wid} or end_agent it and spawn_agent a replacement yourself.`;
+    };
+    const busy = await idleOrWhy(check());
+    if (busy) fail(busy);
     const old = check(); // re-checked after the await; from here until the end no turn can start for it
     this.handingOff.add(wid);
     let out: { id: string; cwd: string; branch: string | null; snap: WorkingTreeSnapshot | null; gate: number | null; carriedMessages: number };
@@ -792,7 +811,7 @@ export class Broker {
         let branch: string | null = null;
         if (!READONLY_ROLES.has(old.role)) {
           try { snap = await git.snapshotWorkingTree(old.worktreePath!); } catch (e) {
-            fail(`Could not read the worktree of ${wid} (${old.worktreePath}): ${firstLine(e)}. Nothing was changed.`);
+            fail(`Handoff refused: cannot capture the worktree of ${wid} (${old.worktreePath}): ${firstLine(e)}. Nothing was changed.`);
           }
           try {
             ({ worktreePath, branch } = await git.createWorktree(lead.cwd, runId, id, snap!.head));
@@ -804,6 +823,13 @@ export class Broker {
             fail(`Handoff aborted: carrying over the uncommitted changes of ${wid} failed (${firstLine(e)}). `
               + `Nothing was changed; ${wid} and its worktree ${old.worktreePath} are untouched.`);
           }
+        }
+        // Asked again now that the copy exists: a turn started meanwhile (outside this broker) may have written after
+        // the snapshot. Bounded by the session-status timeout, so the repository lock is not held for long.
+        const late = await idleOrWhy(old);
+        if (late) {
+          if (worktreePath) await git.discardWorktree(lead.cwd, worktreePath, branch!);
+          fail(`Handoff aborted, nothing was changed: ${late}`);
         }
         const cwd = worktreePath ?? lead.cwd;
         try {
@@ -851,7 +877,6 @@ export class Broker {
       + `${wid} is ended and frees its slot${old.worktreePath ? `; its worktree ${old.worktreePath} and branch ${old.branch} are kept` : ''}.`
       + `${gate !== null ? ` Its pending merge request (gate #${gate}) was rejected; request_merge ${id} when it reports.` : ''}`
       + `${carriedMessages ? ` ${carriedMessages} undelivered message(s) to ${wid} were included in the hand-over.` : ''}`
-      + `${processing === null ? ` Note: CloudCLI could not confirm that ${wid}'s session is idle; anything it still writes stays in its old worktree.` : ''}`
       + ' Call wait_for_agents.';
   }
 
@@ -1462,7 +1487,8 @@ export class Broker {
     if (res.status === 'error') {
       // A worker out of provider quota is paused, not failed: it resumes in the same session when the quota resets.
       // (Only one that was mid-task: a worker that already reported, or was ended meanwhile, is handled as before.)
-      const quota = !isLead && ['running', 'starting', 'idle', 'error'].includes(now.status) ? detectQuota(res.error, this.now()) : null;
+      const quota = !isLead && ['running', 'starting', 'idle', 'error'].includes(now.status)
+        ? detectQuota(res.error, this.now(), { terminal: res.terminal === true }) : null;
       if (quota) {
         this.pause(now, quota, res.error, accepted);
         this.kick();

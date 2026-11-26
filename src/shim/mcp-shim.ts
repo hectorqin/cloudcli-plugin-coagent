@@ -223,7 +223,8 @@ const TOOLS: { name: ToolName; description: string; shape: z.ZodRawShape }[] = [
       + 'same role on another provider. A writer\'s new worktree starts at the old branch HEAD with its uncommitted and '
       + 'untracked changes carried over (verified); the new worker gets the original task, recent activity, last '
       + 'result/error, undelivered messages and your note. The old worker ends (worktree and branch kept, slot freed, '
-      + 'pending merge request rejected). Refused while the worker is running a turn.',
+      + 'pending merge request rejected). Refused while the worker is running a turn, when CloudCLI cannot confirm its '
+      + 'session is idle, or when a submodule holds work that cannot be carried over.',
     shape: {
       worker: z.string().describe('Worker agent id to hand off'),
       provider: z.enum(['claude', 'codex']).describe('Provider for the new worker (usually the other one)'),

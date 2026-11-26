@@ -56,9 +56,10 @@ class FakeCloudCli implements CloudCli {
       await new Promise<void>((r) => this.holds.push(r));
       this.live.delete(app0);
       const held = this.holdError.shift();
-      return held ? { status: 'error', error: held } : { status: 'ok', appSessionId: app0 };
+      return held ? { status: 'error', error: held, terminal: true } : { status: 'ok', appSessionId: app0 };
     }
-    if (st === 'error') return { status: 'error', error: this.errorText.shift() ?? 'boom' };
+    // Like HttpCloudCli: an HTTP failure or the error that ended the run is terminal.
+    if (st === 'error') return { status: 'error', error: this.errorText.shift() ?? 'boom', terminal: true };
     let app = input.sessionId ?? null;
     if (!app) {
       app = `app-${++this.n}`;
@@ -66,7 +67,7 @@ class FakeCloudCli implements CloudCli {
     }
     onApp?.(app);
     emit();
-    if (st === 'accepted-error') return { status: 'error', error: this.errorText.shift() ?? 'died mid-turn' };
+    if (st === 'accepted-error') return { status: 'error', error: this.errorText.shift() ?? 'died mid-turn', terminal: true };
     if (st === 'aborted') return { status: 'aborted', appSessionId: app };
     return { status: 'ok', appSessionId: app };
   }
@@ -2363,5 +2364,128 @@ describe('handoff_agent (Q42)', () => {
     expect(fs.readdirSync(path.dirname(old.worktreePath!))).toEqual(before);
     expect(sh(repo, 'branch', '--list', 'coagent/*').split('\n')).toHaveLength(1);
     expect(fs.readFileSync(path.join(old.worktreePath!, 'wip.txt'), 'utf8')).toBe('wip\n');
+  });
+});
+
+describe('review rework (Q41/Q42)', () => {
+  it('handoff is refused when CloudCLI cannot confirm the session is idle (null status)', async () => {
+    await startApprovedRun();
+    const w = await spawn('coder');
+    cc.status = () => null;
+    const r = await call('handoff_agent', { worker: w.id, provider: 'codex' });
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/cannot confirm that .* session is idle/);
+    expect(r.text).toMatch(/Install the CoAgent CloudCLI fork/);
+    expect(store.agent(w.id)!.status).toBe('idle');
+    expect(store.agents(w.runId)).toHaveLength(2);
+  });
+
+  it('handoff aborts cleanly when the session starts processing between the snapshot and the switch', async () => {
+    const run = await startApprovedRun();
+    const w = await spawn('coder');
+    fs.writeFileSync(path.join(w.worktreePath!, 'wip.txt'), 'wip\n');
+    let asked = 0;
+    cc.status = () => ++asked > 1; // idle on the first check, processing on the re-check
+    const before = fs.readdirSync(path.dirname(w.worktreePath!));
+    const r = await call('handoff_agent', { worker: w.id, provider: 'codex' });
+    expect(asked).toBe(2);
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/Handoff aborted, nothing was changed: .* still running a turn/);
+    expect(store.agent(w.id)!.status).toBe('idle');
+    expect(store.agents(run.id)).toHaveLength(2);
+    expect(fs.readdirSync(path.dirname(w.worktreePath!))).toEqual(before);
+    expect(sh(repo, 'branch', '--list', 'coagent/*').split('\n')).toHaveLength(1);
+    expect(store.events(run.id).some((e) => e.type === 'handoff')).toBe(false);
+  });
+
+  it('handoff refuses a worktree with dirty submodules and lists them', async () => {
+    const lib = path.join(tmp, 'lib');
+    fs.mkdirSync(lib);
+    sh(lib, 'init', '-q', '-b', 'main');
+    fs.writeFileSync(path.join(lib, 'lib.txt'), 'v1\n');
+    sh(lib, 'add', '-A');
+    sh(lib, 'commit', '-q', '-m', 'lib');
+    sh(repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'vendor/lib');
+    sh(repo, 'commit', '-q', '-m', 'add submodule');
+    await startApprovedRun();
+    const w = await spawn('coder');
+    sh(w.worktreePath!, '-c', 'protocol.file.allow=always', 'submodule', 'update', '-q', '--init');
+    expect(await Git.dirtySubmodules(w.worktreePath!)).toEqual([]);
+    fs.writeFileSync(path.join(w.worktreePath!, 'vendor/lib/lib.txt'), 'v2\n');
+    fs.writeFileSync(path.join(w.worktreePath!, 'vendor/lib/new.txt'), 'new\n');
+    expect(await Git.dirtySubmodules(w.worktreePath!)).toEqual([{ path: 'vendor/lib', issues: ['modified files', 'untracked files'] }]);
+    const r = await call('handoff_agent', { worker: w.id, provider: 'codex' });
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/Handoff refused: .*submodule\(s\) with work that cannot be carried over: vendor\/lib \(modified files, untracked files\)/);
+    expect(store.agent(w.id)!.status).toBe('idle');
+    expect(store.agents(w.runId)).toHaveLength(2);
+  });
+
+  it('the configured backoff is clamped to the same 7-day cap', () => {
+    store.setJson('quotaBackoffMinutes', 1e12);
+    expect(broker.quotaBackoffMinutes()).toBe(7 * 24 * 60);
+    store.setJson('quotaBackoffMinutes', 'abc');
+    expect(broker.quotaBackoffMinutes()).toBe(30);
+    expect(() => broker.setQuotaBackoffMinutes(7 * 24 * 60 + 1)).toThrow(/at most 10080/);
+    expect(() => broker.setQuotaBackoffMinutes(Infinity)).toThrow();
+  });
+
+  describe('quota classification through the real /api/agent stream', () => {
+    const sse = (events: unknown[]) => events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('');
+    let scripts: unknown[][];
+    let prevKey: string | undefined;
+    beforeEach(() => {
+      scripts = [];
+      prevKey = process.env.COAGENT_API_KEY;
+      process.env.COAGENT_API_KEY = 'ck_test';
+      const fetchImpl = (async () => new Response(new ReadableStream({
+        start(ctl) { ctl.enqueue(new TextEncoder().encode(sse(scripts.shift() ?? []))); ctl.close(); },
+      }), { status: 200 })) as unknown as typeof fetch;
+      const http = new HttpCloudCli({
+        pluginsConfigPath: path.join(tmp, 'none.json'), localServerPath: path.join(tmp, 'none.json'), dbPath: path.join(tmp, 'none.db'), fetchImpl,
+      });
+      // The lead still goes through the fake (it is known to it); workers use the real SSE reader.
+      const real = Object.assign(new FakeCloudCli(), { sessions: cc.sessions });
+      real.send = (input, onApp, onEvent) => (input.sessionId === 'lead-app' ? cc.send(input, onApp, onEvent) : http.send(input, onApp, onEvent));
+      broker = new Broker({ store, cloudcli: real, git: Git, prompts: filePrompts(PROMPTS), now: () => clock });
+    });
+    afterEach(() => {
+      if (prevKey === undefined) delete process.env.COAGENT_API_KEY; else process.env.COAGENT_API_KEY = prevKey;
+    });
+    const start = { type: 'session-id', sessionId: 'app-w' };
+    const text = (t: string) => ({ kind: 'text', role: 'assistant', content: t, provider: 'codex' });
+
+    it('an unrelated tool error mentioning HTTP 429 in a turn that completes does not pause the worker', async () => {
+      await startApprovedRun();
+      scripts.push([start, { kind: 'error', content: 'GET https://api.example.com/v1 failed: HTTP 429 Too Many Requests', provider: 'codex' },
+        text('The API rate-limits us; adding a retry.'), { kind: 'complete', exitCode: 0, success: true, provider: 'codex' }]);
+      const w = await spawn('coder', 'fix the client', 'codex');
+      expect(store.agent(w.id)).toMatchObject({ status: 'idle', lastError: null, resumeAt: null });
+    });
+
+    it('a mid-turn 429 followed by an unrelated terminal failure fails the worker, without pausing it', async () => {
+      await startApprovedRun();
+      scripts.push([start, { kind: 'error', content: 'upstream said 429 rate limit', provider: 'codex' }, text('retrying'),
+        { kind: 'error', content: 'process exited unexpectedly', provider: 'codex' }, { kind: 'complete', exitCode: 1, success: false, provider: 'codex' }]);
+      const w = await spawn('coder', 'fix the client', 'codex');
+      expect(store.agent(w.id)).toMatchObject({ status: 'error', lastError: 'process exited unexpectedly' });
+    });
+
+    it('the terminal provider failure is classified, generic wording included', async () => {
+      clock = Date.parse('2026-11-26T18:00:00Z');
+      await startApprovedRun();
+      scripts.push([start, text('working'), { kind: 'error', content: 'stream error: 429 Too Many Requests; rate limit reached', provider: 'codex' },
+        { kind: 'complete', exitCode: 1, success: false, provider: 'codex' }]);
+      const w = await spawn('coder', 'fix the client', 'codex');
+      expect(store.agent(w.id)).toMatchObject({ status: 'paused', pauseReason: 'rate limit', resumeAt: '2026-11-26T18:30:00.000Z' });
+    });
+
+    it('the distinctive provider phrase pauses even without a terminal complete', async () => {
+      clock = Date.parse('2026-11-26T18:00:00Z');
+      await startApprovedRun();
+      scripts.push([start, { kind: 'error', content: "You've hit your usage limit. Try again at 7:13 PM.", provider: 'codex' }, text('…')]);
+      const w = await spawn('coder', 'fix the client', 'codex');
+      expect(store.agent(w.id)).toMatchObject({ status: 'paused', pauseReason: 'usage limit' });
+    });
   });
 });

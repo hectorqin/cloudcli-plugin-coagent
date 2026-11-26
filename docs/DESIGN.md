@@ -197,7 +197,12 @@ tab 改为泳道时序图：每个 agent 一条泳道（最左为 You），时�
 
 ## 15. 额度暂停、自动续跑与 handoff（2026-11-26，Q41–Q42）
 
-- **识别（`src/broker/quota.ts`）**：worker turn 的错误文本匹配 usage limit（`usage limit`、`hit your … limit`、`quota exceeded`、`insufficient_quota`…）或 rate limit（`rate limit`/`rate_limit_error`、`too many requests`、独立的 `429`）即视为额度错误。解析重置时间：`try again at 7:13 PM`、`resets 7:10pm (UTC)`、`GMT+2`、IANA 时区、`in 20 minutes` 等，取 `now` 之后最近一次并加 1 分钟余量。**未带时区一律按 UTC**（代码注释说明：broker 无从得知 provider 用的时区；猜早了只会再暂停一次）。读不出时间则用 `quotaBackoffMinutes`（kv，`PUT /config` 可改，默认 30）。lead 的 turn 不受影响（lead 无暂停）。
+- **识别（`src/broker/quota.ts`）**：只看 run 的**终止失败**。`HttpCloudCli.send`（`readRun`）按 CloudCLI 契约读流：每个 run 恰好一个 `complete {exitCode, success, aborted}`；成功的 `complete` → ok（之前的 error 事件不再让 turn 失败）；失败的 `complete` → error，若紧挨着它之前（中间只隔 status/生命周期事件）有 `kind:'error'`，那就是失败原因，标 `terminal: true`；路由自身的 `{type:'error'}` 和 `/api/agent` 的 HTTP 状态也是 terminal；没有 `complete` 的旧宿主，只有最后一个事件是 error 时才算 terminal。中途的 error 事件（例如 agent 调试某个外部 API 的 HTTP 429）不是 terminal。
+  - 供应商专有措辞无条件识别：`hit your … limit`（含 “You've hit your usage limit”）、`N-hour limit`、`insufficient_quota`。
+  - 通用措辞只在 terminal 时识别：`usage limit`、`quota exceeded`、`rate limit`/`rate_limit_error`、`too many requests`、独立的 `429`。
+  - 重置时间：`try again at 7:13 PM`、`resets 7:10pm (UTC)`、`GMT+2`、IANA 时区、`in 20 minutes` 等，取 `now` 之后最近一次并加 1 分钟余量。IANA 时区按**目标日期**的偏移迭代求解（`Intl`），跨 DST 切换（如 Europe/Paris 2026-03-29、2026-10-25）也正确；翻到次日时重新求解。**未带时区一律按 UTC**（代码注释说明：broker 无从得知 provider 用的时区；猜早了只会再暂停一次）。
+  - 上限：解析结果必须是有限值、在未来、且不超过 7 天（`MAX_PAUSE_MS`），否则视为读不出，改用 `quotaBackoffMinutes`（kv，`PUT /config` 可改，默认 30，同样夹在 7 天内；`pause()` 再校验一次）。
+  - lead 的 turn 不受影响（lead 无暂停）。
 - **状态 `paused`**：`agents` 新列 `resume_at`、`pause_reason`、`pause_nudge`（幂等迁移，`MIGRATIONS` 最后一项）。不置 `error`；记 `paused {reason, resumeAt, guessed, error}`；给 lead system 消息 “`<id>` paused (usage limit), auto-resume at `<time>`”。`pause_nudge` = 被打断的 turn 是否已被 CloudCLI 接受：接受过则续跑时要告诉它“上一轮被打断”；未接受（如 HTTP 429）消息已回队，续跑时直接投递即可。
 - **自动续跑**：`tick()` 对到点的 paused worker（`pausedDue`，只看 active 且未 ending 的 run）在同一事务里置 `idle`、清除暂停信息、按需入队一条 system 消息 “[coagent] Your previous turn was interrupted (<reason>). Check your worktree state (git status / git diff) and continue the task; report_result when done.”，记 `resumed {by:'auto'}`，然后按普通投递发给**同一 session**（同 appSessionId）。该消息就是一次普通投递，不会重发；若这一轮又撞额度，按上面规则重新 `paused`（新的 resumeAt）。
   - `paused` 在 `NO_DELIVERY` 中：期间发给它的消息保持 queued，续跑时随之投递；`send_message` 会告知发送方。
@@ -207,7 +212,8 @@ tab 改为泳道时序图：每个 agent 一条泳道（最左为 You），时�
 - **`wait_for_agents`**：暂停的 system 消息是紧急消息，所以等待会提前返回一次；返回文本列出 “`<id>` paused until `<time>`”，并提示“通常直接再 wait”。paused 不算 finished，所以再次 wait 会一直等到它续跑并完成。lead prompt 与 skill 同步说明。
 - **不自动重试的仍不重试**：`error`/`interrupted` 的 worker 不自动续跑（沿用“已接受的 turn 出错不重试”）。tab 抽屉与 wait/spawn 卡片提供 **Resume**（`POST /agents/:id/resume`，tab 鉴权，发送同一条续跑消息，`resumed {by:'user'}`）；paused 的提供 **Resume now**（同一路由，跳过等待）和 **Cancel auto-resume**（`POST /agents/:id/cancel-resume`：改为 `interrupted`、记 `resume_cancelled`、通知 lead 决定）。
 - **`handoff_agent(worker, provider, note?)`**（仅 lead）：把手工流程（end 旧 worker → spawn 新 worker → 合并旧分支 → `git diff | git apply --3way` 搬未提交改动）自动化。
-  - 拒绝：worker 正在跑 turn（本进程 busy/dispatch/detached 或状态 running），或 CloudCLI `sessionStatus` 说仍在处理；`null`（未知）允许，但回复中注明旧 worktree 之后的写入不会被带走。拒绝已 ended/merged 的 worker。
+  - 拒绝：worker 正在跑 turn（本进程 busy/dispatch/detached 或状态 running）；或 CloudCLI `sessionStatus` 不是明确的 `false`。与删除 worktree 相同的策略：`null`（未知：宿主无该接口或查询失败）也拒绝，并告诉 lead 安装 CloudCLI fork 或等 CloudCLI 能回答后重试（或自行 send_message / end_agent + spawn_agent）。快照、新 worktree 恢复完成后、结束旧 worker 之前**再查一次**（受 session-status 超时约束），若此时在处理或未知，则删除新 worktree/分支并中止，什么都不变。拒绝已 ended/merged 的 worker。
+  - 子模块：子模块里的改动属于子模块自己的仓库，快照只能记录 gitlink。`snapshotWorkingTree` 先用 `git status --porcelain=v2` 的子模块标志（`S` + C/M/U：新提交、已修改、未跟踪）找出脏子模块，有则拒绝 handoff 并列出路径和问题。
   - 写角色：在 lead 仓库锁内，先对旧 worktree 做**内容快照**：复制其 index 到临时文件，用 `GIT_INDEX_FILE` 执行 `git add -A` + `write-tree`，得到包含已跟踪改动（含暂存）、删除、未跟踪且未被忽略文件的 tree，旧 worktree、它的 index 和 stash 都不动。然后 `createWorktree(..., startPoint = 旧 HEAD)`（git 层新增起点参数），在新 worktree 里 `read-tree -m -u HEAD <tree>` + `reset -q`：内容一致，全部变成未提交改动（原来暂存的新文件变为未跟踪，不丢数据）。最后对新 worktree 再做一次快照，**tree hash 必须相同**，否则删除新 worktree/分支并报错，什么都不变。被 `.gitignore` 忽略的文件不搬。
   - 只读角色：直接在 lead 目录用新 provider 起一个同角色 worker。
   - 一个事务内：旧 worker 的 pending 合并关卡置 rejected、旧 worker 置 `ended`（保留 worktree 与分支，释放名额，取消其 queued 消息，`agent_ended {handoff: <new>}`）、容量复核、创建新 worker（`spawned {handoffFrom}`）、记 `handoff {from, to, provider, carried}`、入队交接任务。交接任务包含：原始任务、旧 worker 最近约 12 条活动、最后的 result/错误、它未收到的消息、lead 的 `note`，并明确说明“已有工作就在你的 worktree 里”及搬过来的文件清单。复制期间旧 worker 被加入进程内 `handingOff` 集合，`deliver()` 不会给它开新 turn。
