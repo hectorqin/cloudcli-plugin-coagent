@@ -1,0 +1,185 @@
+From 9e6eddabc9360ae0c04caac358767793e6b54018 Mon Sep 17 00:00:00 2001
+From: hectorqin <14220132+hectorqin@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 09:39:53 +0000
+Subject: [PATCH 07/13] fix(plugins): keep the renderer cache and context key
+ exact
+
+- a load that fails after an invalidation no longer deletes the newer
+  cache entry that replaced it
+- the update key uses the exact project context handed to the plugin
+  (fullPath || path), so a path change is never missed
+- tests: invalidating a successfully cached module refetches it, the
+  invalidation race, a stale renderer's destroy() cannot touch its
+  replacement, and a path change with an empty fullPath
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pluginToolRendererLifecycle.test.tsx      | 39 +++++++++++
+ .../tests/toolRendererModuleCache.test.ts     | 65 +++++++++++++++----
+ .../tool-renderers/PluginToolRenderer.tsx     |  4 +-
+ .../tool-renderers/loadToolRendererModule.ts  |  6 +-
+ 4 files changed, 99 insertions(+), 15 deletions(-)
+
+diff --git a/src/modules/plugins/tests/pluginToolRendererLifecycle.test.tsx b/src/modules/plugins/tests/pluginToolRendererLifecycle.test.tsx
+index c292fa22..08972053 100644
+--- a/src/modules/plugins/tests/pluginToolRendererLifecycle.test.tsx
++++ b/src/modules/plugins/tests/pluginToolRendererLifecycle.test.tsx
+@@ -104,3 +104,42 @@ test('a replaced renderer gets its own node, so a late one cannot touch the new
+   assert.match(container.textContent ?? '', /fresh/);
+   assert.doesNotMatch(container.textContent ?? '', /stale/);
+ });
++
++test('a stale renderer destroying its own node leaves the replacement intact', async () => {
++  const nodes: HTMLElement[] = [];
++  renderTool.mockImplementation((node: HTMLElement) => {
++    nodes.push(node);
++    node.textContent = nodes.length === 1 ? 'old' : 'fresh';
++    // A destroy that wipes "its" output, as a careless plugin might.
++    return { destroy: () => { node.replaceChildren(); node.textContent = ''; } };
++  });
++  const view = (toolName: string) => (
++    <MemoryRouter>
++      <PluginToolRenderer plugin={plugin} toolName={toolName} toolInput={{}} status="completed" fallback={<span>host</span>} />
++    </MemoryRouter>
++  );
++  const { rerender, container } = render(view('mcp__p__one'));
++  await waitFor(() => assert.equal(screen.queryByText('old') === null, false, 'first renderer not shown'));
++  await act(async () => { rerender(view('mcp__p__two')); });
++  await waitFor(() => assert.equal(screen.queryByText('fresh') === null, false, 'replacement not shown'));
++  assert.match(container.textContent ?? '', /fresh/);
++  assert.equal(nodes[0].isConnected, false);
++});
++
++test('a project path change with an empty fullPath still updates the renderer', async () => {
++  const update = vi.fn();
++  renderTool.mockImplementation(() => ({ update }));
++  const view = (path: string) => (
++    <MemoryRouter>
++      <PluginToolRenderer plugin={plugin} toolName="mcp__p__x" toolInput={{}} status="completed"
++        selectedProject={{ projectId: 'same', displayName: 'same', fullPath: '', path }} fallback={<span>host</span>} />
++    </MemoryRouter>
++  );
++  const { rerender } = render(view('/a'));
++  await waitFor(() => assert.equal(renderTool.mock.calls.length, 1));
++  await waitFor(() => assert.equal(screen.queryByText('host') === null, true, 'host row still shown'));
++  const before = update.mock.calls.length;
++  await act(async () => { rerender(view('/b')); });
++  await waitFor(() => assert.ok(update.mock.calls.length > before, 'update not called'));
++  assert.equal(update.mock.calls.at(-1)?.[0].project.path, '/b');
++});
+diff --git a/src/modules/plugins/tests/toolRendererModuleCache.test.ts b/src/modules/plugins/tests/toolRendererModuleCache.test.ts
+index 25f46e8f..70a2d8f8 100644
+--- a/src/modules/plugins/tests/toolRendererModuleCache.test.ts
++++ b/src/modules/plugins/tests/toolRendererModuleCache.test.ts
+@@ -1,22 +1,63 @@
+ import assert from 'node:assert/strict';
+ 
+-import { test, vi } from 'vitest';
++import { afterEach, beforeEach, test, vi } from 'vitest';
+ 
++const assetResponses: Array<() => Promise<{ ok: boolean; status?: number; text?: () => Promise<string> }>> = [];
+ let fetches = 0;
+ vi.mock('@/shared/api', () => ({
+-  api: { plugins: { asset: vi.fn(async () => { fetches += 1; return { ok: false, status: 500 }; }) } },
++  api: {
++    plugins: {
++      asset: vi.fn(() => {
++        fetches += 1;
++        const next = assetResponses.shift();
++        return next ? next() : Promise.resolve({ ok: true, text: async () => 'export const renderTool = () => ({});' });
++      }),
++    },
++  },
+ }));
+ 
+-test('invalidating a plugin drops its cached module so the next load fetches again', async () => {
+-  const { loadToolRendererModule, invalidateToolRendererModules } = await import('@/modules/plugins/tool-renderers/loadToolRendererModule');
+-  // A failed load is not cached; make the first load succeed-ish by keeping its pending promise.
+-  const first = loadToolRendererModule('p', 'dist/index.js');
+-  const second = loadToolRendererModule('p', 'dist/index.js');
+-  assert.equal(first, second, 'concurrent loads share one request');
+-  await first.catch(() => undefined);
++// jsdom has no Blob-URL module loading; serve the module source as a data: URL, which Node can import.
++const blobSources = new Map<string, string>();
++beforeEach(() => {
++  fetches = 0;
++  assetResponses.length = 0;
++  vi.stubGlobal('URL', Object.assign(Object.create(URL), {
++    createObjectURL: () => {
++      const id = `blob:test-${blobSources.size}`;
++      blobSources.set(id, 'data:text/javascript,export%20const%20renderTool%20%3D%20()%20%3D%3E%20(%7B%7D)%3B');
++      return blobSources.get(id)!;
++    },
++    revokeObjectURL: () => undefined,
++  }));
++});
++afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
++
++const loader = () => import('@/modules/plugins/tool-renderers/loadToolRendererModule');
++
++test('a successfully cached module is shared, and invalidation makes the next load fetch again', async () => {
++  const { loadToolRendererModule, invalidateToolRendererModules } = await loader();
++  const first = await loadToolRendererModule('p', 'dist/index.js');
++  assert.equal(typeof first.renderTool, 'function');
++  await loadToolRendererModule('p', 'dist/index.js');
++  assert.equal(fetches, 1, 'cached module is reused');
++
+   invalidateToolRendererModules('p');
+-  const third = loadToolRendererModule('p', 'dist/index.js');
+-  assert.notEqual(third, first);
+-  await third.catch(() => undefined);
++  await loadToolRendererModule('p', 'dist/index.js');
++  assert.equal(fetches, 2, 'invalidated module is fetched again');
++});
++
++test('an old load that fails after an invalidation does not drop the newer cache entry', async () => {
++  const { loadToolRendererModule, invalidateToolRendererModules } = await loader();
++  let failOld!: () => void;
++  assetResponses.push(() => new Promise((resolve) => { failOld = () => resolve({ ok: false, status: 500 }); }));
++  const old = loadToolRendererModule('p', 'dist/index.js');
++
++  invalidateToolRendererModules('p');
++  const fresh = loadToolRendererModule('p', 'dist/index.js');
++  failOld();
++  await old.catch(() => undefined);
++  await fresh;
++
++  assert.equal(loadToolRendererModule('p', 'dist/index.js'), fresh, 'the newer entry survived');
+   assert.equal(fetches, 2);
+ });
+diff --git a/src/modules/plugins/tool-renderers/PluginToolRenderer.tsx b/src/modules/plugins/tool-renderers/PluginToolRenderer.tsx
+index d83a3810..ecc82144 100644
+--- a/src/modules/plugins/tool-renderers/PluginToolRenderer.tsx
++++ b/src/modules/plugins/tool-renderers/PluginToolRenderer.tsx
+@@ -122,9 +122,9 @@ export default function PluginToolRenderer({
+ 
+   // Push every prop change (streamed input, the result arriving, theme, project) to the mounted renderer. A renderer
+   // whose update throws is released and the host rendering comes back.
++  // Keyed on the exact values handed to the plugin (context.project included), so nothing it sees can change silently.
+   const contextKey = JSON.stringify([
+-    toolInput, toolResult?.content, toolResult?.isError, status, isDarkMode, sessionId,
+-    selectedProject?.projectId ?? null, selectedProject?.fullPath ?? selectedProject?.path ?? null,
++    toolInput, toolResult?.content, toolResult?.isError, status, isDarkMode, sessionId, context.project,
+   ]);
+   useEffect(() => {
+     if (state !== 'ready') return;
+diff --git a/src/modules/plugins/tool-renderers/loadToolRendererModule.ts b/src/modules/plugins/tool-renderers/loadToolRendererModule.ts
+index f7a4fa66..b11f8d74 100644
+--- a/src/modules/plugins/tool-renderers/loadToolRendererModule.ts
++++ b/src/modules/plugins/tool-renderers/loadToolRendererModule.ts
+@@ -58,7 +58,11 @@ export function loadToolRendererModule(pluginName: string, entry: string): Promi
+         URL.revokeObjectURL(blobUrl);
+       }
+     })();
+-    pending.catch(() => modules.delete(key)); // let a later row retry after a failure
++    // Let a later row retry after a failure, but never drop a newer load that replaced this one after an
++    // invalidation.
++    pending.catch(() => {
++      if (modules.get(key) === pending) modules.delete(key);
++    });
+     modules.set(key, pending);
+   }
+   return pending;
+-- 
+2.53.0
+

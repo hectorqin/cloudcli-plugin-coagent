@@ -1,0 +1,213 @@
+From e932db36356bf014ca4154eec9530017ccbcd940 Mon Sep 17 00:00:00 2001
+From: hectorqin <14220132+hectorqin@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:36:31 +0000
+Subject: [PATCH 10/13] fix(plugins): delete handlers read the current
+ selection; transport errors are results
+
+- handleProjectDelete / handleSessionDelete compare against the
+  selection at call time (refs) instead of the one they were created
+  with, so a callback held by a plugin UI across an await, or after its
+  host unmounted, cannot clear a newer selection
+- archive/delete actions return { ok: false, error } when the request
+  itself rejects (no automatic retry of destructive requests)
+- tests drive the real useProjectsState: a callback captured before a
+  selection change keeps the new selection; rejected requests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../tests/pluginProjectActions.test.ts        | 18 +++++
+ .../plugins/usePluginProjectActions.ts        | 15 +++-
+ .../hooks/useProjectsState.ts                 | 10 ++-
+ .../projectsStateDeleteSelection.test.ts      | 77 +++++++++++++++++++
+ 4 files changed, 114 insertions(+), 6 deletions(-)
+ create mode 100644 src/modules/project-workspace/tests/projectsStateDeleteSelection.test.ts
+
+diff --git a/src/modules/plugins/tests/pluginProjectActions.test.ts b/src/modules/plugins/tests/pluginProjectActions.test.ts
+index 3476e36d..98e30a49 100644
+--- a/src/modules/plugins/tests/pluginProjectActions.test.ts
++++ b/src/modules/plugins/tests/pluginProjectActions.test.ts
+@@ -122,3 +122,21 @@ test('cleanup after a pending request uses the latest workspace callbacks (selec
+ 
+   assert.deepEqual(calls, ['after:removeProject:p-1', 'after:refresh', 'after:removeSession:s-1', 'after:refresh']);
+ });
++
++test('a request that rejects (network failure) yields an error result, not an exception', async () => {
++  const removeProject = vi.fn();
++  const removeSession = vi.fn();
++  workspace = {
++    projects: [{ projectId: 'p-1', fullPath: '/src/app-worktrees/w1', worktreeOf: '/src/app' }],
++    refresh: vi.fn(async () => undefined),
++    removeProject,
++    removeSession,
++  };
++  deleteProject.mockRejectedValue(new TypeError('Failed to fetch'));
++  deleteSession.mockRejectedValue(new TypeError('Failed to fetch'));
++  const projects = renderHook(() => usePluginProjectActions()).result;
++  const sessions = renderHook(() => usePluginSessionActions()).result;
++  assert.deepEqual(await projects.current!('/src/app-worktrees/w1', 'delete'), { ok: false, error: 'Failed to fetch' });
++  assert.deepEqual(await sessions.current!('s-1', 'delete'), { ok: false, error: 'Failed to fetch' });
++  assert.equal(removeProject.mock.calls.length + removeSession.mock.calls.length, 0, 'nothing removed locally');
++});
+diff --git a/src/modules/plugins/usePluginProjectActions.ts b/src/modules/plugins/usePluginProjectActions.ts
+index c8ba3ebe..26b0274f 100644
+--- a/src/modules/plugins/usePluginProjectActions.ts
++++ b/src/modules/plugins/usePluginProjectActions.ts
+@@ -35,7 +35,13 @@ export function usePluginProjectActions():
+     if (typeof project.worktreeOf !== 'string' || !project.worktreeOf) {
+       return { ok: false, error: `${projectPath} is not a git worktree project; plugins can only archive or delete worktree projects` };
+     }
+-    const response = await api.deleteProject(project.projectId, action === 'delete');
++    let response: Response;
++    try {
++      response = await api.deleteProject(project.projectId, action === 'delete');
++    } catch (error) {
++      // A transport failure (offline, connection reset) is still a result, never a rejection; no automatic retry.
++      return { ok: false, error: error instanceof Error ? error.message : 'Request failed' };
++    }
+     if (!response.ok) {
+       const body = await response.json().catch(() => null);
+       return { ok: false, error: readApiErrorMessage(body) ?? `Request failed (${response.status})` };
+@@ -69,7 +75,12 @@ export function usePluginSessionActions():
+     const current = workspaceRef.current;
+     if (!current) return { ok: false, error: 'Session actions are only available inside a project workspace' };
+     if (typeof sessionId !== 'string' || !sessionId) return { ok: false, error: 'sessionId is required' };
+-    const response = await api.deleteSession(sessionId, action === 'delete');
++    let response: Response;
++    try {
++      response = await api.deleteSession(sessionId, action === 'delete');
++    } catch (error) {
++      return { ok: false, error: error instanceof Error ? error.message : 'Request failed' };
++    }
+     if (!response.ok) {
+       const body = await response.json().catch(() => null);
+       return { ok: false, error: readApiErrorMessage(body) ?? `Request failed (${response.status})` };
+diff --git a/src/modules/project-workspace/hooks/useProjectsState.ts b/src/modules/project-workspace/hooks/useProjectsState.ts
+index 965a9b1e..9a72a41d 100644
+--- a/src/modules/project-workspace/hooks/useProjectsState.ts
++++ b/src/modules/project-workspace/hooks/useProjectsState.ts
+@@ -1107,7 +1107,7 @@ export function useProjectsState({
+     (sessionIdToDelete: string) => {
+       clearSessionAttention(sessionIdToDelete);
+ 
+-      if (selectedSession?.id === sessionIdToDelete) {
++      if (selectedSessionRef.current?.id === sessionIdToDelete) {
+         setSelectedSession(null);
+         navigate('/');
+       }
+@@ -1116,7 +1116,7 @@ export function useProjectsState({
+         prevProjects.map((project) => removeSessionFromProject(project, sessionIdToDelete)),
+       );
+     },
+-    [clearSessionAttention, navigate, selectedSession?.id],
++    [clearSessionAttention, navigate],
+   );
+ 
+   const handleSidebarRefresh = useCallback(async () => {
+@@ -1264,9 +1264,11 @@ export function useProjectsState({
+ 
+   // `projectId` is the DB identifier passed from the sidebar's delete flow
+   // after the migration away from folder-derived project names.
++  // Both delete handlers compare against the selection *now* (refs), not the one they were created with: callers such
++  // as plugin UIs may hold a callback across an await and even outlive their own mount.
+   const handleProjectDelete = useCallback(
+     (projectId: string) => {
+-      if (selectedProject?.projectId === projectId) {
++      if (selectedProjectRef.current?.projectId === projectId) {
+         setSelectedProject(null);
+         setSelectedSession(null);
+         navigate('/');
+@@ -1274,7 +1276,7 @@ export function useProjectsState({
+ 
+       setProjects((prevProjects) => prevProjects.filter((project) => project.projectId !== projectId));
+     },
+-    [navigate, selectedProject?.projectId],
++    [navigate],
+   );
+ 
+   const sidebarSharedProps = useMemo(
+diff --git a/src/modules/project-workspace/tests/projectsStateDeleteSelection.test.ts b/src/modules/project-workspace/tests/projectsStateDeleteSelection.test.ts
+new file mode 100644
+index 00000000..a7f0a470
+--- /dev/null
++++ b/src/modules/project-workspace/tests/projectsStateDeleteSelection.test.ts
+@@ -0,0 +1,77 @@
++import assert from 'node:assert/strict';
++
++import { act, renderHook, waitFor } from '@testing-library/react';
++import { afterEach, beforeEach, test, vi } from 'vitest';
++
++import type { Project, ProjectSession } from '@/shared/types';
++
++/**
++ * The sidebar's delete callbacks are also handed to plugin UIs, which may hold one across an await or after their
++ * own host unmounted. A callback created while A was selected must still compare against the selection at call time.
++ */
++
++const projectsResponse = vi.fn();
++vi.mock('@/shared/api', () => ({
++  api: {
++    projects: () => projectsResponse(),
++    projectTaskmaster: () => Promise.resolve({ ok: false }),
++    sessionDetails: () => Promise.resolve({ ok: false }),
++    projectSessions: () => Promise.resolve({ ok: false }),
++  },
++}));
++
++const session = (id: string): ProjectSession => ({ id, summary: id } as ProjectSession);
++const project = (id: string, sessions: ProjectSession[]): Project => ({
++  projectId: id, path: `/${id}`, fullPath: `/${id}`, displayName: id, isStarred: false,
++  sessions, sessionMeta: { hasMore: false, total: sessions.length },
++});
++
++const renderProjectsState = async (navigate: ReturnType<typeof vi.fn>) => {
++  const { useProjectsState } = await import('@/modules/project-workspace/hooks/useProjectsState');
++  return renderHook(() => useProjectsState({
++    sessionId: undefined as never,
++    navigate: navigate as never,
++    subscribe: () => () => undefined,
++    isMobile: false,
++    isSessionProcessing: () => false,
++  }));
++};
++
++beforeEach(() => { localStorage.clear(); projectsResponse.mockReset(); });
++afterEach(() => { vi.resetModules(); });
++
++test('a session-delete callback captured before a selection change does not clear the new selection', async () => {
++  projectsResponse.mockResolvedValue({ ok: true, json: async () => [project('p', [session('a'), session('b')])] });
++  const navigate = vi.fn();
++  const { result } = await renderProjectsState(navigate);
++  await waitFor(() => assert.equal(result.current.projects.length, 1));
++
++  act(() => { result.current.handleSessionSelect(session('a')); });
++  const staleDelete = result.current.sidebarSharedProps.onSessionDelete; // captured while A is selected
++  act(() => { result.current.handleSessionSelect(session('b')); });
++  navigate.mockClear();
++
++  act(() => { staleDelete('a'); });
++  assert.equal(result.current.selectedSession?.id, 'b', 'deleting A keeps B selected');
++  assert.deepEqual(navigate.mock.calls, []);
++
++  act(() => { staleDelete('b'); });
++  assert.equal(result.current.selectedSession, null, 'deleting the current selection still leaves it');
++});
++
++test('a project-delete callback captured before a selection change does not clear the new selection', async () => {
++  projectsResponse.mockResolvedValue({ ok: true, json: async () => [project('p1', []), project('p2', [])] });
++  const navigate = vi.fn();
++  const { result } = await renderProjectsState(navigate);
++  await waitFor(() => assert.equal(result.current.projects.length, 2));
++
++  act(() => { result.current.handleProjectSelect(result.current.projects[0]); });
++  const staleDelete = result.current.sidebarSharedProps.onProjectDelete; // captured while p1 is selected
++  act(() => { result.current.handleProjectSelect(result.current.projects[1]); });
++  navigate.mockClear();
++
++  act(() => { staleDelete('p1'); });
++  assert.equal(result.current.selectedProject?.projectId, 'p2', 'deleting p1 keeps p2 selected');
++  assert.deepEqual(navigate.mock.calls, []);
++  assert.deepEqual(result.current.projects.map((p) => p.projectId), ['p2']);
++});
+-- 
+2.53.0
+

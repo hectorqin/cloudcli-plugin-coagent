@@ -1,7 +1,7 @@
-From e9dedf27fafb929002b4984a3dcc941b045f8581 Mon Sep 17 00:00:00 2001
+From 18877aa6ee4a06b0cf5de1bccf710bde5d1a5e9c Mon Sep 17 00:00:00 2001
 From: hectorqin <14220132+hectorqin@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 09:00:15 +0000
-Subject: [PATCH 6/8] fix(plugins): harden the tool-renderer lifecycle
+Subject: [PATCH 05/13] fix(plugins): harden the tool-renderer lifecycle
 
 - give each renderTool call its own mount node, so a renderer that
   finishes late can neither write into nor clear its replacement

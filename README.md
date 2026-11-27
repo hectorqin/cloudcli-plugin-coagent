@@ -79,7 +79,7 @@ so the script copies the build into `~/.claude-code-ui/plugins/cloudcli-coagent`
 ## Compatibility
 
 Vanilla CloudCLI 1.37.9 and newer provides the CoAgent core workflow and tab. The optional CloudCLI fork at
-https://github.com/hectorqin/claudecodeui, branch `coagent/v1.37.10-coagent.4`, additionally provides live chat tool
+https://github.com/hectorqin/claudecodeui, branch `coagent/v1.37.10-coagent.5`, additionally provides live chat tool
 cards through `toolRenderers`, sidebar grouping for worker worktrees, and session-status-aware recovery. Those enhanced
 views are not required for the core tab workflow; unsupported hosts fall back to their normal tool-call display.
 
@@ -156,4 +156,4 @@ See `docs/DESIGN.md` for the full design and the verified assumptions behind it.
 ## License
 
 MIT for the plugin. The files in `patches/` modify CloudCLI and are AGPL-3.0 like CloudCLI itself; see `LICENSE`.
-The patched CloudCLI build lives in the fork: https://github.com/hectorqin/claudecodeui (branch `coagent/v1.37.10-coagent.4`).
+The patched CloudCLI build lives in the fork: https://github.com/hectorqin/claudecodeui (branch `coagent/v1.37.10-coagent.5`).

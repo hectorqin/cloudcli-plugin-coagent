@@ -1,0 +1,89 @@
+From 6a8f553d759bcbdbbec073b5c634c7c1c1d730de Mon Sep 17 00:00:00 2001
+From: hectorqin <14220132+hectorqin@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 09:41:08 +0000
+Subject: [PATCH 08/13] fix(plugins): clean up with the latest workspace
+ callbacks after a pending request
+
+The sidebar's project and session cleanup callbacks compare against the
+selection they were created with. Read them again once the request
+resolves, so a selection changed in the meantime is neither cleared by
+mistake nor left on deleted data.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../tests/pluginProjectActions.test.ts        | 31 +++++++++++++++++++
+ .../plugins/usePluginProjectActions.ts        | 12 ++++---
+ 2 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/src/modules/plugins/tests/pluginProjectActions.test.ts b/src/modules/plugins/tests/pluginProjectActions.test.ts
+index d94e20b7..3476e36d 100644
+--- a/src/modules/plugins/tests/pluginProjectActions.test.ts
++++ b/src/modules/plugins/tests/pluginProjectActions.test.ts
+@@ -91,3 +91,34 @@ test('successful actions drop the target locally before refreshing, so a refresh
+   await sessions.current!('s-3', 'delete');
+   assert.deepEqual(order, [], 'nothing is removed locally when the request fails');
+ });
++
++test('cleanup after a pending request uses the latest workspace callbacks (selection may have changed)', async () => {
++  const calls: string[] = [];
++  const makeWorkspace = (tag: string) => ({
++    projects: [{ projectId: 'p-1', fullPath: '/src/app-worktrees/w1', worktreeOf: '/src/app' }],
++    refresh: vi.fn(async () => { calls.push(`${tag}:refresh`); }),
++    removeProject: (id: string) => calls.push(`${tag}:removeProject:${id}`),
++    removeSession: (id: string) => calls.push(`${tag}:removeSession:${id}`),
++  });
++  let resolveProject!: (v: unknown) => void;
++  let resolveSession!: (v: unknown) => void;
++  deleteProject.mockReturnValue(new Promise((r) => { resolveProject = r; }));
++  deleteSession.mockReturnValue(new Promise((r) => { resolveSession = r; }));
++
++  workspace = makeWorkspace('before');
++  const projectHook = renderHook(() => usePluginProjectActions());
++  const sessionHook = renderHook(() => usePluginSessionActions());
++  const projectDone = projectHook.result.current!('/src/app-worktrees/w1', 'delete');
++  const sessionDone = sessionHook.result.current!('s-1', 'delete');
++
++  // The user selects something else while both requests are in flight: the hooks re-render with new callbacks.
++  workspace = makeWorkspace('after');
++  projectHook.rerender();
++  sessionHook.rerender();
++  resolveProject({ ok: true });
++  resolveSession({ ok: true });
++  await projectDone;
++  await sessionDone;
++
++  assert.deepEqual(calls, ['after:removeProject:p-1', 'after:refresh', 'after:removeSession:s-1', 'after:refresh']);
++});
+diff --git a/src/modules/plugins/usePluginProjectActions.ts b/src/modules/plugins/usePluginProjectActions.ts
+index bfad2ae0..c8ba3ebe 100644
+--- a/src/modules/plugins/usePluginProjectActions.ts
++++ b/src/modules/plugins/usePluginProjectActions.ts
+@@ -41,8 +41,11 @@ export function usePluginProjectActions():
+       return { ok: false, error: readApiErrorMessage(body) ?? `Request failed (${response.status})` };
+     }
+     // Same local cleanup as the sidebar: drop it (leaving it first if it is selected), then resync.
+-    current.removeProject?.(project.projectId);
+-    await current.refresh();
++    // Read the workspace again: the selection may have changed while the request was pending, and the sidebar's
++    // cleanup callback compares against the selection it was created with.
++    const latest = workspaceRef.current ?? current;
++    latest.removeProject?.(project.projectId);
++    await latest.refresh();
+     return { ok: true };
+   }, []);
+ 
+@@ -73,8 +76,9 @@ export function usePluginSessionActions():
+     }
+     // Remove it locally before refreshing: the refresh merges loaded session pages and would otherwise put an
+     // archived or deleted session back. This also leaves it if it was the selected session.
+-    current.removeSession?.(sessionId);
+-    await current.refresh();
++    const latest = workspaceRef.current ?? current;
++    latest.removeSession?.(sessionId);
++    await latest.refresh();
+     return { ok: true };
+   }, []);
+ 
+-- 
+2.53.0
+

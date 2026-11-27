@@ -1,8 +1,8 @@
-From 8b1b74ef0a07d1f786b263d5d4984a83ec6e781d Mon Sep 17 00:00:00 2001
+From b004fa43be6347db5d753bb4f63a69d4cc5cfd65 Mon Sep 17 00:00:00 2001
 From: hectorqin <14220132+hectorqin@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 10:45:23 +0000
-Subject: [PATCH 2/8] feat(plugins): let plugins render the chat rows of their
- tools
+Subject: [PATCH 02/13] feat(plugins): let plugins render the chat rows of
+ their tools
 
 A plugin can now list tool names (or prefixes ending in *) under
 toolRenderers in its manifest and export renderTool(container, context,

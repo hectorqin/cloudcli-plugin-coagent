@@ -1,7 +1,7 @@
-From 7565a68669c7d48494b79dd84f2ea31ad8b53e7c Mon Sep 17 00:00:00 2001
+From 02a20553b1a83068267ac895a0d2cb8dfd64f27c Mon Sep 17 00:00:00 2001
 From: hectorqin <14220132+hectorqin@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 10:00:04 +0000
-Subject: [PATCH 1/8] feat(sidebar): nest git worktree projects under their
+Subject: [PATCH 01/13] feat(sidebar): nest git worktree projects under their
  repository
 
 Worktree directories (CloudCLI's own <repo>-worktrees/<name> and any linked

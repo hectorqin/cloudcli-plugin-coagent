@@ -1,7 +1,7 @@
-From 34e539f670366aec54befff930c4a2dcdd498e04 Mon Sep 17 00:00:00 2001
+From 75791a3480c619cc3423508f659c6aa039700496 Mon Sep 17 00:00:00 2001
 From: hectorqin <14220132+hectorqin@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 09:02:17 +0000
-Subject: [PATCH 8/8] fix(plugins): reconcile local state after plugin
+Subject: [PATCH 06/13] fix(plugins): reconcile local state after plugin
  archive/delete
 
 After a successful request, drop the project or session from local
