@@ -229,3 +229,9 @@ tab 改为泳道时序图：每个 agent 一条泳道（最左为 You），时�
 - Q48：先在 fork 实现自用，现有 PR 有维护者反馈后再提上游。
 - broker 实现：仅当 `GET /api/agent/capabilities` 返回 `childSessions: true`（缓存；未知/超时视为不支持）时，worker **创建会话的首轮**（spawn_agent、handoff_agent 的新 worker）在 `POST /api/agent` 里带 `parentSessionId` = lead 的 app 会话 id（无则 provider 会话 id）。续接轮与 lead 自己的轮次从不发送，因此不会触发宿主的 “parentSessionId cannot change” 400。
 - 上游进展（2026-11-27）：#1862（toolRenderers）与 #1863（Agent API permissionMode / capabilities / sessions/:id）已合并，随 **v1.37.11** 发布；#1861 待提供复现步骤（已回复）；#1864 被要求改为独立 PR（Q49 待定）。fork 改为基于 v1.37.11。
+
+## 17. Tab 通知（2026-11-28）
+
+待审批 gate 和暂停/错误 worker 会显示在 CoAgent tab 标题中。用户可选择启用浏览器 Notification API；开关保存在
+`localStorage`，存取失败时安全降级，通知按 gate/agent 去重。这个实现仍是纯插件能力。CloudCLI 目前没有插件宿主
+通知 API；上游 #1840/#1874 的跨会话待处理 prompt 工作以后可能提供更一致的宿主级入口，届时再评估迁移。

@@ -1143,7 +1143,8 @@ export class Broker {
     const { store } = this.d;
     const run = store.run(runId);
     return run
-      ? { run, agents: store.agents(runId), messages: store.messages(runId), gates: store.gates(runId), events: store.events(runId) }
+      ? { run, agents: store.agents(runId), messages: store.messages(runId), gates: store.gates(runId), events: store.events(runId),
+        leadWaiting: this.waiting.has(run.leadAgentId) }
       : null;
   }
 
