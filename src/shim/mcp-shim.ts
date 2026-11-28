@@ -197,9 +197,21 @@ const TOOLS: { name: ToolName; description: string; shape: z.ZodRawShape }[] = [
   },
   {
     name: 'report_result',
-    description: 'WORKERS: report your finished work to the lead (what changed, files, verification, open issues). '
-      + 'Then end your turn.',
-    shape: { summary: z.string(), agent_id: agentId },
+    description: 'WORKERS: report a concise summary (at most 1000 characters) plus optional full details, files, '
+      + 'verification and open issues. Ordinary lead delivery contains only the compact fields; full text is available '
+      + 'through get_result. Then end your turn.',
+    shape: {
+      summary: z.string(), details: z.string().optional(), files: z.array(z.string()).optional(),
+      verification: z.string().optional(), open_issues: z.string().optional(), agent_id: agentId,
+    },
+  },
+  {
+    name: 'get_result',
+    description: 'LEAD ONLY: fetch a worker result in full on demand. Defaults to the details/full-text part.',
+    shape: {
+      worker: z.string().describe('Worker agent id'),
+      part: z.enum(['details', 'summary', 'files', 'verification', 'open_issues']).optional(),
+    },
   },
   {
     name: 'request_merge',
@@ -233,8 +245,9 @@ const TOOLS: { name: ToolName; description: string; shape: z.ZodRawShape }[] = [
   },
   {
     name: 'list_agents',
-    description: 'List the agents in your run with role, provider, status and working directory.',
-    shape: { agent_id: agentId },
+    description: 'List the lead and active/reworkable agents in your run with role, provider, status and working '
+      + 'directory. Finished merged/ended agents are hidden by default.',
+    shape: { include_finished: z.boolean().optional().describe('Include merged and ended agents (default false).'), agent_id: agentId },
   },
 ];
 

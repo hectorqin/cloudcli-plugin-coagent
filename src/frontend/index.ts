@@ -1,5 +1,5 @@
 /** CoAgent tab. Bundled into one ES module (the host imports it from a Blob URL). */
-import type { AgentDTO, GateDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
+import type { AgentDTO, EventDTO, GateDTO, MessageDTO, RunDetailDTO, StateDTO } from '../shared/protocol.js';
 import { mountDiff } from './diffView.js';
 import { buildTimeline, type Ref, type Row, type Timeline, type Tone, USER_LANE } from './timeline.js';
 import { drawerUsageHtml, laneUsageHtml, runUsageHtml, runUsageText } from './usage.js';
@@ -93,6 +93,9 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   const drafts = new Map<string, string>();
   const cleanupResults = new Map<string, string>();
   const cleanupPending = new Set<string>();
+  const fullResults = new Map<string, string>();
+  const olderMessages = new Map<string, MessageDTO[]>();
+  const olderEvents = new Map<string, EventDTO[]>();
   let endPanelRun: string | null = null;
   /** Gate diffs the user opened: kept open across re-renders (the diff itself is cached by diffView). */
   const openDiffs = new Set<number>();
@@ -113,6 +116,15 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       const json = JSON.stringify(next);
       if (!force && json === lastJson) return;
       state = next;
+      if (next.current) {
+        const id = next.current.run.id;
+        const messages = olderMessages.get(id) ?? [];
+        const events = olderEvents.get(id) ?? [];
+        const newestMessageIds = new Set(next.current.messages.map((x) => x.id));
+        const newestEventIds = new Set(next.current.events.map((x) => x.id));
+        next.current.messages = [...messages.filter((x) => !newestMessageIds.has(x.id)), ...next.current.messages];
+        next.current.events = [...events.filter((x) => !newestEventIds.has(x.id)), ...next.current.events];
+      }
       lastJson = json;
       showNotifications(next);
     } catch (e) {
@@ -150,6 +162,25 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   async function act(fn: () => Promise<unknown>) {
     try { await fn(); } catch (e) { error = (e as Error).message; }
     await refresh(true);
+  }
+
+  async function loadOlder() {
+    const cursor = state?.history;
+    const runId = state?.current?.run.id;
+    if (!cursor || !runId || (!cursor.beforeEvent && !cursor.beforeMessage)) return;
+    const q = new URLSearchParams({ run: runId });
+    if (api.context.session?.id) q.set('session', api.context.session.id);
+    q.set('before_event', String(cursor.beforeEvent ?? 0));
+    q.set('before_message', String(cursor.beforeMessage ?? 0));
+    const older = await api.rpc('GET', `state?${q}`) as StateDTO;
+    if (!state?.current || !older.current) return;
+    olderMessages.set(runId, [...older.current.messages, ...(olderMessages.get(runId) ?? [])]);
+    olderEvents.set(runId, [...older.current.events, ...(olderEvents.get(runId) ?? [])]);
+    state.current.messages = [...older.current.messages, ...state.current.messages];
+    state.current.events = [...older.current.events, ...state.current.events];
+    state.history = older.history;
+    lastJson = ''; // the next ordinary poll may replace this accumulated view with the newest page.
+    render();
   }
 
   function render() {
@@ -269,7 +300,9 @@ export function mount(container: HTMLElement, api: PluginAPI) {
         ? `plan #${g.id} from ${esc(g.requestedBy)}` : `merge ${esc(g.subjectAgent)} (#${g.id})`}</b></span>
         <button class="primary" data-act="select" data-type="gate" data-id="${g.id}">Review</button></div>`).join('')}
       ${errHtml}</div>`;
-    return top + timelineView(tl, d) + drawer(d);
+    const older = state!.history && (state!.history.beforeEvent || state!.history.beforeMessage)
+      ? '<div class="pad" style="text-align:center"><button data-act="load-older">Load older timeline</button></div>' : '';
+    return top + older + timelineView(tl, d) + drawer(d);
   }
 
   function timelineView(tl: Timeline, d: RunDetailDTO): string {
@@ -410,7 +443,12 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       ${drawerUsageHtml(a.usage)}
       ${a.lastError ? `<div class="err sub">${esc(a.lastError)}</div>` : ''}
       ${a.task ? `<h3>Task</h3><pre>${esc(a.task)}</pre>` : ''}
-      ${a.result ? `<h3>Result</h3><pre>${esc(a.result)}</pre>` : ''}
+      ${a.result ? `<h3>Result summary</h3><pre>${esc(a.result)}</pre>
+        ${a.resultVerification ? `<div class="sub"><b>Verification:</b> ${esc(a.resultVerification)}</div>` : ''}
+        ${a.resultOpenIssues ? `<div class="sub"><b>Open issues:</b> ${esc(a.resultOpenIssues)}</div>` : ''}
+        ${a.resultFiles?.length ? `<div class="sub"><b>Files:</b> ${esc(a.resultFiles.join(', '))}</div>` : ''}
+        ${fullResults.has(a.id) ? `<details open><summary>Full text</summary><pre>${esc(fullResults.get(a.id))}</pre></details>`
+          : `<button data-act="load-result" data-id="${esc(a.id)}">Load full text</button>`}` : ''}
       ${a.status === 'interrupted' ? '<div class="sub">Interrupted (a broker restart, or its auto-resume was cancelled). Resume it in its session, send it a message, or end it.</div>' : ''}
       ${!ended ? resumeRow(a) : ''}
       ${canMsg ? `<div class="row" style="margin-top:8px"><input class="grow" style="width:auto" data-draft="msg-${esc(a.id)}" placeholder="Message ${esc(a.id)}…">
@@ -509,6 +547,15 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     switch (ds.act) {
       case 'open-run': selectedRun = id; selected = null; firstPaint = true; notificationDeduper.reset(); void refresh(true); break;
       case 'back': selectedRun = null; selected = null; notificationDeduper.reset(); void refresh(true); break;
+      case 'load-older': void loadOlder().catch((e) => { error = (e as Error).message; render(); }); break;
+      case 'load-result':
+        el.setAttribute('disabled', '');
+        void api.rpc('GET', `agents/${encodeURIComponent(id)}/result`).then((value) => {
+          const result = value as { details?: unknown; summary?: unknown };
+          fullResults.set(id, String(result.details ?? result.summary ?? '(none)'));
+          render();
+        }, (e) => { error = (e as Error).message; render(); });
+        break;
       case 'select':
         selected = ds.type === 'agent' ? { type: 'agent', id } : { type: ds.type as Ref['type'], id: Number(id) } as Ref;
         render();

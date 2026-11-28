@@ -280,8 +280,9 @@ export class Broker {
       case 'send_message': {
         const toRaw = str(a.to, 'to');
         const to = toRaw === 'lead' ? lead.id : toRaw;
-        const target = store.agent(to);
+        let target = store.agent(to);
         if (!target || target.runId !== run.id) fail(`No agent "${toRaw}" in this run. Use list_agents.`);
+        target = this.reopenAutoEndedReadOnly(target!);
         if (target!.status === 'merged' || target!.status === 'ended') fail(`${to} is ${target!.status} and no longer receives messages.`);
         if (to === agent.id) fail('You cannot message yourself.');
         const wait = this.slotWait(target!) ?? this.pausedWait(target!);
@@ -299,16 +300,47 @@ export class Broker {
 
       case 'report_result': {
         if (isLead) fail('The lead reports to the user directly, not via report_result.');
-        const summary = str(a.summary, 'summary');
+        const rawSummary = str(a.summary, 'summary');
+        const structured = a.details !== undefined || a.files !== undefined || a.verification !== undefined || a.open_issues !== undefined;
+        let summary = rawSummary;
+        let details = typeof a.details === 'string' && a.details.trim() ? a.details : null;
+        if (rawSummary.length > 1000) {
+          if (structured) fail('summary must be at most 1000 characters; put the full text in details.');
+          details = rawSummary;
+          const note = '… (truncated, full text via get_result)';
+          summary = `${rawSummary.slice(0, 1000 - note.length)}${note}`;
+        }
+        const files = a.files === undefined ? [] : Array.isArray(a.files) && a.files.every((x) => typeof x === 'string')
+          ? a.files.map(String) : fail('files must be an array of strings.');
+        const verification = typeof a.verification === 'string' && a.verification.trim() ? a.verification.trim() : null;
+        const openIssues = typeof a.open_issues === 'string' && a.open_issues.trim() ? a.open_issues.trim() : null;
+        const body = formatResultSummary(agent.id, { summary, files, verification, openIssues });
         store.transaction(() => {
-          store.updateAgent(agent.id, { result: summary, status: 'reported' });
-          store.addMessage(run.id, agent.id, lead.id, 'result', summary);
+          store.setAgentResult(agent.id, { summary, details, files, verification, openIssues });
+          store.addMessage(run.id, agent.id, lead.id, 'result', body);
           // The turn that carried its task has done its job: acknowledge it now, so a crash before the stream
           // closes can never re-send the task.
           store.completeDispatch(store.dispatching(agent.id).map((m) => m.id));
         });
+        if (!store.busy.has(agent.id)) this.autoEndReportedReadOnly(agent.id);
         this.kick();
         return `Result sent to ${lead.id}. END YOUR TURN NOW. You may receive rework in this session later.`;
+      }
+
+      case 'get_result': {
+        requireLead();
+        const wid = str(a.worker, 'worker');
+        const worker = store.agent(wid);
+        if (!worker || worker.runId !== run.id || worker.role === 'lead') fail(`No worker "${wid}" in this run.`);
+        const result = store.resultDetails(wid);
+        if (!result?.summary) fail(`${wid} has not reported a result.`);
+        const reported = result!;
+        const part = typeof a.part === 'string' ? a.part : 'details';
+        const values: Record<string, unknown> = { summary: reported.summary, details: reported.details ?? reported.summary,
+          files: reported.files, verification: reported.verification, open_issues: reported.openIssues };
+        if (!(part in values)) fail('part must be details, summary, files, verification, or open_issues.');
+        const value = values[part];
+        return `${wid} result ${part}:\n${Array.isArray(value) ? value.join('\n') : value ?? '(none)'}`;
       }
 
       case 'request_merge': {
@@ -391,11 +423,20 @@ export class Broker {
       }
 
       case 'list_agents': {
-        const rows = store.agents(run.id).map((x) =>
+        const all = store.agents(run.id);
+        const includeFinished = a.include_finished === true;
+        const visible = includeFinished ? all : all.filter((x) => x.role === 'lead'
+          || !['merged', 'ended'].includes(x.status)
+          || (x.status === 'ended' && !READONLY_ROLES.has(x.role) && !!x.worktreePath));
+        const hidden = all.filter((x) => !visible.includes(x));
+        const rows = visible.map((x) =>
           `- ${x.id}${x.id === agent.id ? ' (you)' : ''}: role=${x.role} provider=${x.provider} status=${x.status}`
           + `${x.status === 'paused' && x.resumeAt ? ` (auto-resume at ${formatUtc(Date.parse(x.resumeAt))})` : ''}`
           + `${store.busy.has(x.id) ? ' [running]' : ''} cwd=${x.cwd}${x.branch ? ` branch=${x.branch}` : ''}`);
-        return `Run ${run.id} (plan: ${run.planStatus})\n${rows.join('\n')}`;
+        const merged = hidden.filter((x) => x.status === 'merged').length;
+        const ended = hidden.filter((x) => x.status === 'ended').length;
+        const note = includeFinished ? '' : `\n${hidden.length} finished agents hidden (merged: ${merged}, ended: ${ended}); pass include_finished: true to list them`;
+        return `Run ${run.id} (plan: ${run.planStatus})\n${rows.join('\n')}${note}`;
       }
     }
     return fail(`Unknown tool ${req.tool}`);
@@ -568,8 +609,9 @@ export class Broker {
 
   userMessage(agentId: string, body: string) {
     const { store } = this.d;
-    const a = store.agent(agentId) ?? fail(`No agent ${agentId}`);
+    let a = store.agent(agentId) ?? fail(`No agent ${agentId}`);
     if (!this.runOpen(a.runId)) fail('This run has ended.', 409);
+    a = this.reopenAutoEndedReadOnly(a);
     if (a.status === 'merged' || a.status === 'ended') fail(`${a.id} is ${a.status} and no longer receives messages.`);
     const wait = this.slotWait(a) ?? this.pausedWait(a);
     store.addMessage(a.runId, null, a.id, 'message', str(body, 'body'));
@@ -754,6 +796,29 @@ export class Broker {
       const dropped = cancelled ? ` ${cancelled} undelivered message(s) to it were cancelled.` : '';
       return `Ended ${w.id}; its worker slot is free.${dropped}${cleanup}`;
     });
+  }
+
+  /** Frees a read-only worker only after report_result was accepted and its turn is no longer running. */
+  private autoEndReportedReadOnly(agentId: string) {
+    const { store } = this.d;
+    const worker = store.agent(agentId);
+    if (!worker || !READONLY_ROLES.has(worker.role) || worker.status !== 'reported' || store.busy.has(worker.id)) return;
+    store.transaction(() => {
+      const current = store.agent(agentId)!;
+      if (current.status !== 'reported' || store.busy.has(current.id)) return;
+      store.updateAgent(current.id, { status: 'ended' });
+      const cancelled = store.cancelQueued(current.id);
+      store.addEvent(current.runId, current.id, 'agent_ended', { reason: 'auto', after: 'report', cancelled });
+    });
+  }
+
+  /** Auto-ended readers retain their CloudCLI session and can be brought back for another review/planning pass. */
+  private reopenAutoEndedReadOnly(worker: AgentDTO): AgentDTO {
+    const { store } = this.d;
+    if (worker.status !== 'ended' || !READONLY_ROLES.has(worker.role) || !(worker.appSessionId || worker.providerSessionId)
+      || !store.wasAutoEndedAfterReport(worker.id)) return worker;
+    store.updateAgent(worker.id, { status: 'idle' });
+    return store.agent(worker.id)!;
   }
 
   /**
@@ -1124,7 +1189,7 @@ export class Broker {
   }
 
   // ── state for the tab ─────────────────────────────────────────────
-  state(appSessionId: string | null, runId: string | null): StateDTO {
+  state(appSessionId: string | null, runId: string | null, beforeEvent: number | null = null, beforeMessage: number | null = null): StateDTO {
     const { store, cloudcli } = this.d;
     const me = appSessionId ? store.agentByAppSession(appSessionId) : null;
     const showRun = runId ?? me?.runId ?? null;
@@ -1134,17 +1199,27 @@ export class Broker {
         autoRegister: store.getJson('autoRegister', true),
       },
       me: me?.id ?? null,
-      current: showRun ? this.detail(showRun) : null,
+      current: showRun ? this.detail(showRun, beforeEvent, beforeMessage) : null,
       runs: store.runSummaries(),
+      runsCount: store.runCount(),
+      history: showRun ? this.historyCursor(showRun, beforeEvent, beforeMessage) : null,
     };
   }
 
-  detail(runId: string): RunDetailDTO | null {
+  detail(runId: string, beforeEvent: number | null = null, beforeMessage: number | null = null): RunDetailDTO | null {
     const { store } = this.d;
     const run = store.run(runId);
     return run
-      ? { run, agents: store.agents(runId), messages: store.messages(runId), gates: store.gates(runId), events: store.events(runId) }
+      ? { run, agents: store.agents(runId), messages: store.messages(runId, 200, beforeMessage), gates: store.gates(runId),
+        events: store.events(runId, 200, beforeEvent) }
       : null;
+  }
+
+  private historyCursor(runId: string, beforeEvent: number | null, beforeMessage: number | null) {
+    const messages = this.d.store.messages(runId, 200, beforeMessage);
+    const events = this.d.store.events(runId, 200, beforeEvent);
+    return { beforeMessage: messages.length === 200 ? messages[0].id : null,
+      beforeEvent: events.length === 200 ? events[0].id : null };
   }
 
   // ── delivery ──────────────────────────────────────────────────────
@@ -1351,11 +1426,13 @@ export class Broker {
     const { store } = this.d;
     const mode = a.mode === 'any' ? 'any' : 'all';
     const workers = store.agents(runId).filter((x) => x.role !== 'lead');
+    const pendingInbox = store.undelivered(leadId);
+    const newlyReported = new Set(pendingInbox.filter((m) => m.kind === 'result' && m.from).map((m) => m.from!));
     const wanted = Array.isArray(a.agents) ? a.agents.map(String).filter(Boolean) : [];
     for (const id of wanted) if (!workers.some((w) => w.id === id)) fail(`No worker "${id}" in this run.`);
     const targets = wanted.length
       ? workers.filter((w) => wanted.includes(w.id))
-      : workers.filter((w) => store.busy.has(w.id) || !['merged', 'ended'].includes(w.status));
+      : workers.filter((w) => store.busy.has(w.id) || !['merged', 'ended'].includes(w.status) || newlyReported.has(w.id));
     const ids = new Set(targets.map((t) => t.id));
     const finished = (w: AgentDTO) => !store.busy.has(w.id) && FINISHED_STATUSES.has(w.status);
 
@@ -1365,7 +1442,7 @@ export class Broker {
     }
     this.holdLease(leadId);
 
-    const inbox = store.undelivered(leadId);
+    const inbox = pendingInbox;
     const urgent = inbox.some((m) => m.kind !== 'result');
     const newResults = inbox.filter((m) => m.kind === 'result' && m.from && ids.has(m.from));
     const allDone = targets.every(finished);
@@ -1492,6 +1569,7 @@ export class Broker {
         : res.status === 'aborted' ? { ok: false, aborted: true, turn: id } : { ok: true, turn: id });
     }
     const now = store.agent(agent.id)!;
+    if (!isLead && accepted && READONLY_ROLES.has(now.role) && now.status === 'reported') this.autoEndReportedReadOnly(agent.id);
 
     if (res.status === 'busy') {
       const prev = this.backoff.get(agent.id)?.ms ?? 0;
@@ -1514,7 +1592,7 @@ export class Broker {
       const prev = this.backoff.get(agent.id)?.ms ?? 0;
       const ms = Math.min(BACKOFF_MAX, prev ? prev * 2 : BACKOFF_MIN);
       this.backoff.set(agent.id, { until: this.now() + ms, ms });
-      const keep = isLead || now.status === 'ended' || now.status === 'interrupted';
+      const keep = isLead || ['reported', 'ended', 'interrupted'].includes(now.status);
       store.updateAgent(agent.id, { lastError: res.error, ...(keep ? {} : { status: 'error' }) });
       if (!isLead) {
         store.addMessage(agent.runId, null, store.run(agent.runId)!.leadAgentId, 'system', `${agent.id} failed: ${res.error}`);
@@ -1546,6 +1624,7 @@ export class Broker {
       if (info?.providerSessionId) store.updateAgent(agent.id, { providerSessionId: info.providerSessionId });
     }
     if (!isLead && now.status === 'running') store.updateAgent(agent.id, { status: 'idle', lastError: null });
+    if (!isLead) this.autoEndReportedReadOnly(agent.id);
     this.kick();
     return true;
   }
@@ -1604,4 +1683,15 @@ export function resumeText(a: Pick<AgentDTO, 'branch'>, reason: string): string 
 export function formatInbox(agentId: string, msgs: MessageDTO[]): string {
   const parts = msgs.map((m) => `### From ${m.from ?? 'user'} · ${m.kind}\n${m.body}`);
   return `[coagent] ${msgs.length} new message(s) for ${agentId}:\n\n${parts.join('\n\n')}`;
+}
+
+function formatResultSummary(worker: string, result: {
+  summary: string; files: string[]; verification: string | null; openIssues: string | null;
+}) {
+  const parts = [result.summary];
+  if (result.files.length) parts.push(`Files: ${result.files.join(', ')}`);
+  if (result.verification) parts.push(`Verification: ${result.verification}`);
+  if (result.openIssues) parts.push(`Open issues: ${result.openIssues}`);
+  parts.push(`Full text: get_result(worker: "${worker}")`);
+  return parts.join('\n\n');
 }

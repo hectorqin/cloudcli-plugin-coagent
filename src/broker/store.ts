@@ -166,6 +166,12 @@ const ENDING_FRAGMENT: SchemaFragment = { table: 'runs', columns: { ending_at: '
 // "you were interrupted" message (its interrupted turn had been accepted). Persisted so a restart keeps the plan.
 const PAUSE_FRAGMENT: SchemaFragment = { table: 'agents', columns: { resume_at: 'TEXT', pause_reason: 'TEXT', pause_nudge: 'INTEGER' } };
 
+// A2: compact result stays in `result`; full text and structured handoff metadata stay out of ordinary state.
+const RESULT_DETAILS_FRAGMENT: SchemaFragment = {
+  table: 'agents',
+  columns: { result_details: 'TEXT', result_files: 'TEXT', result_verification: 'TEXT', result_open_issues: 'TEXT' },
+};
+
 /** Indexes for the hot queries in this file; test/migrations.test.ts checks each one against the real statement. */
 const HOT_INDEXES_FRAGMENT: SchemaFragment = {
   indexes: {
@@ -253,6 +259,7 @@ const fragmentStep = (version: number, description: string, fragments: readonly 
  *
  * - `up` may run any SQL: renames, table rebuilds, constraint changes, multi-statement backfills. It must not COMMIT.
  *   For a purely additive change, `fragmentStep(N, description, [fragment])` also gives it drift repair.
+ *   `fragmentStep` shares each fragment object between `up` and `repair`, so never edit a released step's fragment in place.
  * - Also update Store.diagnostics() (its `expected` column map) for new tables/columns; pendingMigrations() and the
  *   repair list follow from `repair` automatically.
  * - Add the shape to test/migrations.test.ts (upgrade from N-1, idempotent, backup only on the version change).
@@ -268,6 +275,7 @@ export const MIGRATIONS: readonly VersionedMigration[] = [
   fragmentStep(5, 'persisted run ending intent', [ENDING_FRAGMENT], 'runs'),
   fragmentStep(6, 'paused worker resume state', [PAUSE_FRAGMENT], 'agents'),
   fragmentStep(7, 'hot-path query indexes', [HOT_INDEXES_FRAGMENT]),
+  fragmentStep(8, 'structured agent result details', [RESULT_DETAILS_FRAGMENT], 'agents'),
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.at(-1)?.version ?? 0;
@@ -443,7 +451,8 @@ export class Store {
   diagnostics(now = Date.now()) {
     const expected: Record<string, string[]> = {
       runs: ['id', 'lead_agent_id', 'project_path', 'status', 'plan_status', 'created_at', 'ended_at', 'ending_at'],
-      agents: ['id', 'run_id', 'role', 'provider', 'status', 'created_at', 'resume_at', 'pause_reason', 'pause_nudge'],
+      agents: ['id', 'run_id', 'role', 'provider', 'status', 'created_at', 'resume_at', 'pause_reason', 'pause_nudge',
+        'result_details', 'result_files', 'result_verification', 'result_open_issues'],
       messages: ['id', 'run_id', 'to_agent', 'kind', 'body', 'created_at', 'delivered_at', 'gate_id',
         'delivery_state', 'attempts', 'lease_until'],
       gates: ['id', 'run_id', 'kind', 'status', 'created_at', 'worker_head', 'lead_head', 'merge_base',
@@ -499,17 +508,20 @@ export class Store {
     const r = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id) as Row | undefined;
     return r ? this.toRun(r) : null;
   }
-  runs(): RunDTO[] {
+  runs(limit?: number): RunDTO[] {
     const usage = this.runUsages();
-    return (this.db.prepare('SELECT * FROM runs ORDER BY created_at DESC').all() as Row[]).map((r) => this.toRun(r, usage));
+    const sql = `SELECT * FROM runs ORDER BY created_at DESC${limit === undefined ? '' : ' LIMIT ?'}`;
+    const rows = (limit === undefined ? this.db.prepare(sql).all() : this.db.prepare(sql).all(limit)) as Row[];
+    return rows.map((r) => this.toRun(r, usage));
   }
   /** The run list for the tab: counts come from grouped queries, so the cost does not grow per run. */
-  runSummaries(): (RunDTO & { agentCount: number; pendingGates: number })[] {
+  runSummaries(limit = 50): (RunDTO & { agentCount: number; pendingGates: number })[] {
     const count = (sql: string) => new Map((this.db.prepare(sql).all() as Row[]).map((r) => [String(r.k), Number(r.n)]));
     const agents = count('SELECT run_id AS k, COUNT(*) AS n FROM agents GROUP BY run_id');
     const gates = count("SELECT run_id AS k, COUNT(*) AS n FROM gates WHERE status = 'pending' GROUP BY run_id");
-    return this.runs().map((r) => ({ ...r, agentCount: agents.get(r.id) ?? 0, pendingGates: gates.get(r.id) ?? 0 }));
+    return this.runs(limit).map((r) => ({ ...r, agentCount: agents.get(r.id) ?? 0, pendingGates: gates.get(r.id) ?? 0 }));
   }
+  runCount(): number { return Number((this.db.prepare('SELECT COUNT(*) AS n FROM runs').get() as Row).n); }
   /** Lead agent ids of every run (cheap: no usage). */
   leadIds(): Set<string> {
     return new Set((this.db.prepare('SELECT lead_agent_id AS id FROM runs').all() as Row[]).map((r) => String(r.id)));
@@ -582,6 +594,24 @@ export class Store {
     if (!entries.length) return;
     this.db.prepare(`UPDATE agents SET ${entries.map(([k]) => `${cols[k]} = ?`).join(', ')} WHERE id = ?`)
       .run(...entries.map(([, v]) => (v ?? null) as string | null), id);
+  }
+  setAgentResult(id: string, result: { summary: string; details: string | null; files: string[]; verification: string | null; openIssues: string | null }) {
+    this.db.prepare(`UPDATE agents SET result = ?, result_details = ?, result_files = ?, result_verification = ?,
+      result_open_issues = ?, status = 'reported' WHERE id = ?`).run(
+      result.summary, result.details, JSON.stringify(result.files), result.verification, result.openIssues, id);
+  }
+  resultDetails(id: string) {
+    const r = this.db.prepare(`SELECT result, result_details, result_files, result_verification, result_open_issues
+      FROM agents WHERE id = ?`).get(id) as Row | undefined;
+    if (!r) return null;
+    return { summary: s(r.result), details: s(r.result_details), files: parseStringArray(r.result_files),
+      verification: s(r.result_verification), openIssues: s(r.result_open_issues) };
+  }
+  wasAutoEndedAfterReport(id: string): boolean {
+    const r = this.db.prepare("SELECT data FROM events WHERE agent_id = ? AND type = 'agent_ended' ORDER BY id DESC LIMIT 1").get(id) as Row | undefined;
+    if (!r) return false;
+    const data = JSON.parse(String(r.data)) as Record<string, unknown>;
+    return data.reason === 'auto' && data.after === 'report';
   }
   /** Marks a worker paused until `resumeAt` (ISO). `nudge`: its resume must tell it that a turn was cut off. */
   pauseAgent(id: string, resumeAt: string, reason: string, nudge: boolean, lastError: string | null) {
@@ -695,9 +725,12 @@ export class Store {
     return (this.db.prepare(`SELECT a.* FROM agents a JOIN runs r ON r.id = a.run_id WHERE r.status = 'active' ORDER BY a.created_at`)
       .all() as Row[]).map((r) => this.toAgent(r, usage));
   }
-  messages(runId: string, limit = 500): MessageDTO[] {
-    return (this.db.prepare('SELECT * FROM (SELECT * FROM messages WHERE run_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id')
-      .all(runId, limit) as Row[]).map(toMessage);
+  messages(runId: string, limit = 200, before?: number | null): MessageDTO[] {
+    if (before === 0) return [];
+    const clause = before ? ' AND id < ?' : '';
+    const args = before ? [runId, before, limit] : [runId, limit];
+    return (this.db.prepare(`SELECT * FROM (SELECT * FROM messages WHERE run_id = ?${clause} ORDER BY id DESC LIMIT ?) ORDER BY id`)
+      .all(...args) as Row[]).map(toMessage);
   }
 
   // ── gates ─────────────────────────────────────────────────────────
@@ -739,8 +772,12 @@ export class Store {
     this.db.prepare('INSERT INTO events (run_id, agent_id, type, data, created_at) VALUES (?,?,?,?,?)')
       .run(runId, agentId, type, JSON.stringify(data), this.ts());
   }
-  events(runId: string): EventDTO[] {
-    return (this.db.prepare('SELECT * FROM events WHERE run_id = ? ORDER BY id').all(runId) as Row[]).map((r) => ({
+  events(runId: string, limit = 200, before?: number | null): EventDTO[] {
+    if (before === 0) return [];
+    const clause = before ? ' AND id < ?' : '';
+    const args = before ? [runId, before, limit] : [runId, limit];
+    return (this.db.prepare(`SELECT * FROM (SELECT * FROM events WHERE run_id = ?${clause} ORDER BY id DESC LIMIT ?) ORDER BY id`)
+      .all(...args) as Row[]).map((r) => ({
       id: Number(r.id), runId: String(r.run_id), agentId: s(r.agent_id), type: String(r.type) as EventType,
       data: JSON.parse(String(r.data)) as Record<string, unknown>, createdAt: String(r.created_at),
     }));
@@ -867,7 +904,8 @@ export class Store {
       id: String(r.id), runId: String(r.run_id), role: String(r.role), provider: String(r.provider) as Provider,
       providerSessionId: s(r.provider_session_id), appSessionId: s(r.app_session_id), cwd: String(r.cwd),
       branch: s(r.branch), worktreePath: s(r.worktree_path), status: String(r.status) as AgentStatus,
-      task: s(r.task), result: s(r.result), lastError: s(r.last_error),
+      task: s(r.task), result: s(r.result), resultFiles: parseStringArray(r.result_files),
+      resultVerification: s(r.result_verification), resultOpenIssues: s(r.result_open_issues), lastError: s(r.last_error),
       resumeAt: s(r.resume_at), pauseReason: s(r.pause_reason), busy: this.busy.has(String(r.id)),
       activity: (this.activity.get(String(r.id)) ?? []).map(({ ts, text }) => ({ ts, text })),
       usage: usage ? usage.get(String(r.id)) ?? emptyAgentUsage() : this.agentUsage(String(r.id)),
@@ -882,6 +920,11 @@ export class Store {
       usage: usage ? usage.get(String(r.id)) ?? emptyRunUsage() : this.runUsage(String(r.id)),
     };
   }
+}
+
+function parseStringArray(value: unknown): string[] {
+  if (typeof value !== 'string') return [];
+  try { const parsed = JSON.parse(value) as unknown; return Array.isArray(parsed) ? parsed.map(String) : []; } catch { return []; }
 }
 
 const emptyAgentUsage = (): AgentUsageDTO => ({

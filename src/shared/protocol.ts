@@ -9,6 +9,7 @@ export type ToolName =
   | 'send_message'
   | 'read_inbox'
   | 'report_result'
+  | 'get_result'
   | 'request_merge'
   | 'list_agents'
   | 'wait_for_agents'
@@ -148,6 +149,9 @@ export interface AgentDTO {
   status: AgentStatus;
   task: string | null;
   result: string | null;
+  resultFiles?: string[];
+  resultVerification?: string | null;
+  resultOpenIssues?: string | null;
   lastError: string | null;
   /** Paused workers: when the broker resumes it (ISO), and why it paused ("usage limit" / "rate limit"). */
   resumeAt?: string | null;
@@ -209,6 +213,11 @@ export interface RunDetailDTO {
   events: EventDTO[];
 }
 
+export interface HistoryCursorDTO {
+  beforeEvent: number | null;
+  beforeMessage: number | null;
+}
+
 /** Response of GET /state for the tab. */
 export interface StateDTO {
   setup: { apiKeyConfigured: boolean; registration: Record<string, string>; autoRegister: boolean };
@@ -216,4 +225,8 @@ export interface StateDTO {
   me: string | null;
   current: RunDetailDTO | null;
   runs: (RunDTO & { agentCount: number; pendingGates: number })[];
+  /** Total run count; `runs` contains only the newest 50. */
+  runsCount?: number;
+  /** Non-null ids mean older timeline rows can be requested with the corresponding `before_*` query. */
+  history?: HistoryCursorDTO | null;
 }

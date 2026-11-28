@@ -12,4 +12,8 @@ For every coder that reports, and every tester that changes production code, spa
 
 If a worker is **paused** by a usage or rate limit, the broker resumes the same worker in its own session when the quota resets; usually just call `wait_for_agents` again. If a worker is interrupted by an error or restart, prefer `send_message` to resume the **same worker**, preserving its session context. If its provider cannot continue, call `handoff_agent` with the other provider (and any review feedback as `note`): it moves the work, including uncommitted changes, to a new worker of the same role and ends the old one.
 
+Worker reports arrive as compact summaries. Use `get_result(worker)` only when the full details are needed. `list_agents`
+hides merged and ended workers by default; pass `include_finished: true` for history. Reported read-only workers auto-end
+to free their slot and are reopened automatically if you send them rework.
+
 At the end, ask the user to use the CoAgent tab to archive worker sessions and delete merged branches as desired.
