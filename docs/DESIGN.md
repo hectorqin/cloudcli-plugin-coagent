@@ -219,3 +219,12 @@ tab 改为泳道时序图：每个 agent 一条泳道（最左为 You），时�
   - 一个事务内：旧 worker 的 pending 合并关卡置 rejected、旧 worker 置 `ended`（保留 worktree 与分支，释放名额，取消其 queued 消息，`agent_ended {handoff: <new>}`）、容量复核、创建新 worker（`spawned {handoffFrom}`）、记 `handoff {from, to, provider, carried}`、入队交接任务。交接任务包含：原始任务、旧 worker 最近约 12 条活动、最后的 result/错误、它未收到的消息、lead 的 `note`，并明确说明“已有工作就在你的 worktree 里”及搬过来的文件清单。复制期间旧 worker 被加入进程内 `handingOff` 集合，`deliver()` 不会给它开新 turn。
   - 时间线：`handoff` 画成旧泳道 → 新泳道的箭头；新泳道的 spawned 节点显示 “took over from …”。
 - 未实测：真实 CloudCLI 下 Codex/Claude 额度错误经 `/api/agent` SSE 到达的确切形态（按用户提供的两条原文测试）；tab/卡片按钮在真实 UI 中的渲染。
+
+## 16. 子会话（Q45–Q48，2026-11-28）
+
+- 背景：CloudCLI 现有会话树只按 fork 关系（`forked_from_session_id`）在**同一项目、同一 provider** 内嵌套，coagent 的 worker 跨项目（worktree）且常跨 provider，无法套用。
+- Q45：fork 新增「子会话」关系 `parent_session_id`，与 fork 血缘分离，允许跨项目、跨 provider；Agent API 接受 `parentSessionId`；coagent 派 worker 时传 lead 的 app 会话 id。侧边栏把子会话挂在父会话下（各自 provider 图标），即截图样式。作为 fork 补丁 5。
+- Q46：子会话**只显示在父会话下**；若某 worktree 项目里的会话全是别处的子会话，该项目不在项目列表单独出现。补丁 1（worktree 归组）保留给 CloudCLI 自身的 worktree。
+- Q47：只读与写代码 worker 一视同仁；已合并/已结束的显示为灰色；已归档的不显示。
+- Q48：先在 fork 实现自用，现有 PR 有维护者反馈后再提上游。
+- 上游进展（2026-11-27）：#1862（toolRenderers）与 #1863（Agent API permissionMode / capabilities / sessions/:id）已合并，随 **v1.37.11** 发布；#1861 待提供复现步骤（已回复）；#1864 被要求改为独立 PR（Q49 待定）。fork 改为基于 v1.37.11。
