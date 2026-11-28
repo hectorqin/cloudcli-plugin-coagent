@@ -232,8 +232,9 @@ describe('database migration backups', () => {
     new Store(file).close();
     const db = new DatabaseSync(file);
     db.exec('DROP TABLE turns'); // also drops turns_agent / turns_run: the schema main had before usage visibility
+    db.exec('PRAGMA user_version = 3'); // historical databases predate the ledger; shape detection identifies v3
     db.prepare('INSERT INTO kv (k, v) VALUES (?, ?)').run('preserved', '1');
-    expect(pendingMigrations(db)).toEqual(['table turns']);
+    expect(pendingMigrations(db)[0]).toMatch(/^v4: turn accounting/);
     db.close();
 
     new Store(file).close();
@@ -257,7 +258,7 @@ describe('database migration backups', () => {
     ['a dropped schema index', 'DROP INDEX events_run'],
     ['a missing delivery index', 'DROP INDEX messages_delivery'],
     ['a legacy inbox index', 'CREATE INDEX messages_inbox ON messages(to_agent)'],
-  ])('backs up a current database that has %s before repairing it', (_label, change) => {
+  ])('repairs a current-version database that has %s without a migration backup', (_label, change) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-drift-'));
     const file = path.join(tmp, 'coagent.db');
     new Store(file).close();
@@ -265,9 +266,9 @@ describe('database migration backups', () => {
     db.exec(change);
     db.close();
     new Store(file).close();
-    expect(fs.readdirSync(path.join(tmp, 'backups'))).toHaveLength(1);
-    new Store(file).close(); // repaired: nothing left to migrate, so no second backup
-    expect(fs.readdirSync(path.join(tmp, 'backups'))).toHaveLength(1);
+    expect(fs.existsSync(path.join(tmp, 'backups'))).toBe(false);
+    new Store(file).close();
+    expect(fs.existsSync(path.join(tmp, 'backups'))).toBe(false);
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 

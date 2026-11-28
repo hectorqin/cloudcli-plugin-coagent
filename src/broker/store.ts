@@ -84,10 +84,7 @@ CREATE INDEX IF NOT EXISTS events_run ON events(run_id, id);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 `;
 
-/**
- * One schema change applied by Store.migrate(), described as data so that other code (e.g. a pre-migration backup
- * check) can tell whether a database still needs migrating: see pendingMigrations().
- */
+/** Legacy additive schema fragment. Kept exported because parallel features can compose their table/column additions. */
 export interface MigrationItem {
   table: string;
   /** CREATE TABLE IF NOT EXISTS for tables added after the base SCHEMA (minimal columns; the rest come from `columns`). */
@@ -127,8 +124,7 @@ export const TURNS_MIGRATION: MigrationItem = {
   },
 };
 
-/** Every migration after the base SCHEMA, in order. */
-export const MIGRATIONS: readonly MigrationItem[] = [
+const ADDITIVE_MIGRATIONS: readonly MigrationItem[] = [
   {
     table: 'messages',
     columns: {
@@ -171,18 +167,14 @@ export const MIGRATIONS: readonly MigrationItem[] = [
 const SCHEMA_TABLES = [...SCHEMA.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
 const SCHEMA_INDEXES = [...SCHEMA.matchAll(/CREATE INDEX IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
 
-/**
- * What migrate() would still change in this database (empty = up to date). Read-only, so it can run on a database
- * opened with { readOnly: true } before deciding to back it up.
- */
-export function pendingMigrations(db: DatabaseSync): string[] {
+function structuralPending(db: DatabaseSync): string[] {
   const out: string[] = [];
   const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Row[]).map((r) => String(r.name)));
   const indexes = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Row[]).map((r) => String(r.name)));
   // The base SCHEMA is the first migration step (migrate() runs it before MIGRATIONS), so check it here too.
   for (const t of SCHEMA_TABLES) if (!tables.has(t)) out.push(`table ${t}`);
   for (const i of SCHEMA_INDEXES) if (!indexes.has(i)) out.push(`index ${i}`);
-  for (const m of MIGRATIONS) {
+  for (const m of ADDITIVE_MIGRATIONS) {
     if (!tables.has(m.table)) { out.push(`table ${m.table}`); continue; }
     const cols = new Set((db.prepare(`PRAGMA table_info(${m.table})`).all() as Row[]).map((r) => String(r.name)));
     for (const c of Object.keys(m.columns)) if (!cols.has(c)) out.push(`column ${m.table}.${c}`);
@@ -190,6 +182,98 @@ export function pendingMigrations(db: DatabaseSync): string[] {
     for (const i of m.dropIndexes ?? []) if (indexes.has(i)) out.push(`drop index ${i}`);
   }
   return out;
+}
+
+function addFragment(db: DatabaseSync, m: MigrationItem) {
+  if (m.create) db.exec(m.create);
+  const cols = new Set((db.prepare(`PRAGMA table_info(${m.table})`).all() as Row[]).map((r) => String(r.name)));
+  for (const [name, type] of Object.entries(m.columns)) {
+    if (cols.has(name)) continue;
+    db.exec(`ALTER TABLE ${m.table} ADD COLUMN ${name} ${type}`);
+    const backfill = m.backfill?.[name];
+    if (backfill) db.exec(backfill);
+  }
+  for (const i of m.dropIndexes ?? []) db.exec(`DROP INDEX IF EXISTS ${i}`);
+  for (const sql of Object.values(m.indexes)) db.exec(sql);
+}
+
+export interface VersionedMigration {
+  /** Monotonically increasing; append only. Never edit a released step. */
+  version: number;
+  description: string;
+  /** Primary table, when the step has one (compatibility/introspection only). */
+  table?: string;
+  up(db: DatabaseSync): void;
+}
+
+const HOT_INDEXES: Readonly<Record<string, string>> = {
+  agents_run_created: 'CREATE INDEX IF NOT EXISTS agents_run_created ON agents(run_id, created_at)',
+  agents_app_session: 'CREATE INDEX IF NOT EXISTS agents_app_session ON agents(app_session_id)',
+  messages_run_id: 'CREATE INDEX IF NOT EXISTS messages_run_id ON messages(run_id, id)',
+  messages_delivery_lease_id: 'CREATE INDEX IF NOT EXISTS messages_delivery_lease_id ON messages(delivery_state, lease_until, id)',
+  gates_run_id: 'CREATE INDEX IF NOT EXISTS gates_run_id ON gates(run_id, id)',
+  gates_pending_subject: 'CREATE INDEX IF NOT EXISTS gates_pending_subject ON gates(run_id, kind, status, subject_agent)',
+  turns_run_agent_id: 'CREATE INDEX IF NOT EXISTS turns_run_agent_id ON turns(run_id, agent_id, id)',
+};
+
+/**
+ * Schema ledger. Append one atomic step with the next version; never reorder or modify released entries. A step may
+ * use addFragment for parallel additive work, or arbitrary SQL for renames, constraints and complex backfills.
+ * Store wraps every `up` call and its PRAGMA user_version update in the same transaction.
+ */
+export const MIGRATIONS: readonly VersionedMigration[] = [
+  { version: 1, description: 'initial run, agent, message, gate and event schema', up: (db) => db.exec(SCHEMA) },
+  { version: 2, description: 'reliable message delivery leases', table: 'messages', up: (db) => addFragment(db, ADDITIVE_MIGRATIONS[0]) },
+  { version: 3, description: 'merge gate snapshots', table: 'gates', up: (db) => addFragment(db, ADDITIVE_MIGRATIONS[1]) },
+  { version: 4, description: 'turn accounting', table: 'turns', up: (db) => addFragment(db, ADDITIVE_MIGRATIONS[2]) },
+  { version: 5, description: 'persisted run ending intent', table: 'runs', up: (db) => addFragment(db, ADDITIVE_MIGRATIONS[3]) },
+  { version: 6, description: 'paused worker resume state', table: 'agents', up: (db) => addFragment(db, ADDITIVE_MIGRATIONS[4]) },
+  { version: 7, description: 'hot-path query indexes', up: (db) => {
+    for (const sql of Object.values(HOT_INDEXES)) db.exec(sql);
+  } },
+];
+
+export const SCHEMA_VERSION = MIGRATIONS.at(-1)?.version ?? 0;
+
+const hasColumn = (db: DatabaseSync, table: string, column: string) =>
+  (db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).some((r) => String(r.name) === column);
+const hasTable = (db: DatabaseSync, table: string) => !!db.prepare(
+  "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+).get(table);
+
+/** Infer the newest contiguous historical shape for databases created before the ledger existed. */
+function inferredLegacyVersion(db: DatabaseSync): number {
+  if (!['runs', 'agents', 'messages', 'gates', 'events', 'kv'].every((table) => hasTable(db, table))) return 0;
+  let version = 1;
+  if (!hasColumn(db, 'messages', 'delivery_state')) return version;
+  version = 2;
+  if (!hasColumn(db, 'gates', 'worker_head')) return version;
+  version = 3;
+  if (!hasTable(db, 'turns')) return version;
+  version = 4;
+  if (!hasColumn(db, 'runs', 'ending_at')) return version;
+  version = 5;
+  if (!hasColumn(db, 'agents', 'resume_at')) return version;
+  return 6;
+}
+
+export function schemaVersion(db: DatabaseSync): number {
+  const recorded = Number((db.prepare('PRAGMA user_version').get() as Row).user_version ?? 0);
+  return recorded || inferredLegacyVersion(db);
+}
+
+/** Read-only description of the version steps (and any additive repair) migrate() would apply. */
+export function pendingMigrations(db: DatabaseSync): string[] {
+  const recorded = Number((db.prepare('PRAGMA user_version').get() as Row).user_version ?? 0);
+  const version = recorded || inferredLegacyVersion(db);
+  const pending = MIGRATIONS.filter((m) => m.version > version).map((m) => `v${m.version}: ${m.description}`);
+  // A current ledger with a manually damaged/additively extended schema is repaired without rewriting its version.
+  if (recorded >= SCHEMA_VERSION) {
+    pending.push(...structuralPending(db));
+    const indexes = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Row[]).map((r) => String(r.name)));
+    for (const name of Object.keys(HOT_INDEXES)) if (!indexes.has(name)) pending.push(`index ${name}`);
+  }
+  return pending;
 }
 
 export interface NewAgent {
@@ -220,7 +304,6 @@ export class Store {
     try {
       if (this.needsMigration()) this.backupOrSkip(file, opts.maxBackupBytes ?? MAX_BACKUP_BYTES);
       this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
-      this.db.exec(SCHEMA);
       this.migrate();
     } catch (error) {
       this.db.close();
@@ -232,7 +315,7 @@ export class Store {
   private needsMigration() {
     const userTables = this.db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").get() as Row;
     if (Number(userTables.n) === 0) return false; // A new/empty database has no user state to preserve.
-    return pendingMigrations(this.db).length > 0;
+    return schemaVersion(this.db) < SCHEMA_VERSION;
   }
 
   /**
@@ -281,22 +364,22 @@ export class Store {
     }
   }
 
-  /** Idempotent: safe on fresh and on any older database. Driven by MIGRATIONS. */
+  /** Idempotent: each version step and its ledger update commit atomically. */
   private migrate() {
+    const recorded = Number((this.db.prepare('PRAGMA user_version').get() as Row).user_version ?? 0);
+    let version = recorded || inferredLegacyVersion(this.db);
     for (const m of MIGRATIONS) {
-      if (m.create) this.db.exec(m.create);
-      const cols = new Set((this.db.prepare(`PRAGMA table_info(${m.table})`).all() as Row[]).map((r) => String(r.name)));
-      for (const [name, type] of Object.entries(m.columns)) {
-        if (cols.has(name)) continue;
-        const backfill = m.backfill?.[name];
-        this.transaction(() => {
-          this.db.exec(`ALTER TABLE ${m.table} ADD COLUMN ${name} ${type}`);
-          if (backfill) this.db.exec(backfill);
-        });
-      }
-      for (const i of m.dropIndexes ?? []) this.db.exec(`DROP INDEX IF EXISTS ${i}`);
-      for (const sql of Object.values(m.indexes)) this.db.exec(sql);
+      if (m.version <= version) continue;
+      this.transaction(() => {
+        m.up(this.db);
+        this.db.exec(`PRAGMA user_version = ${m.version}`);
+      });
+      version = m.version;
     }
+    // Compatibility for a current DB receiving additive fragments from a parallel feature branch.
+    this.db.exec(SCHEMA);
+    for (const m of ADDITIVE_MIGRATIONS) addFragment(this.db, m);
+    for (const sql of Object.values(HOT_INDEXES)) this.db.exec(sql);
   }
 
   close() { this.db.close(); }
@@ -331,7 +414,8 @@ export class Store {
       'SELECT to_agent, COUNT(*) AS count FROM messages WHERE delivered_at IS NULL GROUP BY to_agent',
     ).all() as Row[]).map((r) => [String(r.to_agent), Number(r.count)]));
     return {
-      schema: { ok: Object.keys(missingColumns).length === 0, columns: actualColumns, missingColumns },
+      schema: { version: schemaVersion(this.db), latestVersion: SCHEMA_VERSION,
+        ok: Object.keys(missingColumns).length === 0, columns: actualColumns, missingColumns },
       counts: { runs: countBy('runs'), agents: countBy('agents') },
       stuckBusy: [...this.busySince.entries()].filter(([, since]) => now - since > 30 * 60_000)
         .map(([agentId, since]) => ({ agentId, since: new Date(since).toISOString() })),

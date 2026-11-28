@@ -2017,7 +2017,7 @@ describe('turn usage (review rework)', () => {
     expect(pendingMigrations(raw)).toEqual([]);
     raw.exec('DROP TABLE turns');
     raw.exec('DROP INDEX messages_delivery');
-    expect(pendingMigrations(raw)).toEqual(['index messages_delivery', 'table turns']);
+    expect(pendingMigrations(raw)).toEqual(['index messages_delivery', 'table turns', 'index turns_run_agent_id']);
     raw.close();
     new Store(file).close();
     const again = new DatabaseSync(file, { readOnly: true });
