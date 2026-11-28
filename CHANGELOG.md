@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Child sessions: on hosts whose `GET /api/agent/capabilities` reports `childSessions: true` (CloudCLI fork), a
+  worker's first turn sends `parentSessionId` (the lead's app session id, else its provider id), so worker sessions
+  nest under the lead in the sidebar. Never sent on continuation turns, for the lead, or when the capability is missing
+  or unknown.
+
 ## [0.3.0] - 2026-11-26
 
 ### Added

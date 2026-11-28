@@ -19,6 +19,18 @@ export interface SendInput {
   /** App or provider session id; omit to start a new session. */
   sessionId?: string | null;
   message: string;
+  /**
+   * Nests a NEW session under this parent (app or provider session id) in CloudCLI's sidebar. Only for a run that
+   * creates its session (no `sessionId`), and only when `capabilities().childSessions` is true: hosts without child
+   * sessions are not relied on to ignore the field, and a host that has them rejects a changed parent on continuation.
+   */
+  parentSessionId?: string | null;
+}
+
+/** Optional Agent API features (GET /api/agent/capabilities). null = unknown: no key, or the query failed / timed out. */
+export interface Capabilities {
+  sessionStatus: boolean | null;
+  childSessions: boolean | null;
 }
 
 export type SendResult =
@@ -50,6 +62,8 @@ export interface CloudCli {
    * null = unknown: the host lacks the endpoint, or the query failed.
    */
   sessionStatus(sessionId: string): Promise<{ processing: boolean | null }>;
+  /** The host's optional Agent API features; a definite answer is cached, an unknown one is asked again next time. */
+  capabilities(): Promise<Capabilities>;
 }
 
 const HOME = os.homedir();
@@ -146,6 +160,8 @@ export class HttpCloudCli implements CloudCli {
           // Let MCP elicitation forms (inline approvals) show in the session's tab instead of being auto-declined.
           unattended: false,
           ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+          // Never on a continuation: the host would reject a parent that differs from the stored one (400).
+          ...(!input.sessionId && input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
         }),
       });
     } catch (e) {
@@ -159,24 +175,37 @@ export class HttpCloudCli implements CloudCli {
     return readRun(res.body, onAppSessionId, onEvent);
   }
 
-  private sessionStatusSupported: boolean | null = null;
+  private caps: { sessionStatus: boolean; childSessions: boolean } | null = null;
+
+  private statusSignal() { return AbortSignal.timeout(this.opts.statusTimeoutMs ?? 5_000); }
+
+  async capabilities(): Promise<Capabilities> {
+    if (this.caps) return { ...this.caps };
+    const key = this.apiKey();
+    if (!key) return { sessionStatus: null, childSessions: null };
+    try {
+      // A hung CloudCLI must not hang the caller: a timeout means "cannot tell".
+      const res = await (this.opts.fetchImpl ?? fetch)(`${this.baseUrl()}/api/agent/capabilities`, {
+        headers: { 'x-api-key': key }, signal: this.statusSignal(),
+      });
+      // Only a definite answer is cached; a failure (or a host without the endpoint) is asked again next time.
+      if (!res.ok) return { sessionStatus: null, childSessions: null };
+      const j = (await res.json()) as Record<string, unknown>;
+      this.caps = { sessionStatus: j.sessionStatus === true, childSessions: j.childSessions === true };
+      return { ...this.caps };
+    } catch {
+      return { sessionStatus: null, childSessions: null };
+    }
+  }
 
   async sessionStatus(sessionId: string): Promise<{ processing: boolean | null }> {
     const key = this.apiKey();
     if (!key) return { processing: null };
     const doFetch = this.opts.fetchImpl ?? fetch;
     const headers = { 'x-api-key': key };
-    // A hung CloudCLI must not hang the caller (endRun/endAgent/recovery): a timeout means "cannot tell".
-    const signal = () => AbortSignal.timeout(this.opts.statusTimeoutMs ?? 5_000);
     try {
-      if (this.sessionStatusSupported === null) {
-        const caps = await doFetch(`${this.baseUrl()}/api/agent/capabilities`, { headers, signal: signal() });
-        // Only a definite answer is cached; a transient failure is retried next time.
-        if (!caps.ok) return { processing: null };
-        this.sessionStatusSupported = ((await caps.json()) as Record<string, unknown>).sessionStatus === true;
-      }
-      if (!this.sessionStatusSupported) return { processing: null };
-      const res = await doFetch(`${this.baseUrl()}/api/agent/sessions/${encodeURIComponent(sessionId)}`, { headers, signal: signal() });
+      if ((await this.capabilities()).sessionStatus !== true) return { processing: null };
+      const res = await doFetch(`${this.baseUrl()}/api/agent/sessions/${encodeURIComponent(sessionId)}`, { headers, signal: this.statusSignal() });
       // CloudCLI does not know the session, so it cannot be running a turn in it.
       if (res.status === 404) return { processing: false };
       if (!res.ok) return { processing: null };
