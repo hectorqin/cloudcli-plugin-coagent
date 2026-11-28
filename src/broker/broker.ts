@@ -1408,6 +1408,18 @@ export class Broker {
   }
 
   /**
+   * The session a worker's NEW session nests under in CloudCLI's sidebar: the lead's (app id, else provider id). null
+   * for the lead itself, and unless the host says it supports child sessions (unknown = no).
+   */
+  private async parentSessionFor(agent: AgentDTO): Promise<string | null> {
+    if (agent.role === 'lead') return null;
+    const lead = this.d.store.agent(this.d.store.run(agent.runId)!.leadAgentId);
+    const parent = lead && lead.id !== agent.id ? lead.appSessionId ?? lead.providerSessionId : null;
+    if (!parent) return null;
+    return (await this.d.cloudcli.capabilities()).childSessions === true ? parent : null;
+  }
+
+  /**
    * Sends one turn carrying the claimed (dispatching) messages `msgIds` to an agent's session through CloudCLI.
    * They become delivered when the turn was accepted and finished, and go back to the queue otherwise.
    */
@@ -1430,8 +1442,9 @@ export class Broker {
       if (lastUsage) store.setTurnUsage(turnId, lastUsage);
     };
     try {
+      const sessionId = agent.appSessionId ?? agent.providerSessionId;
       res = await cloudcli.send(
-        { projectPath: agent.cwd, provider: agent.provider, sessionId: agent.appSessionId ?? agent.providerSessionId, message },
+        { projectPath: agent.cwd, provider: agent.provider, sessionId, message, parentSessionId: sessionId ? null : await this.parentSessionFor(agent) },
         (appId) => {
           // CloudCLI only announces the session once it accepted the run, so a 409 never opens a turn.
           started = true;

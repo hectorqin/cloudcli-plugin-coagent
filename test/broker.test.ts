@@ -34,12 +34,20 @@ class FakeCloudCli implements CloudCli {
   holdError: string[] = [];
   /** Stream events per accepted turn, emitted after the session id (one list per send, in order). */
   events: Record<string, unknown>[][] = [];
+  /** capabilities().childSessions: true = the host nests child sessions; null = unknown (query failed). */
+  childSessions: boolean | null = false;
+  /** Parent stored per app session (like the fork's parent_session_id). */
+  parents = new Map<string, string>();
   private n = 0;
   apiKeyConfigured() { return true; }
   verifyApiKey() { return true; }
   async saveApiKey() { /* not used */ }
   async send(input: SendInput, onApp?: (id: string) => void, onEvent?: (e: Record<string, unknown>) => void): Promise<SendResult> {
     this.calls.push(input);
+    // Like the fork's /api/agent: a parent on continuation must equal the stored one, or the request is a 400.
+    if (input.sessionId && input.parentSessionId && input.parentSessionId !== this.parents.get(input.sessionId)) {
+      return { status: 'error', error: 'HTTP 400: parentSessionId cannot change', terminal: true };
+    }
     let st = this.next.shift() ?? 'ok';
     if (st === 'busy') return { status: 'busy' };
     const script = this.events.shift() ?? [];
@@ -63,6 +71,7 @@ class FakeCloudCli implements CloudCli {
     let app = input.sessionId ?? null;
     if (!app) {
       app = `app-${++this.n}`;
+      if (input.parentSessionId) this.parents.set(app, input.parentSessionId);
       this.sessions.set(`prov-${this.n}`, { appSessionId: app, providerSessionId: `prov-${this.n}`, provider: input.provider, projectPath: input.projectPath });
     }
     onApp?.(app);
@@ -74,6 +83,7 @@ class FakeCloudCli implements CloudCli {
   async sessionStatus(id: string) {
     return { processing: this.status ? this.status(id) : this.live.has(id) };
   }
+  async capabilities() { return { sessionStatus: this.status ? null : true, childSessions: this.childSessions }; }
   sessionByProviderId(id: string) { return this.sessions.get(id) ?? null; }
   sessionByAppId(app: string) { return [...this.sessions.values()].find((s) => s.appSessionId === app) ?? null; }
 }
@@ -2220,6 +2230,97 @@ describe('quota pauses and auto-resume (Q41)', () => {
     const again = new DatabaseSync(file, { readOnly: true });
     expect(pendingMigrations(again)).toEqual([]);
     again.close();
+  });
+});
+
+describe('child sessions (Q45)', () => {
+  const toWorker = (id: string) => cc.calls.filter((c) => c.projectPath === store.agent(id)!.cwd && c.sessionId !== 'lead-app');
+  const has = (c: SendInput) => Object.prototype.hasOwnProperty.call(c, 'parentSessionId') && c.parentSessionId != null;
+
+  it("a worker's first turn nests its new session under the lead when the host supports it", async () => {
+    cc.childSessions = true;
+    await startApprovedRun();
+    const w = await spawn('coder');
+    const [first] = toWorker(w.id);
+    expect(first.sessionId ?? null).toBeNull();
+    expect(first.parentSessionId).toBe('lead-app');
+    expect(cc.parents.get(store.agent(w.id)!.appSessionId!)).toBe('lead-app');
+  });
+
+  it('falls back to the lead provider session id when its app id is unknown', async () => {
+    cc.childSessions = true;
+    const run = await startApprovedRun();
+    store.updateAgent(run.leadAgentId, { appSessionId: null });
+    const w = await spawn('coder');
+    expect(toWorker(w.id)[0].parentSessionId).toBe('lead-prov');
+  });
+
+  it.each([['missing', false], ['unknown', null]] as const)('is absent when the capability is %s', async (_label, cap) => {
+    cc.childSessions = cap;
+    await startApprovedRun();
+    const w = await spawn('coder');
+    expect(toWorker(w.id).some(has)).toBe(false);
+  });
+
+  it('continuation turns and the lead own turns never carry it, so the host cannot answer 400', async () => {
+    cc.childSessions = true;
+    await startApprovedRun();
+    const w = await spawn('coder');
+    await call('send_message', { to: w.id, body: 'also add a test' });
+    await call('send_message', { to: w.id, body: 'and docs' });
+    const calls = toWorker(w.id);
+    expect(calls.length).toBeGreaterThanOrEqual(3);
+    expect(calls.slice(1).every((c) => c.sessionId && !has(c))).toBe(true);
+    expect(cc.calls.filter((c) => c.sessionId === 'lead-app').some(has)).toBe(false);
+    expect(store.agent(w.id)!.status).not.toBe('error');
+  });
+
+  it("handoff_agent's new worker nests under the lead", async () => {
+    cc.childSessions = true;
+    await startApprovedRun();
+    const old = await spawn('reviewer', 'review the diff', 'codex');
+    store.updateAgent(old.id, { status: 'error', lastError: 'Codex usage limit' });
+    const r = await call('handoff_agent', { worker: old.id, provider: 'claude' });
+    expect(r.ok, r.text).toBe(true);
+    const id = r.text.match(/off to (\S+)/)![1];
+    const first = cc.calls.filter((c) => c.sessionId == null).at(-1)!; // the new worker's session-creating turn
+    expect(first.message).toContain('review the diff');
+    expect(first.parentSessionId).toBe('lead-app');
+    expect(cc.parents.get(store.agent(id)!.appSessionId!)).toBe('lead-app');
+  });
+
+  it('HttpCloudCli sends parentSessionId only for a new session and caches childSessions from capabilities', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coagent-child-'));
+    const prev = process.env.COAGENT_API_KEY;
+    process.env.COAGENT_API_KEY = 'ck_test';
+    try {
+      const bodies: Record<string, unknown>[] = [];
+      let capsCalls = 0;
+      let capsOk = false;
+      const fetchImpl = (async (url: string, init?: RequestInit) => {
+        if (url.endsWith('/api/agent/capabilities')) {
+          capsCalls++;
+          return capsOk ? Response.json({ sessionStatus: true, childSessions: true }) : new Response('nope', { status: 500 });
+        }
+        bodies.push(JSON.parse(String(init!.body)));
+        return new Response(new ReadableStream({ start(ctl) { ctl.enqueue(new TextEncoder().encode('data: {"type":"session-id","sessionId":"a"}\n\n')); ctl.close(); } }));
+      }) as unknown as typeof fetch;
+      const http = new HttpCloudCli({ pluginsConfigPath: path.join(dir, 'none.json'), localServerPath: path.join(dir, 'none.json'), fetchImpl });
+      expect(await http.capabilities()).toEqual({ sessionStatus: null, childSessions: null }); // not cached
+      capsOk = true;
+      expect(await http.capabilities()).toEqual({ sessionStatus: true, childSessions: true });
+      expect(await http.capabilities()).toEqual({ sessionStatus: true, childSessions: true });
+      expect(capsCalls).toBe(2);
+      await http.send({ projectPath: '/p', provider: 'claude', message: 'm', parentSessionId: 'lead-app' });
+      await http.send({ projectPath: '/p', provider: 'claude', message: 'm', sessionId: 'a', parentSessionId: 'lead-app' });
+      expect(bodies[0]).toMatchObject({ projectPath: '/p', provider: 'claude', parentSessionId: 'lead-app' });
+      expect(bodies[0]).not.toHaveProperty('sessionId');
+      expect(bodies[1]).toMatchObject({ sessionId: 'a' });
+      expect(bodies[1]).not.toHaveProperty('parentSessionId');
+    } finally {
+      if (prev === undefined) delete process.env.COAGENT_API_KEY; else process.env.COAGENT_API_KEY = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

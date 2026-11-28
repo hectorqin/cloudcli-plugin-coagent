@@ -82,7 +82,7 @@ so the script copies the build into `~/.claude-code-ui/plugins/cloudcli-coagent`
 |---|---|
 | 1.37.9 – 1.37.10 | Core workflow and the CoAgent tab. Tool calls show as plain rows; handoff and worktree removal stay conservative because the session status is unknown. |
 | **1.37.11 and newer** | Adds live chat tool cards (`toolRenderers`, upstream #1862) and session-status-aware recovery, handoff and cleanup (`GET /api/agent/sessions/:id`, upstream #1863). |
-| Fork `coagent/v1.37.10-coagent.5` at https://github.com/hectorqin/claudecodeui | Also sidebar grouping of worktree projects (pending upstream #1861) and one-click archive/delete of worker projects and sessions (upstream #1880). |
+| Fork `coagent/v1.37.10-coagent.5` at https://github.com/hectorqin/claudecodeui | Also sidebar grouping of worktree projects (pending upstream #1861) and one-click archive/delete of worker projects and sessions (upstream #1880), and worker sessions nested under the lead in the sidebar (child sessions, `childSessions` capability). |
 
 Unsupported hosts fall back to their normal tool-call display; none of the enhancements is required for the core
 workflow.
