@@ -78,10 +78,14 @@ so the script copies the build into `~/.claude-code-ui/plugins/cloudcli-coagent`
 
 ## Compatibility
 
-Vanilla CloudCLI 1.37.9 and newer provides the CoAgent core workflow and tab. The optional CloudCLI fork at
-https://github.com/hectorqin/claudecodeui, branch `coagent/v1.37.10-coagent.5`, additionally provides live chat tool
-cards through `toolRenderers`, sidebar grouping for worker worktrees, and session-status-aware recovery. Those enhanced
-views are not required for the core tab workflow; unsupported hosts fall back to their normal tool-call display.
+| CloudCLI | What you get |
+|---|---|
+| 1.37.9 – 1.37.10 | Core workflow and the CoAgent tab. Tool calls show as plain rows; handoff and worktree removal stay conservative because the session status is unknown. |
+| **1.37.11 and newer** | Adds live chat tool cards (`toolRenderers`, upstream #1862) and session-status-aware recovery, handoff and cleanup (`GET /api/agent/sessions/:id`, upstream #1863). |
+| Fork `coagent/v1.37.10-coagent.5` at https://github.com/hectorqin/claudecodeui | Also sidebar grouping of worktree projects (pending upstream #1861) and one-click archive/delete of worker projects and sessions (being resubmitted upstream). |
+
+Unsupported hosts fall back to their normal tool-call display; none of the enhancements is required for the core
+workflow.
 
 ## Use
 
@@ -116,8 +120,8 @@ If a provider cannot continue, the lead calls `handoff_agent(worker, provider, n
 new worktree that starts at the old worker's branch HEAD. Its uncommitted changes (tracked, staged, deleted and
 untracked, but not ignored files) are carried over from a snapshot taken without touching the old worktree, and the
 broker checks that the result is the identical tree before going on. If any step fails, nothing changes. The handoff is
-refused while the worker's session runs a turn, and also when CloudCLI cannot confirm the session is idle (vanilla
-hosts lack the session-status endpoint of the CloudCLI fork). It is checked again just before the switch. It is also
+refused while the worker's session runs a turn, and also when CloudCLI cannot confirm the session is idle (CloudCLI before
+1.37.11 lacks the session-status endpoint). It is checked again just before the switch. It is also
 refused when a submodule holds uncommitted, untracked or unrecorded work, which cannot be carried over. A read-only
 worker is simply restarted on the other provider. The new worker's first message holds the original task, the old
 worker's recent activity, its last result or error, its undelivered messages and the lead's note. The old worker ends
