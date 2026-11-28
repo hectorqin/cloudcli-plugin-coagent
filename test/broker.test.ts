@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { Broker, ENDING_RETRY_MS, MAX_WORKERS } from '../src/broker/broker.js';
+import { Broker, ENDING_RETRY_MS, MAX_WORKERS, isTestPath } from '../src/broker/broker.js';
 import { HttpCloudCli, type CloudCli, type SendInput, type SendResult, type SessionInfo } from '../src/broker/cloudcli.js';
 import { Git } from '../src/broker/git.js';
 import { filePrompts } from '../src/broker/prompts.js';
@@ -2355,6 +2355,28 @@ describe('first-class review protocol', () => {
     sh(tester.worktreePath!, 'commit', '-q', '-m', 'production');
     await call('report_result', { summary: 'changed production' }, workerCaller(tester.providerSessionId!, tester.provider));
     expect((await call('request_merge', { worker: tester.id })).text).toMatch(/no review/);
+  });
+
+  it('requires review when a tester renames production code into a test directory', async () => {
+    await startApprovedRun();
+    const tester = await spawn('tester', 'rename');
+    fs.mkdirSync(path.join(tester.worktreePath!, 'test'));
+    sh(tester.worktreePath!, 'mv', 'README.md', 'test/README.md');
+    sh(tester.worktreePath!, 'commit', '-q', '-m', 'move');
+    await call('report_result', { summary: 'moved' }, workerCaller(tester.providerSessionId!, tester.provider));
+    expect((await call('request_merge', { worker: tester.id })).text).toMatch(/no review/);
+  });
+
+  it('anchors test directories at the repo root but matches *.test.* / *.spec.* anywhere', () => {
+    expect(isTestPath('test/a.ts')).toBe(true);
+    expect(isTestPath('tests/a/b.ts')).toBe(true);
+    expect(isTestPath('__tests__/a.ts')).toBe(true);
+    expect(isTestPath('src/deep/a.test.ts')).toBe(true);
+    expect(isTestPath('src/a.spec.js')).toBe(true);
+    expect(isTestPath('src/test/a.ts')).toBe(false);
+    expect(isTestPath('pkg/__tests__/a.ts')).toBe(false);
+    expect(isTestPath('src/prod.ts')).toBe(false);
+    expect(isTestPath('src/test.ts')).toBe(false);
   });
 
   it('keeps a non-busy report when automatic review cannot start', async () => {

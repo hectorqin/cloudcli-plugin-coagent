@@ -174,18 +174,27 @@ export class Broker {
     const roles = value as string[];
     this.d.store.setJson('reviewExemptRoles', [...new Set(roles.map((x: string) => x.trim().toLowerCase()))]);
   }
+  /**
+   * Tester exemption: every changed path, including a rename's source, must be a test file. Directories are anchored
+   * at the repo root (`test/`, `tests/`, `__tests__/`); `*.test.*` / `*.spec.*` match at any depth. Renames count both
+   * sides so `git mv src/x.ts test/x.ts` cannot move production code past review.
+   */
   private reviewExemptForFiles(role: string, files: MergeSnapshot['files']): boolean {
     const normalized = role.toLowerCase();
     if (!this.reviewExemptRoles().includes(normalized)) return false;
     if (normalized !== 'tester') return true;
-    const testPath = (p: string) => /(^|\/)(?:test|tests|__tests__)\//.test(p) || /\.(?:test|spec)\.[^/]+$/.test(p);
-    return files.length > 0 && files.every((f) => testPath(f.path));
+    return files.length > 0 && files.every((f) => isTestPath(f.path) && (!f.oldPath || isTestPath(f.oldPath)));
   }
+  /**
+   * Auto-review's exemption check. It reads the committed branch only, so uncommitted work makes the tester
+   * non-exempt (conservative); request_merge recomputes the exemption from the locked snapshot taken after commitAll.
+   */
   private async reviewExemptForAgent(lead: AgentDTO, worker: AgentDTO): Promise<boolean> {
     if (!this.reviewExemptRoles().includes(worker.role.toLowerCase())) return false;
     if (worker.role.toLowerCase() !== 'tester') return true;
     if (!worker.worktreePath || !worker.branch) return false;
     try {
+      if ((await this.d.git.status(worker.worktreePath)).trim()) return false;
       const snapshot = await this.d.git.mergeSnapshot(lead.cwd, worker.worktreePath, worker.branch);
       return this.reviewExemptForFiles(worker.role, snapshot.files);
     } catch { return false; }
@@ -1956,6 +1965,11 @@ function parseFindings(value: unknown): ReviewFinding[] {
 function reviewSummary(round: number, verdict: 'pass' | 'block', findings: ReviewFinding[]): string {
   return `Review round ${round}: ${verdict.toUpperCase()} (${findings.length} finding${findings.length === 1 ? '' : 's'})`
     + (findings.length ? `\n${findings.map((f) => `- [${f.severity}] ${f.file}${f.line ? `:${f.line}` : ''}: ${f.problem} — Fix: ${f.fix}`).join('\n')}` : '');
+}
+
+/** Test-only paths for the tester review exemption: root-anchored test dirs, or a *.test.* / *.spec.* file anywhere. */
+export function isTestPath(p: string): boolean {
+  return /^(?:test|tests|__tests__)\//.test(p) || /(?:^|\/)[^/]+\.(?:test|spec)\.[^/]+$/.test(p);
 }
 
 function reworkMessage(round: number, findings: ReviewFinding[]): string {
