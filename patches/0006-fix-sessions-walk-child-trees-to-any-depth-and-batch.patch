@@ -1,0 +1,520 @@
+From b1babc32a5dee8fcca47fce561154aef1f6b4942 Mon Sep 17 00:00:00 2001
+From: hectorqin <14220132+hectorqin@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 03:39:07 +0000
+Subject: [PATCH 6/7] fix(sessions): walk child trees to any depth and batch
+ them per project list
+
+Child trees stopped at 8 levels while every attached child was still
+left out of its own project, so a 9th generation showed up nowhere.
+Read the whole tree with one recursive CTE (UNION ends parent loops in
+damaged data; each session is placed under one parent only), using the
+same visibility rule as the attachment predicate, so a session is always
+either under its parent or in its own project.
+
+The project list also read child trees and attached-child counts once
+per project. Read the trees for every project's page in one query and
+the counts with one GROUP BY project_path, and map them back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../database/repositories/sessions.db.ts      | 180 ++++++++++--------
+ .../sessions-parent.db.integration.test.ts    |  49 +++++
+ .../projects-with-sessions-fetch.service.ts   |  75 ++++++--
+ .../tests/project-child-sessions.test.ts      |  28 +++
+ 4 files changed, 233 insertions(+), 99 deletions(-)
+
+diff --git a/server/modules/database/repositories/sessions.db.ts b/server/modules/database/repositories/sessions.db.ts
+index 2e7afa99..d142cd68 100644
+--- a/server/modules/database/repositories/sessions.db.ts
++++ b/server/modules/database/repositories/sessions.db.ts
+@@ -63,8 +63,16 @@ const attachedChildSql = (alias: string) => `(
+   )
+ )`;
+ 
+-/** Children nest at most this deep; deeper rows are cut off rather than walked forever on damaged data. */
+-const MAX_CHILD_SESSION_DEPTH = 8;
++/**
++ * The child rows a parent's tree may hold: active sessions in active projects
++ * (aliased `alias`, project joined as `${alias}_project`). The same rule as
++ * `attachedChildSql` applied from the parent's side, so a session is either
++ * reachable from its parent's tree or listed in its own project, never neither.
++ */
++const visibleChildSql = (alias: string) => `
++  ${alias}.session_id <> ${alias}.parent_session_id
++  AND ${alias}.isArchived = 0
++  AND COALESCE(${alias}_project.isArchived, 0) = 0`;
+ 
+ type ChildSessionRow = {
+   session_id: string;
+@@ -678,81 +686,87 @@ export const sessionsDb = {
+   },
+ 
+   /**
+-   * The active children of each given session, recursively, keyed by parent
+-   * id; parents without children are absent from the map. Children are
+-   * ordered by creation (the order their parent started them) and may live in
+-   * any project and run on any provider. Archived children and children in
+-   * archived projects are left out. One query per nesting level, so a page of
+-   * parents costs the same as one.
++   * The active children of each given session, recursively and to any depth,
++   * keyed by parent id; parents without children are absent from the map.
++   * Children are ordered by creation (the order their parent started them)
++   * and may live in any project and run on any provider. Archived children
++   * and children in archived projects are left out, together with their
++   * subtrees, which `attachedChildSql` lists in their own projects instead.
++   *
++   * One recursive query for any number of parents. `UNION` stops it on a
++   * parent loop in damaged data, and each session is placed under one parent
++   * only, so the returned tree is always finite.
+    */
+   getChildSessionsByParentIds(parentSessionIds: readonly string[]): Map<string, ChildSessionSummary[]> {
+-    const db = getConnection();
+     const result = new Map<string, ChildSessionSummary[]>();
+     const roots = [...new Set(parentSessionIds)];
+-    // Which requested parent each placed child descends from. A requested
+-    // parent can itself be another one's child; it is only skipped below
+-    // its own descendants, where damaged data would form a loop.
+-    const rootOf = new Map(roots.map((id) => [id, id]));
+-    const placed = new Set<string>();
+-    const childrenOf = new Map<string, ChildSessionSummary[]>();
+-    let frontier = roots;
+-
+-    for (let depth = 0; depth < MAX_CHILD_SESSION_DEPTH && frontier.length > 0; depth += 1) {
+-      const rows: ChildSessionRow[] = [];
+-      // Stay well below SQLite's bound-parameter limit on very large pages.
+-      for (let start = 0; start < frontier.length; start += 500) {
+-        const batch = frontier.slice(start, start + 500);
+-        rows.push(...db.prepare(
+-          `SELECT sessions.session_id, sessions.provider, sessions.custom_name, sessions.project_path,
+-                  projects.project_id, sessions.parent_session_id, sessions.forked_from_session_id,
+-                  sessions.created_at, sessions.updated_at
+-           FROM sessions
+-           LEFT JOIN projects ON projects.project_path = sessions.project_path
+-           WHERE sessions.parent_session_id IN (${batch.map(() => '?').join(', ')})
+-             AND sessions.session_id <> sessions.parent_session_id
+-             AND sessions.isArchived = 0
+-             AND COALESCE(projects.isArchived, 0) = 0
+-           ORDER BY julianday(sessions.created_at) ASC, sessions.session_id ASC`
+-        ).all(...batch) as ChildSessionRow[]);
+-      }
++    if (roots.length === 0) return result;
+ 
+-      const next: string[] = [];
+-      for (const row of rows) {
+-        // A cycle in damaged data, or a row already placed under another parent.
+-        const root = rootOf.get(row.parent_session_id);
+-        if (placed.has(row.session_id) || !root || row.session_id === root) continue;
+-        placed.add(row.session_id);
+-        if (!rootOf.has(row.session_id)) rootOf.set(row.session_id, root);
+-        const createdAt = normalizeTimestamp(row.created_at) ?? row.created_at;
+-        const child: ChildSessionSummary = {
+-          id: row.session_id,
+-          provider: row.provider as ChildSessionSummary['provider'],
+-          summary: row.custom_name || '',
+-          lastActivity: normalizeTimestamp(row.updated_at) ?? createdAt,
+-          createdAt,
+-          projectId: row.project_id ?? null,
+-          projectPath: row.project_path ?? null,
+-          parentSessionId: row.parent_session_id,
+-          forkedFromSessionId: row.forked_from_session_id ?? null,
+-          childSessions: [],
+-        };
+-        const siblings = childrenOf.get(row.parent_session_id) ?? [];
+-        siblings.push(child);
+-        childrenOf.set(row.parent_session_id, siblings);
+-        next.push(row.session_id);
+-      }
+-      frontier = next;
++    const rows = getConnection().prepare(
++      `WITH RECURSIVE descendants(session_id) AS (
++         SELECT child.session_id
++         FROM sessions AS child
++         LEFT JOIN projects AS child_project ON child_project.project_path = child.project_path
++         WHERE child.parent_session_id IN (SELECT value FROM json_each(?))
++           AND ${visibleChildSql('child')}
++         UNION
++         SELECT child.session_id
++         FROM sessions AS child
++         JOIN descendants ON child.parent_session_id = descendants.session_id
++         LEFT JOIN projects AS child_project ON child_project.project_path = child.project_path
++         WHERE ${visibleChildSql('child')}
++       )
++       SELECT sessions.session_id, sessions.provider, sessions.custom_name, sessions.project_path,
++              projects.project_id, sessions.parent_session_id, sessions.forked_from_session_id,
++              sessions.created_at, sessions.updated_at
++       FROM descendants
++       JOIN sessions ON sessions.session_id = descendants.session_id
++       LEFT JOIN projects ON projects.project_path = sessions.project_path
++       ORDER BY julianday(sessions.created_at) ASC, sessions.session_id ASC`
++    ).all(JSON.stringify(roots)) as ChildSessionRow[];
++
++    const rowsByParent = new Map<string, ChildSessionRow[]>();
++    for (const row of rows) {
++      const siblings = rowsByParent.get(row.parent_session_id) ?? [];
++      siblings.push(row);
++      rowsByParent.set(row.parent_session_id, siblings);
+     }
+ 
+-    // Wire each level onto its parent now that every level is read.
+-    for (const children of childrenOf.values()) {
+-      for (const child of children) {
+-        child.childSessions = childrenOf.get(child.id) ?? [];
++    // Each requested parent's own child list. A requested parent that is also
++    // another one's descendant shares this list rather than being walked twice.
++    const rootLists = new Map(roots.map((id) => [id, [] as ChildSessionSummary[]]));
++    const placed = new Set<string>();
++    for (const root of roots) {
++      const stack: Array<{ parentId: string; into: ChildSessionSummary[] }> = [{ parentId: root, into: rootLists.get(root)! }];
++      while (stack.length) {
++        const { parentId, into } = stack.pop()!;
++        for (const row of rowsByParent.get(parentId) ?? []) {
++          // Placed once only; a loop back to the root being walked is cut.
++          if (placed.has(row.session_id) || row.session_id === root) continue;
++          placed.add(row.session_id);
++          const createdAt = normalizeTimestamp(row.created_at) ?? row.created_at;
++          const ownList = rootLists.get(row.session_id);
++          const child: ChildSessionSummary = {
++            id: row.session_id,
++            provider: row.provider as ChildSessionSummary['provider'],
++            summary: row.custom_name || '',
++            lastActivity: normalizeTimestamp(row.updated_at) ?? createdAt,
++            createdAt,
++            projectId: row.project_id ?? null,
++            projectPath: row.project_path ?? null,
++            parentSessionId: row.parent_session_id,
++            forkedFromSessionId: row.forked_from_session_id ?? null,
++            childSessions: ownList ?? [],
++          };
++          into.push(child);
++          // A requested parent fills its shared list when its own turn comes.
++          if (!ownList) stack.push({ parentId: row.session_id, into: child.childSessions });
++        }
+       }
+     }
+-    for (const parentId of new Set(parentSessionIds)) {
+-      const children = childrenOf.get(parentId);
+-      if (children?.length) result.set(parentId, children);
++
++    for (const [root, children] of rootLists) {
++      if (children.length) result.set(root, children);
+     }
+     return result;
+   },
+@@ -959,23 +973,31 @@ export const sessionsDb = {
+   },
+ 
+   /**
+-   * Counts a project's active sessions that are listed under a parent session
+-   * rather than in the project's own list. The sidebar hides a project whose
+-   * only sessions are such children.
++   * Counts, per project path, the active sessions listed under a parent
++   * session rather than in the project's own list, in one grouped query for
++   * the whole project list. Paths without any are absent. The sidebar hides a
++   * project whose only sessions are such children.
+    */
+-  countAttachedChildSessionsByProjectPath(projectPath: string): number {
+-    const db = getConnection();
+-    const row = db
++  countAttachedChildSessionsByProjectPaths(projectPaths: readonly string[]): Map<string, number> {
++    const counts = new Map<string, number>();
++    if (projectPaths.length === 0) return counts;
++    const rows = getConnection()
+       .prepare(
+-        `SELECT COUNT(*) AS count
++        `SELECT project_path, COUNT(*) AS count
+          FROM sessions
+-         WHERE project_path = ?
++         WHERE project_path IN (SELECT value FROM json_each(?))
+            AND isArchived = 0
+-           AND ${attachedChildSql('sessions')}`
++           AND ${attachedChildSql('sessions')}
++         GROUP BY project_path`
+       )
+-      .get(normalizeProjectPath(projectPath)) as { count: number } | undefined;
++      .all(JSON.stringify([...new Set(projectPaths.map((projectPath) => normalizeProjectPath(projectPath)))])) as Array<{ project_path: string; count: number }>;
++    for (const row of rows) counts.set(row.project_path, Number(row.count));
++    return counts;
++  },
+ 
+-    return Number(row?.count ?? 0);
++  /** One project's count of `countAttachedChildSessionsByProjectPaths`. */
++  countAttachedChildSessionsByProjectPath(projectPath: string): number {
++    return sessionsDb.countAttachedChildSessionsByProjectPaths([projectPath]).get(normalizeProjectPath(projectPath)) ?? 0;
+   },
+ 
+   deleteSessionsByProjectPath(projectPath: string): void {
+diff --git a/server/modules/database/tests/sessions-parent.db.integration.test.ts b/server/modules/database/tests/sessions-parent.db.integration.test.ts
+index 0ba81a06..1f3c8187 100644
+--- a/server/modules/database/tests/sessions-parent.db.integration.test.ts
++++ b/server/modules/database/tests/sessions-parent.db.integration.test.ts
+@@ -135,3 +135,52 @@ test('child trees nest recursively in creation order, skip archived children and
+     assert.deepEqual(looped[0].childSessions[0].childSessions, []);
+   });
+ });
++
++test('a chain deeper than any fixed limit is walked to its end, so no generation drops out of every list', async () => {
++  await withDatabase(() => {
++    const db = getConnection();
++    sessionsDb.createAppSession('gen-0', 'claude', '/workspace/app', 'Root');
++    const depth = 12;
++    for (let generation = 1; generation <= depth; generation += 1) {
++      // Alternate projects and providers, as orchestrators nesting workers do.
++      sessionsDb.createAppSession(`gen-${generation}`, generation % 2 ? 'codex' : 'claude', `/workspace/wt-${generation}`, `Gen ${generation}`, `gen-${generation - 1}`);
++    }
++    db.prepare("UPDATE sessions SET created_at = '2026-11-01T00:00:00.000Z'").run();
++
++    let node = sessionsDb.getChildSessionsByParentIds(['gen-0']).get('gen-0')?.[0];
++    const reached: string[] = [];
++    while (node) {
++      reached.push(node.id);
++      assert.equal(node.projectPath, `/workspace/wt-${reached.length}`);
++      node = node.childSessions[0];
++    }
++    assert.equal(reached.length, depth, 'every generation is under its parent');
++    // ...and each is out of its own project, so each appears exactly once.
++    for (let generation = 1; generation <= depth; generation += 1) {
++      assert.equal(sessionsDb.countSessionsByProjectPath(`/workspace/wt-${generation}`), 0);
++      assert.equal(sessionsDb.countAttachedChildSessionsByProjectPath(`/workspace/wt-${generation}`), 1);
++    }
++
++    // Archiving a middle generation hands its subtree back to its own projects.
++    sessionsDb.updateSessionIsArchived('gen-6', true);
++    node = sessionsDb.getChildSessionsByParentIds(['gen-0']).get('gen-0')?.[0];
++    let count = 0;
++    while (node) { count += 1; node = node.childSessions[0]; }
++    assert.equal(count, 5);
++    assert.equal(sessionsDb.countSessionsByProjectPath('/workspace/wt-7'), 1);
++    assert.equal(sessionsDb.getChildSessionsByParentIds(['gen-7']).get('gen-7')?.[0].id, 'gen-8');
++  });
++});
++
++test('attached-child counts for many projects come from one grouped query', async () => {
++  await withDatabase(() => {
++    sessionsDb.createAppSession('lead', 'claude', '/workspace/app', 'Lead');
++    sessionsDb.createAppSession('a1', 'codex', '/workspace/a', 'A1', 'lead');
++    sessionsDb.createAppSession('a2', 'codex', '/workspace/a', 'A2', 'lead');
++    sessionsDb.createAppSession('b1', 'codex', '/workspace/b', 'B1', 'lead');
++    sessionsDb.createAppSession('own', 'codex', '/workspace/c', 'Own');
++    const counts = sessionsDb.countAttachedChildSessionsByProjectPaths(['/workspace/a', '/workspace/b', '/workspace/c', '/workspace/app']);
++    assert.deepEqual([...counts.entries()].sort(), [['/workspace/a', 2], ['/workspace/b', 1]]);
++    assert.deepEqual(sessionsDb.countAttachedChildSessionsByProjectPaths([]), new Map());
++  });
++});
+diff --git a/server/modules/projects/services/projects-with-sessions-fetch.service.ts b/server/modules/projects/services/projects-with-sessions-fetch.service.ts
+index 88600edf..6a510d79 100644
+--- a/server/modules/projects/services/projects-with-sessions-fetch.service.ts
++++ b/server/modules/projects/services/projects-with-sessions-fetch.service.ts
+@@ -139,8 +139,21 @@ function normalizeSessionPagination(options: SessionPaginationOptions = {}): { l
+   };
+ }
+ 
+-function mapSessionRowsToSummaries(rows: SessionRepositoryRow[]): SessionSummary[] {
+-  const childSessions = sessionsDb.getChildSessionsByParentIds(rows.map((row) => row.session_id));
++type ProjectSessionRowsPage = {
++  rows: SessionRepositoryRow[];
++  total: number;
++  hasMore: boolean;
++};
++
++/**
++ * Maps page rows to summaries. `childSessions` is the child-tree map for
++ * these rows, passed in when the caller already read it for a whole project
++ * list; otherwise this reads it for these rows.
++ */
++function mapSessionRowsToSummaries(
++  rows: SessionRepositoryRow[],
++  childSessions: Map<string, ChildSessionSummary[]> = sessionsDb.getChildSessionsByParentIds(rows.map((row) => row.session_id)),
++): SessionSummary[] {
+   return rows.map((row) => ({
+     id: row.session_id,
+     provider: row.provider,
+@@ -154,23 +167,27 @@ function mapSessionRowsToSummaries(rows: SessionRepositoryRow[]): SessionSummary
+   }));
+ }
+ 
+-function readProjectSessionsIncludingArchived(projectPath: string): ProjectSessionsPageResult {
++function readProjectSessionRowsIncludingArchived(projectPath: string): ProjectSessionRowsPage {
+   const rows = sessionsDb.getSessionsByProjectPathIncludingArchived(projectPath) as SessionRepositoryRow[];
++  return { rows, total: rows.length, hasMore: false };
++}
+ 
+-  return {
+-    sessions: mapSessionRowsToSummaries(rows),
+-    total: rows.length,
+-    hasMore: false,
+-  };
++/**
++ * Turns every project's page rows into summaries with one child-tree read
++ * for the whole list, so its cost does not grow with the number of projects.
++ */
++function mapProjectPagesToSummaries(pages: ProjectSessionRowsPage[]): SessionSummary[][] {
++  const childSessions = sessionsDb.getChildSessionsByParentIds(pages.flatMap((page) => page.rows.map((row) => row.session_id)));
++  return pages.map((page) => mapSessionRowsToSummaries(page.rows, childSessions));
+ }
+ 
+ /**
+  * Reads one paginated project session slice from the DB and groups rows by provider.
+  */
+-function readProjectSessionsPageByPath(
++function readProjectSessionRowsPageByPath(
+   projectPath: string,
+   options: SessionPaginationOptions = {},
+-): ProjectSessionsPageResult {
++): ProjectSessionRowsPage {
+   const pagination = normalizeSessionPagination(options);
+   const rows = sessionsDb.getSessionsByProjectPathPage(
+     projectPath,
+@@ -180,12 +197,20 @@ function readProjectSessionsPageByPath(
+   const total = sessionsDb.countSessionsByProjectPath(projectPath);
+ 
+   return {
+-    sessions: mapSessionRowsToSummaries(rows),
++    rows,
+     total,
+     hasMore: pagination.offset + rows.length < total,
+   };
+ }
+ 
++function readProjectSessionsPageByPath(
++  projectPath: string,
++  options: SessionPaginationOptions = {},
++): ProjectSessionsPageResult {
++  const page = readProjectSessionRowsPageByPath(projectPath, options);
++  return { sessions: mapSessionRowsToSummaries(page.rows), total: page.total, hasMore: page.hasMore };
++}
++
+ // Broadcast progress to all connected WebSocket clients.
+ // Uses the unified `kind` envelope like every other websocket frame.
+ function broadcastProgress(progress: ProgressUpdate) {
+@@ -219,7 +244,8 @@ export async function getProjectsWithSessions(
+   }>;
+   const totalProjects = projectRows.length;
+   const knownProjectPaths = new Set(projectRows.map((row) => row.project_path));
+-  const projects: ProjectListItem[] = [];
++  const projects: Array<Omit<ProjectListItem, 'sessions' | 'childSessionCount'>> = [];
++  const pages: ProjectSessionRowsPage[] = [];
+   let processedProjects = 0;
+ 
+   for (const row of projectRows) {
+@@ -240,10 +266,11 @@ export async function getProjectsWithSessions(
+         ? row.custom_project_name
+         : await generateDisplayName(path.basename(projectPath) || projectPath, projectPath);
+ 
+-    const sessionsPage = readProjectSessionsPageByPath(projectPath, {
++    const sessionsPage = readProjectSessionRowsPageByPath(projectPath, {
+       limit: options.sessionsLimit,
+       offset: options.sessionsOffset,
+     });
++    pages.push(sessionsPage);
+ 
+     projects.push({
+       projectId,
+@@ -252,22 +279,28 @@ export async function getProjectsWithSessions(
+       fullPath: projectPath,
+       isStarred: Boolean(row.isStarred),
+       worktreeOf: resolveWorktreeParent(projectPath, knownProjectPaths),
+-      sessions: sessionsPage.sessions,
+       sessionMeta: {
+         hasMore: sessionsPage.hasMore,
+         total: sessionsPage.total,
+       },
+-      childSessionCount: sessionsDb.countAttachedChildSessionsByProjectPath(projectPath),
+     });
+   }
+ 
++  // Child trees and attached-child counts for every project at once.
++  const sessionsByProject = mapProjectPagesToSummaries(pages);
++  const childSessionCounts = sessionsDb.countAttachedChildSessionsByProjectPaths(projects.map((project) => project.path));
++
+   broadcastProgress({
+     phase: 'complete',
+     current: totalProjects,
+     total: totalProjects,
+   });
+ 
+-  return projects;
++  return projects.map((project, index) => ({
++    ...project,
++    sessions: sessionsByProject[index],
++    childSessionCount: childSessionCounts.get(project.path) ?? 0,
++  }));
+ }
+ 
+ /**
+@@ -289,7 +322,8 @@ export async function getArchivedProjectsWithSessions(
+     isStarred?: number;
+   }>;
+ 
+-  const archivedProjects: ArchivedProjectListItem[] = [];
++  const archivedProjects: Array<Omit<ArchivedProjectListItem, 'sessions'>> = [];
++  const pages: ProjectSessionRowsPage[] = [];
+ 
+   for (const row of projectRows) {
+     const displayName =
+@@ -297,7 +331,8 @@ export async function getArchivedProjectsWithSessions(
+         ? row.custom_project_name
+         : await generateDisplayName(path.basename(row.project_path) || row.project_path, row.project_path);
+ 
+-    const sessionsPage = readProjectSessionsIncludingArchived(row.project_path);
++    const sessionsPage = readProjectSessionRowsIncludingArchived(row.project_path);
++    pages.push(sessionsPage);
+ 
+     archivedProjects.push({
+       projectId: row.project_id,
+@@ -307,7 +342,6 @@ export async function getArchivedProjectsWithSessions(
+       isStarred: Boolean(row.isStarred),
+       worktreeOf: null,
+       isArchived: true,
+-      sessions: sessionsPage.sessions,
+       sessionMeta: {
+         hasMore: sessionsPage.hasMore,
+         total: sessionsPage.total,
+@@ -317,7 +351,8 @@ export async function getArchivedProjectsWithSessions(
+     });
+   }
+ 
+-  return archivedProjects;
++  const sessionsByProject = mapProjectPagesToSummaries(pages);
++  return archivedProjects.map((project, index) => ({ ...project, sessions: sessionsByProject[index] }));
+ }
+ 
+ /**
+diff --git a/server/modules/projects/tests/project-child-sessions.test.ts b/server/modules/projects/tests/project-child-sessions.test.ts
+index 347579df..fecf141a 100644
+--- a/server/modules/projects/tests/project-child-sessions.test.ts
++++ b/server/modules/projects/tests/project-child-sessions.test.ts
+@@ -113,3 +113,31 @@ test('pinned summaries say which pins are attached children', async () => {
+     assert.deepEqual(pins.map((pin) => [pin.sessionId, pin.parentSessionId]), [[coder, lead], [lead, null]]);
+   });
+ });
++
++test('child trees and attached counts cost the same number of reads for any number of projects', async (t) => {
++  await withDatabase(async () => {
++    const readsFor = async (projectCount: number) => {
++      for (let index = 0; index < projectCount; index += 1) {
++        const lead = sessionsService.createAppSession('claude', `/workspace/p${projectCount}-${index}`, 'lead').sessionId;
++        sessionsService.createAppSession('codex', `/workspace/p${projectCount}-${index}-wt`, 'worker', { parentSessionId: lead });
++      }
++      const trees = t.mock.method(sessionsDb, 'getChildSessionsByParentIds');
++      const counts = t.mock.method(sessionsDb, 'countAttachedChildSessionsByProjectPaths');
++      const perProjectCount = t.mock.method(sessionsDb, 'countAttachedChildSessionsByProjectPath');
++      const projects = await getProjectsWithSessions({ skipSynchronization: true });
++      const reads = [trees.mock.callCount(), counts.mock.callCount(), perProjectCount.mock.callCount()];
++      t.mock.restoreAll();
++      return { reads, projects };
++    };
++
++    const few = await readsFor(2);
++    const many = await readsFor(8);
++    assert.deepEqual(few.reads, [1, 1, 0]);
++    assert.deepEqual(many.reads, [1, 1, 0]);
++    // The batched result still maps back to each project.
++    const leads = many.projects.filter((project) => project.sessions.length > 0);
++    assert.equal(leads.length, 10);
++    assert.ok(leads.every((project) => project.sessions[0].childSessions.length === 1));
++    assert.ok(many.projects.filter((project) => project.path.endsWith('-wt')).every((project) => project.childSessionCount === 1));
++  });
++});
+-- 
+2.53.0
+

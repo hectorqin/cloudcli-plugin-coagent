@@ -1,0 +1,1117 @@
+From 881a33018c09fbae41db9f6fdb16c542ce3236f7 Mon Sep 17 00:00:00 2001
+From: hectorqin <14220132+hectorqin@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 03:22:08 +0000
+Subject: [PATCH 5/7] feat(sidebar): nest child sessions under the session that
+ started them
+
+Render a session's childSessions under its row with their own provider
+icon, a running indicator from the active-session state, and a muted
+look once idle; clicking opens /session/<id> and selects the child's own
+project. A project whose sessions are all children elsewhere is not
+listed, and a running child keeps its parent in the running view.
+
+Precedence: a session attached to a child-parent is shown only under
+that parent; fork nesting still applies within each sibling group, so a
+fork of a child nests under its source among the parent's children.
+Live session_upserted events for children update them under their parent
+instead of creating a project row; archive and rename reach nested rows.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../hooks/useProjectsState.ts                 |  35 ++++-
+ .../tests/projectsStateChildSessions.test.ts  | 110 ++++++++++++++
+ .../project-workspace/utils/childSessions.ts  | 142 ++++++++++++++++++
+ .../sidebar/SidebarChildSessionItem.tsx       | 102 +++++++++++++
+ .../sidebar/SidebarProjectSessions.tsx        |  75 +++++----
+ .../sidebar/hooks/useSidebarController.ts     |   8 +-
+ .../sidebar/tests/childSessionTree.test.ts    |  96 ++++++++++++
+ .../sidebar/tests/childSessionsView.test.tsx  | 110 ++++++++++++++
+ .../sidebar/utils/projectSessionTree.ts       |  98 ++++++++++--
+ .../sidebar/utils/sidebarProjectFormatting.ts |  29 ++++
+ src/shared/types.ts                           |  35 ++++-
+ 11 files changed, 792 insertions(+), 48 deletions(-)
+ create mode 100644 src/modules/project-workspace/tests/projectsStateChildSessions.test.ts
+ create mode 100644 src/modules/project-workspace/utils/childSessions.ts
+ create mode 100644 src/modules/sidebar/SidebarChildSessionItem.tsx
+ create mode 100644 src/modules/sidebar/tests/childSessionTree.test.ts
+ create mode 100644 src/modules/sidebar/tests/childSessionsView.test.tsx
+
+diff --git a/src/modules/project-workspace/hooks/useProjectsState.ts b/src/modules/project-workspace/hooks/useProjectsState.ts
+index 9a72a41d..565e5eb5 100644
+--- a/src/modules/project-workspace/hooks/useProjectsState.ts
++++ b/src/modules/project-workspace/hooks/useProjectsState.ts
+@@ -8,6 +8,11 @@ import type { ServerEvent,
+   LoadingProgress,
+   Project,
+   ProjectSession,IsSessionProcessing } from '@/shared/types';
++import {
++  removeChildSession,
++  renameChildSession,
++  upsertChildSessionInProjects,
++} from '@/modules/project-workspace/utils/childSessions';
+ import { mergeProjectSelectionMetadata } from '@/modules/project-workspace/utils/projectSelectionMetadata';
+ import { readSelectedProvider } from '@/shared/selectedProvider';
+ 
+@@ -328,6 +333,19 @@ const projectFromRegistration = (project: Project): Project => ({
+ });
+ 
+ const removeSessionFromProject = (project: Project, sessionIdToDelete: string): Project => {
++  // A child session is listed under its parent, not counted in the project's
++  // own total, so pruning it from a child list leaves the totals alone.
++  let childrenPruned = false;
++  const sessions = (project.sessions ?? []).map((session) => {
++    const pruned = removeChildSession(session, sessionIdToDelete);
++    if (pruned !== session) childrenPruned = true;
++    return pruned;
++  });
++  const prunedProject = childrenPruned ? { ...project, sessions } : project;
++  return removeOwnSessionFromProject(prunedProject, sessionIdToDelete);
++};
++
++const removeOwnSessionFromProject = (project: Project, sessionIdToDelete: string): Project => {
+   const sessions = project.sessions ?? [];
+   let changed = false;
+   const nextSessions = sessions.filter((session) => {
+@@ -373,6 +391,7 @@ const renameSessionInProject = (project: Project, sessionIdToRename: string, sum
+         ancestor.id === sessionIdToRename ? { ...ancestor, summary } : ancestor
+       )) };
+     }
++    next = renameChildSession(next, sessionIdToRename, summary);
+     if (next !== session) changed = true;
+     return next;
+   });
+@@ -813,7 +832,11 @@ export function useProjectsState({
+         markSessionAttention(upsert.sessionId);
+       }
+ 
+-      setProjects((previousProjects) => {
++      // A child session goes under its parent, wherever that is loaded, and
++      // never into its own project's list (which it would otherwise create).
++      if (upsert.session.parentSessionId) {
++        setProjects((previousProjects) => upsertChildSessionInProjects(previousProjects, upsert));
++      } else setProjects((previousProjects) => {
+         const targetProjectId = upsert.project?.projectId;
+         const existingProject = previousProjects.find((project) =>
+           targetProjectId ? project.projectId === targetProjectId : getProjectSessions(project).some((session) => session.id === upsert.sessionId),
+@@ -942,7 +965,13 @@ export function useProjectsState({
+       }
+     }
+ 
+-    if (selectedSession?.id === sessionId) {
++    // A session picked from the sidebar is already selected. It still needs
++    // its project resolved when it belongs to another one than the selected
++    // project — a child session listed under a parent in another project.
++    if (
++      selectedSession?.id === sessionId
++      && (!selectedSession.__projectId || selectedSession.__projectId === selectedProject?.projectId)
++    ) {
+       return;
+     }
+ 
+@@ -1046,7 +1075,7 @@ export function useProjectsState({
+           : resolvedSession,
+       );
+     })();
+-  }, [navigate, sessionId, projects, selectedProject, selectedSession?.id, selectedSession?.__provider]);
++  }, [navigate, sessionId, projects, selectedProject, selectedSession?.id, selectedSession?.__provider, selectedSession?.__projectId]);
+ 
+   const handleProjectSelect = useCallback(
+     (project: Project) => {
+diff --git a/src/modules/project-workspace/tests/projectsStateChildSessions.test.ts b/src/modules/project-workspace/tests/projectsStateChildSessions.test.ts
+new file mode 100644
+index 00000000..5a241130
+--- /dev/null
++++ b/src/modules/project-workspace/tests/projectsStateChildSessions.test.ts
+@@ -0,0 +1,110 @@
++import assert from 'node:assert/strict';
++
++import { act, renderHook, waitFor } from '@testing-library/react';
++import { beforeEach, test, vi } from 'vitest';
++
++import { useProjectsState } from '@/modules/project-workspace/hooks/useProjectsState';
++import type { Project, ProjectSession } from '@/shared/types';
++
++const mocks = vi.hoisted(() => ({ projects: vi.fn(), sessionDetails: vi.fn(), rename: vi.fn() }));
++vi.mock('@/shared/api', () => ({ api: {
++  projects: mocks.projects, projectSessions: () => Promise.resolve({ ok: false }), renameSession: mocks.rename,
++  projectTaskmaster: () => Promise.resolve({ ok: false }), sessionDetails: mocks.sessionDetails,
++} }));
++
++const coder = {
++  id: 'coder', provider: 'codex' as const, summary: 'coder', lastActivity: '2026-11-27T00:00:00Z',
++  projectId: 'worktree', projectPath: '/repo-worktrees/coder', parentSessionId: 'lead',
++};
++const lead: ProjectSession = { id: 'lead', summary: 'Lead', provider: 'claude', childSessions: [coder] };
++const acme: Project = {
++  projectId: 'acme', displayName: 'acme', path: '/repo', fullPath: '/repo',
++  sessions: [lead], sessionMeta: { total: 1, hasMore: false }, childSessionCount: 0,
++};
++// Listed by the server, but holding only `coder`, which the sidebar shows under `lead`.
++const worktree: Project = {
++  projectId: 'worktree', displayName: 'coder', path: '/repo-worktrees/coder', fullPath: '/repo-worktrees/coder',
++  sessions: [], sessionMeta: { total: 0, hasMore: false }, childSessionCount: 1,
++};
++const listeners = new Set<(event: never) => void>();
++const subscribe = (listener: (event: never) => void) => { listeners.add(listener); return () => listeners.delete(listener); };
++const emit = (event: unknown) => act(() => listeners.forEach((listener) => listener(event as never)));
++const worktreeRef = { projectId: 'worktree', path: '/repo-worktrees/coder', fullPath: '/repo-worktrees/coder', displayName: 'coder', isStarred: false };
++
++const start = async (projects: Project[] = [acme, worktree]) => {
++  mocks.projects.mockResolvedValue({ ok: true, json: async () => projects });
++  const navigate = vi.fn();
++  const hook = renderHook(({ sessionId }: { sessionId?: string }) => useProjectsState({
++    sessionId, navigate, subscribe, isMobile: false, isSessionProcessing: () => false,
++  }), { initialProps: { sessionId: undefined as string | undefined } });
++  await waitFor(() => assert.equal(hook.result.current.projects.length, projects.length));
++  return { ...hook, navigate };
++};
++const leadChildren = (projects: Project[]) => projects.find((project) => project.projectId === 'acme')?.sessions?.[0].childSessions ?? [];
++
++beforeEach(() => {
++  localStorage.clear(); listeners.clear(); vi.clearAllMocks();
++  mocks.rename.mockResolvedValue({ ok: true });
++});
++
++test('a child upsert updates the child under its parent and never lists it in its own project', async () => {
++  const { result } = await start();
++  emit({
++    kind: 'session_upserted', sessionId: 'coder', providerSessionId: 'native-coder', provider: 'codex',
++    session: { id: 'coder', summary: 'coder renamed', lastActivity: '2026-11-28T00:00:00Z', parentSessionId: 'lead', childSessions: [] },
++    project: worktreeRef,
++  });
++  assert.deepEqual(leadChildren(result.current.projects).map((child) => [child.id, child.summary, child.projectPath]), [
++    ['coder', 'coder renamed', '/repo-worktrees/coder'],
++  ]);
++  assert.deepEqual(result.current.projects.find((project) => project.projectId === 'worktree')?.sessions, []);
++
++  // A second worker the client has not seen, in a project it does not know: no project is created for it.
++  emit({
++    kind: 'session_upserted', sessionId: 'reviewer', provider: 'claude',
++    session: { id: 'reviewer', summary: 'reviewer', lastActivity: '2026-11-28T00:01:00Z', parentSessionId: 'lead' },
++    project: { ...worktreeRef, projectId: 'other-wt', path: '/repo-worktrees/reviewer', fullPath: '/repo-worktrees/reviewer' },
++  });
++  assert.deepEqual(leadChildren(result.current.projects).map((child) => [child.id, child.provider, child.projectId]), [
++    ['coder', 'codex', 'worktree'], ['reviewer', 'claude', 'other-wt'],
++  ]);
++  assert.equal(result.current.projects.length, 2);
++});
++
++test('an empty title upsert keeps the shown child title, and archiving a child drops it without touching totals', async () => {
++  const { result } = await start();
++  emit({
++    kind: 'session_upserted', sessionId: 'coder', provider: 'codex',
++    session: { id: 'coder', summary: '', lastActivity: '2026-11-28T00:00:00Z', parentSessionId: 'lead' },
++    project: worktreeRef,
++  });
++  assert.equal(leadChildren(result.current.projects)[0].summary, 'coder');
++
++  act(() => result.current.handleSessionDelete('coder'));
++  assert.deepEqual(leadChildren(result.current.projects), []);
++  assert.deepEqual(result.current.projects[0].sessionMeta, { total: 1, hasMore: false });
++});
++
++test('renaming a child renames it under its parent', async () => {
++  const { result } = await start();
++  await act(async () => { assert.equal(await result.current.renameSession('coder', 'Worker one'), true); });
++  assert.equal(leadChildren(result.current.projects)[0].summary, 'Worker one');
++});
++
++test('opening a child selects its own project, even one the sidebar does not list', async () => {
++  mocks.sessionDetails.mockResolvedValue({ ok: true, json: async () => ({ data: {
++    sessionId: 'coder', provider: 'codex', summary: 'coder',
++    project: { projectId: 'worktree', path: '/repo-worktrees/coder', fullPath: '/repo-worktrees/coder', displayName: 'coder' },
++  } }) });
++  const { result, navigate, rerender } = await start();
++  act(() => result.current.handleProjectSelect(result.current.projects[0]));
++  act(() => result.current.handleSessionSelect({ id: 'coder', summary: 'coder', __provider: 'codex', __projectId: 'worktree' }));
++  assert.deepEqual(navigate.mock.calls.at(-1), ['/session/coder']);
++
++  rerender({ sessionId: 'coder' });
++  await waitFor(() => assert.equal(result.current.selectedProject?.projectId, 'worktree'));
++  assert.equal(result.current.selectedProject?.fullPath, '/repo-worktrees/coder');
++  assert.equal(result.current.selectedSession?.id, 'coder');
++  assert.equal(result.current.selectedSession?.__provider, 'codex');
++  assert.deepEqual(mocks.sessionDetails.mock.calls, [['coder']]);
++});
+diff --git a/src/modules/project-workspace/utils/childSessions.ts b/src/modules/project-workspace/utils/childSessions.ts
+new file mode 100644
+index 00000000..ed7b1c97
+--- /dev/null
++++ b/src/modules/project-workspace/utils/childSessions.ts
+@@ -0,0 +1,142 @@
++import type { ChildSessionSummary, LLMProvider, Project, ProjectSession } from '@/shared/types';
++
++/**
++ * Pure helpers for the child sessions the server nests under their parent
++ * session (`ProjectSession.childSessions`). A child may run in another project
++ * and on another provider, and is never listed in its own project's
++ * `sessions`, so every update to it has to find it under its parent instead.
++ *
++ * All helpers return the same references when nothing changed, so React state
++ * setters can bail out.
++ */
++
++type ChildContainer = Pick<ProjectSession, 'childSessions'>;
++
++/** Applies `update` to each child list in the tree under `container` (deepest first); `ownerId` names the list's owner. */
++function mapChildTree<T extends ChildContainer>(
++  container: T,
++  update: (children: ChildSessionSummary[], ownerId: string | null) => ChildSessionSummary[],
++  ownerId: string | null,
++  seen: Set<string> = new Set(),
++): T {
++  const children = container.childSessions ?? [];
++  let nestedChanged = false;
++  const nested = children.map((child) => {
++    // Damaged data can repeat a session; visit it once.
++    if (seen.has(child.id)) return child;
++    seen.add(child.id);
++    const next = mapChildTree(child, update, child.id, seen);
++    if (next !== child) nestedChanged = true;
++    return next;
++  });
++  const base = nestedChanged ? nested : children;
++  const updated = update(base, ownerId);
++  if (updated === base && !nestedChanged) return container;
++  return { ...container, childSessions: updated };
++}
++
++function mapProjectChildTrees(
++  projects: Project[],
++  update: (children: ChildSessionSummary[], ownerId: string | null) => ChildSessionSummary[],
++): Project[] {
++  let changedAny = false;
++  const next = projects.map((project) => {
++    let changed = false;
++    const sessions = (project.sessions ?? []).map((session) => {
++      const updated = mapChildTree(session, update, String(session.id));
++      if (updated !== session) changed = true;
++      return updated;
++    });
++    if (!changed) return project;
++    changedAny = true;
++    return { ...project, sessions };
++  });
++  return changedAny ? next : projects;
++}
++
++/** The shape of a `session_upserted` event this module reads. */
++export type ChildSessionUpsert = {
++  sessionId: string;
++  providerSessionId?: string | null;
++  provider: LLMProvider;
++  session: ProjectSession;
++  project: { projectId: string; path: string } | null;
++};
++
++/**
++ * Places an upserted child session under its parent, wherever that parent is
++ * loaded (a project's own row, or nested under another child). The child is
++ * also dropped from any project's own list it was in. A child whose parent is
++ * not loaded is not shown until the parent's page arrives, which embeds it.
++ */
++export function upsertChildSessionInProjects(projects: Project[], event: ChildSessionUpsert): Project[] {
++  const parentId = event.session.parentSessionId;
++  if (!parentId) return projects;
++  const aliasIds = new Set([event.sessionId, event.providerSessionId, event.session.id].filter(
++    (value): value is string => typeof value === 'string' && value.length > 0,
++  ));
++
++  // Drop it from a project's own list, where an earlier upsert may have put it.
++  let next = projects.map((project) => {
++    const sessions = project.sessions ?? [];
++    if (!sessions.some((session) => aliasIds.has(String(session.id)))) return project;
++    const remaining = sessions.filter((session) => !aliasIds.has(String(session.id)));
++    const total = Math.max(0, Number(project.sessionMeta?.total ?? sessions.length) - (sessions.length - remaining.length));
++    return {
++      ...project,
++      sessions: remaining,
++      sessionMeta: { ...project.sessionMeta, total, hasMore: remaining.length < total },
++    };
++  });
++
++  let existing: ChildSessionSummary | undefined;
++  next = mapProjectChildTrees(next, (children, ownerId) => {
++    if (ownerId === parentId) {
++      existing ??= children.find((child) => aliasIds.has(child.id));
++      return children;
++    }
++    // Removed from any other parent (or alias) it was listed under.
++    if (!children.some((child) => aliasIds.has(child.id))) return children;
++    existing ??= children.find((child) => aliasIds.has(child.id));
++    return children.filter((child) => !aliasIds.has(child.id));
++  });
++
++  const incomingSummary = typeof event.session.summary === 'string' ? event.session.summary : '';
++  const child: ChildSessionSummary = {
++    id: event.sessionId,
++    provider: event.provider,
++    // An upsert can carry an empty title for a moment; keep the one already shown.
++    summary: incomingSummary.trim() ? incomingSummary : (existing?.summary ?? ''),
++    lastActivity: event.session.lastActivity ?? existing?.lastActivity ?? new Date().toISOString(),
++    createdAt: (event.session.createdAt as string | undefined) ?? existing?.createdAt,
++    projectId: event.project?.projectId ?? existing?.projectId ?? null,
++    projectPath: event.project?.path ?? existing?.projectPath ?? null,
++    parentSessionId: parentId,
++    forkedFromSessionId: event.session.forkedFromSessionId ?? existing?.forkedFromSessionId ?? null,
++    childSessions: event.session.childSessions ?? existing?.childSessions ?? [],
++  };
++
++  return mapProjectChildTrees(next, (children, ownerId) => {
++    if (ownerId !== parentId) return children;
++    const index = children.findIndex((candidate) => aliasIds.has(candidate.id));
++    if (index < 0) return [...children, child];
++    if (JSON.stringify(children[index]) === JSON.stringify(child)) return children;
++    return children.map((candidate, position) => (position === index ? child : candidate));
++  });
++}
++
++/** Removes a deleted or archived session from every child list it is in. */
++export function removeChildSession<T extends ChildContainer>(container: T, sessionId: string): T {
++  return mapChildTree(container, (children) => (
++    children.some((child) => child.id === sessionId) ? children.filter((child) => child.id !== sessionId) : children
++  ), null);
++}
++
++/** Writes a confirmed rename onto a child row, wherever it is nested. */
++export function renameChildSession<T extends ChildContainer>(container: T, sessionId: string, summary: string): T {
++  return mapChildTree(container, (children) => (
++    children.some((child) => child.id === sessionId && child.summary !== summary)
++      ? children.map((child) => (child.id === sessionId ? { ...child, summary } : child))
++      : children
++  ), null);
++}
+diff --git a/src/modules/sidebar/SidebarChildSessionItem.tsx b/src/modules/sidebar/SidebarChildSessionItem.tsx
+new file mode 100644
+index 00000000..1eeea27c
+--- /dev/null
++++ b/src/modules/sidebar/SidebarChildSessionItem.tsx
+@@ -0,0 +1,102 @@
++import { memo } from 'react';
++import { Loader2 } from 'lucide-react';
++import type { TFunction } from 'i18next';
++
++import { LLMProviderLogo, Tooltip, buttonVariants } from '@/shared/ui';
++import { cn } from '@/shared/utils';
++import type { ProjectSession, SessionWithProvider } from '@/shared/types';
++import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
++import { PROVIDER_LABELS, createSessionViewModel, formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
++
++type SidebarChildSessionItemProps = {
++  /** A child summary converted by `childSessionToSession`: tagged with its own provider and project. */
++  session: SessionWithProvider;
++  selectedSession: ProjectSession | null;
++  /** A turn is in flight. */
++  isProcessing: boolean;
++  /** The turn ended but work it launched still runs. */
++  hasBackgroundWork: boolean;
++  currentTime: Date;
++  /** Opens the session; the second argument is the projectId the session belongs to, which may not be the listing project. */
++  onSessionSelect: (session: SessionWithProvider, projectId: string) => void;
++  t: TFunction;
++};
++
++/**
++ * One child session under the session that started it, rendered by
++ * SidebarProjectSessions. Children often run in another project and on
++ * another provider, so the row shows its own provider and is read-only here:
++ * it only opens the session (renaming, archiving and the rest happen once it
++ * is open). A child with no work in progress is muted, so finished workers
++ * read as done.
++ */
++function SidebarChildSessionItem({
++  session,
++  selectedSession,
++  isProcessing,
++  hasBackgroundWork,
++  currentTime,
++  onSessionSelect,
++  t,
++}: SidebarChildSessionItemProps) {
++  const isCompact = useCompactSidebar();
++  const sessionView = createSessionViewModel(session, currentTime, t);
++  const isSelected = selectedSession?.id === session.id;
++  const isRunning = isProcessing || hasBackgroundWork;
++  const age = formatCompactAge(sessionView.sessionTime, currentTime);
++  const projectPath = typeof session.projectPath === 'string' ? session.projectPath : '';
++  const providerLabel = PROVIDER_LABELS[session.__provider] ?? session.__provider;
++
++  return (
++    <a
++      href={`/session/${session.id}`}
++      data-child-session-id={session.id}
++      data-child-session-state={isRunning ? 'running' : 'idle'}
++      aria-current={isSelected ? 'page' : undefined}
++      title={projectPath ? `${sessionView.sessionName}\n${providerLabel} · ${projectPath}` : `${sessionView.sessionName}\n${providerLabel}`}
++      className={cn(
++        buttonVariants({ variant: 'ghost' }),
++        'h-auto w-full justify-start rounded-md border border-transparent bg-transparent px-1.5 text-left font-normal transition-colors duration-150',
++        isCompact ? 'min-h-10 py-2' : 'py-1',
++        isSelected ? 'border-primary/20 bg-primary/5' : 'hover:bg-accent/50',
++        !isRunning && !isSelected && 'opacity-60 hover:opacity-100',
++      )}
++      // Left-click keeps in-app navigation; modified clicks use the href.
++      onClick={(event) => {
++        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
++        event.preventDefault();
++        onSessionSelect(session, session.__projectId ?? '');
++      }}
++    >
++      <div className="flex w-full min-w-0 items-center gap-1.5">
++        <div
++          className={cn(
++            'flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md',
++            isSelected ? 'bg-primary/10' : 'bg-muted/50',
++          )}
++        >
++          <LLMProviderLogo provider={session.__provider} className="h-3 w-3" />
++        </div>
++        <span
++          className={cn(
++            'min-w-0 flex-1 truncate text-sm',
++            isRunning ? 'text-foreground' : 'text-muted-foreground',
++          )}
++        >
++          {sessionView.sessionName}
++        </span>
++        {isProcessing ? (
++          <Tooltip content={t('tooltips.processingSessionIndicator', 'Processing session')} position="top">
++            <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-md text-muted-foreground" data-child-session-running="">
++              <Loader2 className="h-3 w-3 animate-spin" />
++            </span>
++          </Tooltip>
++        ) : age ? (
++          <span className="ml-auto flex-shrink-0 text-[11px] text-muted-foreground">{age}</span>
++        ) : null}
++      </div>
++    </a>
++  );
++}
++
++export default memo(SidebarChildSessionItem);
+diff --git a/src/modules/sidebar/SidebarProjectSessions.tsx b/src/modules/sidebar/SidebarProjectSessions.tsx
+index c3b2610c..2ad4599a 100644
+--- a/src/modules/sidebar/SidebarProjectSessions.tsx
++++ b/src/modules/sidebar/SidebarProjectSessions.tsx
+@@ -5,6 +5,7 @@ import type { TFunction } from 'i18next';
+ import { Button } from '@/shared/ui';
+ import { cn } from '@/shared/utils';
+ import type { LLMProvider, Project, ProjectSession, SessionWithProvider, SidebarSessionSelection } from '@/shared/types';
++import SidebarChildSessionItem from '@/modules/sidebar/SidebarChildSessionItem';
+ import SidebarSessionItem from '@/modules/sidebar/SidebarSessionItem';
+ import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
+ import { useSessionPins } from '@/modules/sidebar/hooks/useSessionPins';
+@@ -109,7 +110,8 @@ export default function SidebarProjectSessions({
+     const ancestors = new Map(sessions.flatMap((session) => session.forkAncestors ?? []).map((ancestor) => [ancestor.id, ancestor]));
+     // Include pins beyond the loaded page without changing page offsets or
+     // replacing loaded rows' fork metadata with the smaller pin summaries.
+-    const offPagePins: SessionWithProvider[] = projectPins.filter((pin) => includeOffPagePins && !loadedIds.has(pin.sessionId)).map((pin) => ({
++    // A pinned child session is listed under its parent, not here.
++    const offPagePins: SessionWithProvider[] = projectPins.filter((pin) => includeOffPagePins && !pin.parentSessionId && !loadedIds.has(pin.sessionId)).map((pin) => ({
+       forkedFromSessionId: pin.forkedFromSessionId,
+       forkAncestors: pin.forkAncestors,
+       ...ancestors.get(pin.sessionId),
+@@ -180,7 +182,11 @@ export default function SidebarProjectSessions({
+   // row's options menu applies — so it is not selectable either.
+   const isSessionRunning = (session: SessionWithProvider) =>
+     activeSessions.has(session.id) && !backgroundSessionIds.has(session.id);
+-  const selectableSessionIds = treeRows.filter(({ session }) => !isSessionRunning(session)).map(({ session }) => session.id);
++  // Child rows belong to other sessions' families (often other projects) and
++  // are only opened from here, so bulk selection leaves them alone.
++  const selectableSessionIds = treeRows
++    .filter(({ session, isChildSession }) => !isChildSession && !isSessionRunning(session))
++    .map(({ session }) => session.id);
+   // Re-derived from the selectable rows rather than read straight off the
+   // selection, so a row that started running after it was ticked drops out of
+   // the count, the button and the ids the confirmation is opened with.
+@@ -296,11 +302,12 @@ export default function SidebarProjectSessions({
+       ) : (
+         <>
+           <div className={cn(!hasForks && 'space-y-1')} data-testid="project-session-tree">
+-            {visibleRows.map(({ session, parentId, depth, hasChildren, isLastSibling, continuationDepths }) => (
++            {visibleRows.map(({ session, parentId, depth, hasChildren, isLastSibling, isChildSession, continuationDepths }) => (
+               <div
+                 key={session.id}
+                 data-session-id={session.id}
+                 data-parent-session-id={parentId ?? undefined}
++                data-child-session={isChildSession || undefined}
+                 data-fork-depth={depth}
+                 data-fork-branch={hasChildren || undefined}
+                 className="relative flex min-w-0 items-stretch"
+@@ -355,31 +362,43 @@ export default function SidebarProjectSessions({
+                   ) : <span className="w-3 flex-shrink-0" aria-hidden="true" />
+                 )}
+                 <div className="min-w-0 flex-1">
+-                  <SidebarSessionItem
+-                    project={project}
+-                    session={session}
+-                    selectedSession={selectedSession}
+-                    isProcessing={isSessionRunning(session)}
+-                    hasBackgroundWork={backgroundSessionIds.has(session.id)}
+-                    needsAttention={attentionSessionIds.has(session.id)}
+-                    currentTime={currentTime}
+-                    onRenameDraftChange={onRenameDraftChange}
+-                    isEditing={session.id === sessionRenameId}
+-                    renameDraft={session.id === sessionRenameId ? sessionRenameDraft : ''}
+-                    onStartEditingSession={onStartEditingSession}
+-                    onCancelEditingSession={onCancelEditingSession}
+-                    onSaveEditingSession={onSaveEditingSession}
+-                    onProjectSelect={onProjectSelect}
+-                    onSessionSelect={onSessionSelect}
+-                    onArchiveSession={onArchiveSession}
+-                    onDeleteSession={onDeleteSession}
+-                    onForkSession={onForkSession}
+-                    isSelecting={isSelecting}
+-                    isChecked={checkedSessionIds.has(session.id)}
+-                    onToggleSessionSelected={onToggleSessionSelected}
+-                    treeRow={hasForks}
+-                    t={t}
+-                  />
++                  {isChildSession ? (
++                    <SidebarChildSessionItem
++                      session={session}
++                      selectedSession={selectedSession}
++                      isProcessing={isSessionRunning(session)}
++                      hasBackgroundWork={backgroundSessionIds.has(session.id)}
++                      currentTime={currentTime}
++                      onSessionSelect={onSessionSelect}
++                      t={t}
++                    />
++                  ) : (
++                    <SidebarSessionItem
++                      project={project}
++                      session={session}
++                      selectedSession={selectedSession}
++                      isProcessing={isSessionRunning(session)}
++                      hasBackgroundWork={backgroundSessionIds.has(session.id)}
++                      needsAttention={attentionSessionIds.has(session.id)}
++                      currentTime={currentTime}
++                      onRenameDraftChange={onRenameDraftChange}
++                      isEditing={session.id === sessionRenameId}
++                      renameDraft={session.id === sessionRenameId ? sessionRenameDraft : ''}
++                      onStartEditingSession={onStartEditingSession}
++                      onCancelEditingSession={onCancelEditingSession}
++                      onSaveEditingSession={onSaveEditingSession}
++                      onProjectSelect={onProjectSelect}
++                      onSessionSelect={onSessionSelect}
++                      onArchiveSession={onArchiveSession}
++                      onDeleteSession={onDeleteSession}
++                      onForkSession={onForkSession}
++                      isSelecting={isSelecting}
++                      isChecked={checkedSessionIds.has(session.id)}
++                      onToggleSessionSelected={onToggleSessionSelected}
++                      treeRow={hasForks}
++                      t={t}
++                    />
++                  )}
+                 </div>
+               </div>
+             ))}
+diff --git a/src/modules/sidebar/hooks/useSidebarController.ts b/src/modules/sidebar/hooks/useSidebarController.ts
+index 1448af1d..c87c511f 100644
+--- a/src/modules/sidebar/hooks/useSidebarController.ts
++++ b/src/modules/sidebar/hooks/useSidebarController.ts
+@@ -8,6 +8,8 @@ import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationProj
+ import {
+   filterProjects,
+   getAllSessions,
++  hasActiveSessionInFamily,
++  isChildOnlyProject,
+   sortProjects,
+ } from '@/modules/sidebar/utils/sidebarProjectFormatting';
+ import {
+@@ -777,8 +779,9 @@ export function useSidebarController({
+     });
+   }, [optimisticStarByProjectId, projects]);
+ 
++  // A project holding only child sessions (listed under their parents) is not listed itself.
+   const sortedProjects = useMemo(
+-    () => sortProjects(projectsWithResolvedStarState, projectSortOrder),
++    () => sortProjects(projectsWithResolvedStarState.filter((project) => !isChildOnlyProject(project)), projectSortOrder),
+     [projectSortOrder, projectsWithResolvedStarState],
+   );
+ 
+@@ -788,7 +791,8 @@ export function useSidebarController({
+     }
+ 
+     return sortedProjects.reduce<Project[]>((acc, project) => {
+-      const sessions = (project.sessions ?? []).filter((session) => activeSessionIds.has(String(session.id)));
++      // A session stays listed while a child session it started is running.
++      const sessions = (project.sessions ?? []).filter((session) => hasActiveSessionInFamily(session, activeSessionIds));
+       const runningCount = sessions.length;
+ 
+       if (runningCount === 0) {
+diff --git a/src/modules/sidebar/tests/childSessionTree.test.ts b/src/modules/sidebar/tests/childSessionTree.test.ts
+new file mode 100644
+index 00000000..0176712f
+--- /dev/null
++++ b/src/modules/sidebar/tests/childSessionTree.test.ts
+@@ -0,0 +1,96 @@
++import assert from 'node:assert/strict';
++
++import { test } from 'vitest';
++
++import type { ChildSessionSummary, Project, SessionWithProvider } from '@/shared/types';
++import { buildProjectSessionTree } from '@/modules/sidebar/utils/projectSessionTree';
++import { hasActiveSessionInFamily, isChildOnlyProject } from '@/modules/sidebar/utils/sidebarProjectFormatting';
++
++const child = (id: string, parent: string, overrides: Partial<ChildSessionSummary> = {}): ChildSessionSummary => ({
++  id, provider: 'codex', summary: id, lastActivity: '2026-11-28T00:00:00.000Z',
++  projectId: 'worktree', projectPath: '/workspace/acme-app-worktrees/coder', parentSessionId: parent,
++  forkedFromSessionId: null, childSessions: [], ...overrides,
++});
++const session = (id: string, overrides: Partial<SessionWithProvider> = {}): SessionWithProvider => ({
++  id, summary: id, __provider: 'claude', ...overrides,
++});
++const shape = (sessions: SessionWithProvider[]) => buildProjectSessionTree(sessions, 'acme').map((row) => (
++  [row.session.id, row.parentId, row.depth, row.isChildSession, row.session.__provider, row.session.__projectId ?? null]
++));
++
++test('children from another project and provider hang under their parent, in the order they were started', () => {
++  const lead = session('lead', { childSessions: [
++    child('coder', 'lead'),
++    child('reviewer', 'lead', { provider: 'claude', projectId: 'acme', projectPath: '/workspace/acme-app' }),
++  ] });
++  assert.deepEqual(shape([session('newer'), lead]), [
++    ['newer', null, 0, false, 'claude', null],
++    ['lead', null, 0, false, 'claude', null],
++    ['coder', 'lead', 1, true, 'codex', 'worktree'],
++    ['reviewer', 'lead', 1, true, 'claude', 'acme'],
++  ]);
++  const rows = buildProjectSessionTree([lead], 'acme');
++  assert.equal(rows[0].hasChildren, true);
++  assert.equal(rows[2].isLastSibling, true);
++  assert.equal(rows[1].session.projectPath, '/workspace/acme-app-worktrees/coder');
++});
++
++test('grandchildren nest under their own parent', () => {
++  const lead = session('lead', { childSessions: [child('coder', 'lead', { childSessions: [child('helper', 'coder', { provider: 'opencode' })] })] });
++  assert.deepEqual(shape([lead]).map((row) => row.slice(0, 4)), [
++    ['lead', null, 0, false], ['coder', 'lead', 1, true], ['helper', 'coder', 2, true],
++  ]);
++});
++
++test('a session attached to a parent is shown only under that parent, even when it is also a fork', () => {
++  // `stray` reached this list (e.g. an off-page pin) but belongs under `lead`.
++  const stray = session('stray', { parentSessionId: 'lead', forkedFromSessionId: 'base' });
++  assert.deepEqual(shape([stray, session('base')]).map((row) => row[0]), ['base']);
++});
++
++test('fork nesting keeps working among a parent\'s children and alongside its own forks', () => {
++  const lead = session('lead', { childSessions: [
++    child('coder', 'lead'),
++    // A fork of a child inherits the child's parent and nests under its source.
++    child('coder-fork', 'lead', { forkedFromSessionId: 'coder' }),
++    child('reviewer', 'lead'),
++  ] });
++  const leadFork = session('lead-fork', { forkedFromSessionId: 'lead' });
++  assert.deepEqual(shape([leadFork, lead]).map((row) => row.slice(0, 4)), [
++    ['lead', null, 0, false],
++    ['lead-fork', 'lead', 1, false],
++    ['coder', 'lead', 1, true],
++    ['coder-fork', 'coder', 2, true],
++    ['reviewer', 'lead', 1, true],
++  ]);
++});
++
++test('a repeated child is listed once', () => {
++  const lead = session('lead', { childSessions: [child('coder', 'lead', { childSessions: [child('coder', 'coder')] }), child('coder', 'lead')] });
++  assert.deepEqual(shape([lead]).map((row) => row[0]), ['lead', 'coder']);
++});
++
++const project = (overrides: Partial<Project>): Project => ({
++  projectId: 'p', displayName: 'p', fullPath: '/p', sessions: [], sessionMeta: { total: 0, hasMore: false }, ...overrides,
++});
++
++test('a project whose only sessions are children elsewhere is hidden; empty and mixed projects are not', () => {
++  assert.equal(isChildOnlyProject(project({ childSessionCount: 2 })), true);
++  assert.equal(isChildOnlyProject(project({ childSessionCount: 0 })), false, 'a new, empty project stays listed');
++  assert.equal(isChildOnlyProject(project({})), false);
++  assert.equal(isChildOnlyProject(project({ childSessionCount: 1, sessions: [{ id: 'own' }], sessionMeta: { total: 1, hasMore: false } })), false);
++  assert.equal(isChildOnlyProject(project({ childSessionCount: 1, sessionMeta: { total: 3, hasMore: true } })), false);
++});
++
++test('archived children never reach the tree, so a parent with only archived children shows none', () => {
++  // The server leaves archived children out of `childSessions`; the parent is then a plain row.
++  const rows = buildProjectSessionTree([session('lead', { childSessions: [] })], 'acme');
++  assert.deepEqual(rows.map((row) => [row.session.id, row.hasChildren]), [['lead', false]]);
++});
++
++test('a running child keeps its parent in the running view', () => {
++  const lead = session('lead', { childSessions: [child('coder', 'lead', { childSessions: [child('helper', 'coder')] })] });
++  assert.equal(hasActiveSessionInFamily(lead, new Set(['helper'])), true);
++  assert.equal(hasActiveSessionInFamily(lead, new Set(['lead'])), true);
++  assert.equal(hasActiveSessionInFamily(lead, new Set(['other'])), false);
++});
+diff --git a/src/modules/sidebar/tests/childSessionsView.test.tsx b/src/modules/sidebar/tests/childSessionsView.test.tsx
+new file mode 100644
+index 00000000..93864792
+--- /dev/null
++++ b/src/modules/sidebar/tests/childSessionsView.test.tsx
+@@ -0,0 +1,110 @@
++import assert from 'node:assert/strict';
++
++import { fireEvent, render, screen } from '@testing-library/react';
++import type { ComponentProps } from 'react';
++import type { TFunction } from 'i18next';
++import { test, vi } from 'vitest';
++
++import SidebarProjectSessions from '@/modules/sidebar/SidebarProjectSessions';
++import type { SessionWithProvider } from '@/shared/types';
++
++const compact = vi.hoisted(() => ({ value: false }));
++vi.mock('@/modules/sidebar/hooks/useCompactSidebar', () => ({ useCompactSidebar: () => compact.value }));
++vi.mock('@/shared/hooks/useProviderCapabilities', () => ({ useSessionForkingProviders: () => new Set(['claude', 'codex']) }));
++vi.mock('@/modules/sidebar/SessionOptions', () => ({ default: () => null }));
++
++const t = ((key: string, fallbackOrOptions?: unknown) => (
++  typeof fallbackOrOptions === 'object' && fallbackOrOptions && 'session' in fallbackOrOptions
++    ? `${key} ${(fallbackOrOptions as { session: string }).session}`
++    : key
++)) as TFunction;
++const noop = () => {};
++
++const lead: SessionWithProvider = {
++  id: 'lead', summary: 'Use coagent to delegate', __provider: 'claude',
++  childSessions: [
++    {
++      id: 'coder', provider: 'codex', summary: 'coder-42de9c', lastActivity: '2026-11-27T23:50:00Z',
++      projectId: 'worktree', projectPath: '/workspace/acme-app-worktrees/coder', parentSessionId: 'lead',
++    },
++    {
++      id: 'reviewer', provider: 'claude', summary: 'reviewer-c38d53', lastActivity: '2026-11-27T23:40:00Z',
++      projectId: 'acme', projectPath: '/workspace/acme-app', parentSessionId: 'lead',
++    },
++  ],
++};
++const other: SessionWithProvider = { id: 'other', summary: 'Unrelated', __provider: 'claude' };
++
++const props = (overrides: Partial<ComponentProps<typeof SidebarProjectSessions>> = {}): ComponentProps<typeof SidebarProjectSessions> => ({
++  project: { projectId: 'acme', displayName: 'acme-app', fullPath: '/workspace/acme-app' },
++  isExpanded: true, sessions: [lead, other], selectedSession: null, initialSessionsLoaded: true,
++  hasMoreSessions: false, isLoadingMoreSessions: false,
++  activeSessions: new Set(['coder']), backgroundSessionIds: new Set(), attentionSessionIds: new Set(),
++  currentTime: new Date('2026-11-28T00:00:00Z'), sessionRenameId: null, sessionRenameDraft: '',
++  onRenameDraftChange: noop, onStartEditingSession: noop, onCancelEditingSession: noop,
++  onSaveEditingSession: noop, onProjectSelect: noop, onSessionSelect: noop, onArchiveSession: noop, onDeleteSession: noop,
++  onForkSession: noop, onLoadMoreSessions: noop, onNewSession: noop, selectedSessionIds: null,
++  onSetSessionSelection: noop, onToggleSessionSelected: noop, onCancelSessionSelection: noop,
++  onDeleteSelectedSessions: noop, t, ...overrides,
++});
++const rowIds = (container: HTMLElement) => Array.from(container.querySelectorAll('[data-session-id]')).map((row) => row.getAttribute('data-session-id'));
++
++test.each([false, true])('children render under their parent with their own provider, state and link in compact=%s', (isCompact) => {
++  compact.value = isCompact;
++  const select = vi.fn();
++  const { container } = render(<SidebarProjectSessions {...props({ onSessionSelect: select })} />);
++
++  assert.deepEqual(rowIds(container), ['lead', 'coder', 'reviewer', 'other']);
++  const row = (id: string) => container.querySelector(`[data-session-id="${id}"]`)!;
++  assert.equal(row('coder').getAttribute('data-child-session'), 'true');
++  assert.equal(row('coder').getAttribute('data-parent-session-id'), 'lead');
++  assert.equal(row('coder').getAttribute('data-fork-depth'), '1');
++  assert.equal(row('lead').getAttribute('data-child-session'), null);
++
++  const link = (id: string) => row(id).querySelector('[data-child-session-id]')!;
++  assert.equal(link('coder').getAttribute('href'), '/session/coder');
++  assert.equal(link('coder').getAttribute('data-child-session-state'), 'running');
++  assert.ok(link('coder').querySelector('[data-child-session-running]'), 'a running child shows the spinner');
++  assert.equal(link('reviewer').getAttribute('data-child-session-state'), 'idle');
++  assert.match(link('reviewer').className, /opacity-60/, 'a finished child is muted');
++  assert.doesNotMatch(link('coder').className, /opacity-60/);
++  // Each row carries its own provider: the codex child shows the codex logo, not the parent's.
++  assert.ok(link('coder').textContent?.includes('coder-42de9c'));
++  assert.match(link('coder').getAttribute('title') ?? '', /Codex · \/workspace\/acme-app-worktrees\/coder/);
++
++  fireEvent.click(screen.getByText('coder-42de9c'));
++  assert.equal(select.mock.calls.length, 1);
++  const [opened, projectId] = select.mock.calls[0];
++  assert.equal(opened.id, 'coder');
++  assert.equal(opened.__provider, 'codex');
++  assert.equal(projectId, 'worktree', 'opening a child resolves its own project, not the listing one');
++
++  // Modified clicks are left to the browser (new tab via href); jsdom cannot follow it.
++  document.addEventListener('click', (event) => event.preventDefault(), { once: true });
++  fireEvent.click(screen.getByText('reviewer-c38d53'), { metaKey: true });
++  assert.equal(select.mock.calls.length, 1);
++});
++
++test('children collapse with their parent and are not offered for bulk selection', () => {
++  compact.value = false;
++  const setSelection = vi.fn();
++  const { container } = render(<SidebarProjectSessions {...props({ onSetSessionSelection: setSelection, activeSessions: new Set() })} />);
++  fireEvent.click(screen.getByRole('button', { name: 'sessions.collapseForks Use coagent to delegate' }));
++  assert.deepEqual(rowIds(container), ['lead', 'other']);
++  fireEvent.click(screen.getByRole('button', { name: 'sessions.expandForks Use coagent to delegate' }));
++  assert.deepEqual(rowIds(container), ['lead', 'coder', 'reviewer', 'other']);
++
++  const { container: selecting } = render(<SidebarProjectSessions {...props({
++    selectedSessionIds: new Set(), onSetSessionSelection: setSelection, activeSessions: new Set(),
++  })} />);
++  fireEvent.click(Array.from(selecting.querySelectorAll('button')).find((button) => button.textContent === 'sessions.selectAll')!);
++  assert.deepEqual([...setSelection.mock.calls.at(-1)![0].sessionIds].sort(), ['lead', 'other']);
++});
++
++test('the selected child is highlighted and revealed under a collapsed parent', () => {
++  compact.value = false;
++  const { container } = render(<SidebarProjectSessions {...props({ selectedSession: { id: 'reviewer' } })} />);
++  const link = container.querySelector('[data-child-session-id="reviewer"]')!;
++  assert.equal(link.getAttribute('aria-current'), 'page');
++  assert.doesNotMatch(link.className, /opacity-60/);
++});
+diff --git a/src/modules/sidebar/utils/projectSessionTree.ts b/src/modules/sidebar/utils/projectSessionTree.ts
+index 05ae9a56..3736fdd9 100644
+--- a/src/modules/sidebar/utils/projectSessionTree.ts
++++ b/src/modules/sidebar/utils/projectSessionTree.ts
+@@ -1,4 +1,4 @@
+-import type { SessionWithProvider } from '@/shared/types';
++import type { ChildSessionSummary, SessionWithProvider } from '@/shared/types';
+ 
+ type TreeNode = {
+   session: SessionWithProvider;
+@@ -6,8 +6,40 @@ type TreeNode = {
+   children: TreeNode[];
+   rank: number;
+   pinRank: number;
++  isChildSession: boolean;
+ };
+ 
++export type ProjectSessionTreeRow = {
++  session: SessionWithProvider;
++  parentId: string | null;
++  depth: number;
++  hasChildren: boolean;
++  isLastSibling: boolean;
++  /**
++   * The row is a child session: started by the row it hangs under, and
++   * possibly in another project and on another provider. Rendered read-only,
++   * opened by navigating to it.
++   */
++  isChildSession: boolean;
++};
++
++/** A server child summary as a sidebar session, tagged with its own project so opening it resolves the right workspace. */
++export function childSessionToSession(child: ChildSessionSummary): SessionWithProvider {
++  return {
++    id: child.id,
++    summary: child.summary,
++    lastActivity: child.lastActivity,
++    createdAt: child.createdAt,
++    provider: child.provider,
++    __provider: child.provider,
++    __projectId: child.projectId ?? undefined,
++    projectPath: child.projectPath,
++    parentSessionId: child.parentSessionId,
++    forkedFromSessionId: child.forkedFromSessionId ?? null,
++    childSessions: child.childSessions ?? [],
++  };
++}
++
+ /**
+  * SidebarProjectSessions alone uses this projection. Keep the shared session
+  * list flat so Conversations, search and pagination retain their own ordering.
+@@ -15,13 +47,60 @@ type TreeNode = {
+  * position, and parents always precede children. Ancestor hints fill page gaps,
+  * while actual page rows take precedence over their older context snapshots.
+  * A pin lifts its entire family; only root ordering changes, never ancestry.
++ *
++ * Child sessions (`childSessions`, started by a row) are emitted under that
++ * row after its forks, in the order they were started. Precedence when a
++ * session has both kinds of parent: a session with an attached child-parent
++ * (`parentSessionId`) is shown only under that parent, so it is dropped from
++ * the input here; fork nesting still applies within each sibling group, which
++ * is how a fork of a child (it inherits the child's parent) nests under its
++ * source among that parent's children.
+  */
+-export function buildProjectSessionTree(sessions: SessionWithProvider[], projectId: string, pinnedIds: readonly string[] = []) {
++export function buildProjectSessionTree(
++  sessions: SessionWithProvider[],
++  projectId: string,
++  pinnedIds: readonly string[] = [],
++): ProjectSessionTreeRow[] {
++  const roots = buildForkForest(sessions.filter((session) => !session.parentSessionId), projectId, pinnedIds);
++
++  const rows: ProjectSessionTreeRow[] = [];
++  // Each session is emitted once, even when damaged data repeats it.
++  const emitted = new Set<string>();
++  type Frame = { node: TreeNode; depth: number; isLastSibling: boolean; parentId: string | null };
++  const childrenOf = (node: TreeNode): TreeNode[] => {
++    const childSessions = (node.session.childSessions ?? [])
++      .map(childSessionToSession)
++      .filter((child) => !emitted.has(child.id));
++    const childForest = childSessions.length
++      ? buildForkForest(childSessions, projectId, [], true)
++      : [];
++    return [...node.children, ...childForest];
++  };
++  const stack: Frame[] = roots.map((node, index) => ({ node, depth: 0, isLastSibling: index === roots.length - 1, parentId: null })).reverse();
++  while (stack.length) {
++    const { node, depth, isLastSibling, parentId } = stack.pop()!;
++    if (emitted.has(node.session.id)) continue;
++    emitted.add(node.session.id);
++    const children = childrenOf(node);
++    rows.push({ session: node.session, parentId, depth, hasChildren: children.length > 0, isLastSibling, isChildSession: node.isChildSession });
++    for (let index = children.length - 1; index >= 0; index -= 1) {
++      stack.push({ node: children[index], depth: depth + 1, isLastSibling: index === children.length - 1, parentId: node.session.id });
++    }
++  }
++  return rows;
++}
++
++function buildForkForest(
++  sessions: SessionWithProvider[],
++  projectId: string,
++  pinnedIds: readonly string[],
++  isChildSession = false,
++): TreeNode[] {
+   const pinRanks = new Map(pinnedIds.map((id, rank) => [id, rank]));
+   const nodes = new Map<string, TreeNode>();
+   sessions.forEach((session, rank) => {
+     if (!nodes.has(session.id)) {
+-      nodes.set(session.id, { session, parentId: null, children: [], rank, pinRank: pinRanks.get(session.id) ?? Infinity });
++      nodes.set(session.id, { session, parentId: null, children: [], rank, pinRank: pinRanks.get(session.id) ?? Infinity, isChildSession });
+     }
+   });
+ 
+@@ -50,7 +129,7 @@ export function buildProjectSessionTree(sessions: SessionWithProvider[], project
+         __projectId: projectId,
+       } : null;
+       if (!parent || parent.__provider !== session.__provider) break;
+-      nodes.set(parentId, { session: parent, parentId: null, children: [], rank: Infinity, pinRank: pinRanks.get(parentId) ?? Infinity });
++      nodes.set(parentId, { session: parent, parentId: null, children: [], rank: Infinity, pinRank: pinRanks.get(parentId) ?? Infinity, isChildSession });
+       child = parent;
+     }
+   }
+@@ -107,14 +186,5 @@ export function buildProjectSessionTree(sessions: SessionWithProvider[], project
+     return a.rank - b.rank;
+   });
+ 
+-  const rows: { session: SessionWithProvider; parentId: string | null; depth: number; hasChildren: boolean; isLastSibling: boolean }[] = [];
+-  const stack = roots.map((node, index) => ({ node, depth: 0, isLastSibling: index === roots.length - 1 })).reverse();
+-  while (stack.length) {
+-    const { node, depth, isLastSibling } = stack.pop()!;
+-    rows.push({ session: node.session, parentId: node.parentId, depth, hasChildren: node.children.length > 0, isLastSibling });
+-    for (let index = node.children.length - 1; index >= 0; index -= 1) {
+-      stack.push({ node: node.children[index], depth: depth + 1, isLastSibling: index === node.children.length - 1 });
+-    }
+-  }
+-  return rows;
++  return roots;
+ }
+diff --git a/src/modules/sidebar/utils/sidebarProjectFormatting.ts b/src/modules/sidebar/utils/sidebarProjectFormatting.ts
+index e72924ed..1a5bbfec 100644
+--- a/src/modules/sidebar/utils/sidebarProjectFormatting.ts
++++ b/src/modules/sidebar/utils/sidebarProjectFormatting.ts
+@@ -147,6 +147,35 @@ export const sortProjects = (
+   return byName;
+ };
+ 
++/**
++ * True for a project whose visible sessions are all children of sessions
++ * elsewhere (e.g. a git worktree an orchestrator ran its workers in). Those
++ * children are listed under their parent session, so the project itself is
++ * not listed. A project with no sessions at all is still listed.
++ */
++export const isChildOnlyProject = (project: Project): boolean =>
++  Number(project.childSessionCount ?? 0) > 0
++  && (project.sessions?.length ?? 0) === 0
++  && !project.sessionMeta?.hasMore
++  && Number(project.sessionMeta?.total ?? 0) === 0;
++
++/** Whether a session, or any session it started (recursively), is in `activeIds`. */
++export const hasActiveSessionInFamily = (
++  session: Pick<ProjectSession, 'id' | 'childSessions'>,
++  activeIds: ReadonlySet<string>,
++): boolean => {
++  const pending = [session];
++  const seen = new Set<string>();
++  while (pending.length) {
++    const current = pending.pop()!;
++    if (seen.has(String(current.id))) continue;
++    seen.add(String(current.id));
++    if (activeIds.has(String(current.id))) return true;
++    pending.push(...(current.childSessions ?? []));
++  }
++  return false;
++};
++
+ export const filterProjects = (projects: Project[], searchFilter: string): Project[] => {
+   const normalizedSearch = searchFilter.trim().toLowerCase();
+   if (!normalizedSearch) {
+diff --git a/src/shared/types.ts b/src/shared/types.ts
+index 7a1e6066..4ab1f7f0 100644
+--- a/src/shared/types.ts
++++ b/src/shared/types.ts
+@@ -100,6 +100,14 @@ export type ProjectSession = {
+   forkedFromSessionId?: string | null;
+   /** Ancestor context for Projects only; excluded from pagination and the Conversations feed. */
+   forkAncestors?: ProjectSession[];
++  /**
++   * App id of the active session this one is nested under (the session that
++   * started it). Such a session is listed only under that parent, never in its
++   * own project's list; null/absent otherwise.
++   */
++  parentSessionId?: string | null;
++  /** Active sessions this one started, possibly in other projects and on other providers. */
++  childSessions?: ChildSessionSummary[];
+   provider?: LLMProvider;
+   __provider?: LLMProvider;
+   // Tags the session with the owning project's DB `projectId` so UI handlers
+@@ -108,6 +116,24 @@ export type ProjectSession = {
+   [key: string]: unknown;
+ };
+ 
++/**
++ * One session started by another, as the server nests it under its parent.
++ * Carries its own provider and project because children often run in another
++ * project (a git worktree) and on another provider than their parent.
++ */
++export type ChildSessionSummary = {
++  id: string;
++  provider: LLMProvider;
++  summary: string;
++  lastActivity: string;
++  createdAt?: string;
++  projectId: string | null;
++  projectPath: string | null;
++  parentSessionId: string;
++  forkedFromSessionId?: string | null;
++  childSessions?: ChildSessionSummary[];
++};
++
+ /** Pagination metadata returned alongside a project's session page. */
+ type ProjectSessionMeta = {
+   total?: number;
+@@ -138,6 +164,11 @@ export type Project = {
+   worktreeOf?: string | null;
+   sessions?: ProjectSession[];
+   sessionMeta?: ProjectSessionMeta;
++  /**
++   * Active sessions of this project listed under a parent session instead of
++   * here. A project with these and no sessions of its own is not listed.
++   */
++  childSessionCount?: number;
+   taskmaster?: ProjectTaskmasterInfo;
+   [key: string]: unknown;
+ };
+@@ -1755,6 +1786,8 @@ export type SessionWithProvider = ProjectSession & {
+ export type ArchivedSessionListItem = {
+   sessionId: string;
+   provider: LLMProvider;
++  /** Stored parent session id, if this session was started by another. */
++  parentSessionId?: string | null;
+   projectId: string | null;
+   projectPath: string | null;
+   projectDisplayName: string;
+@@ -1772,7 +1805,7 @@ export type RecentConversationListItem = Pick<
+ >;
+ 
+ /** Pin summaries include canonical ancestry so Projects can attach forks outside the loaded page. */
+-export type PinnedConversationListItem = RecentConversationListItem & Pick<ProjectSession, 'forkedFromSessionId' | 'forkAncestors'>;
++export type PinnedConversationListItem = RecentConversationListItem & Pick<ProjectSession, 'forkedFromSessionId' | 'forkAncestors' | 'parentSessionId'>;
+ 
+ /**
+  * The rename the sidebar currently has open, if any.
+-- 
+2.53.0
+

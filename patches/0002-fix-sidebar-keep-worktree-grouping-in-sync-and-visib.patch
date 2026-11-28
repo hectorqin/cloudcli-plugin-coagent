@@ -1,8 +1,8 @@
-From 16e603c29ef249804ac8343cf6d1ddf9eb0ae6f6 Mon Sep 17 00:00:00 2001
+From 13a4f0af6c421c5884d6091ba57f82351cfd9575 Mon Sep 17 00:00:00 2001
 From: hectorqin <14220132+hectorqin@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 08:07:54 +0000
-Subject: [PATCH 04/13] fix(sidebar): keep worktree grouping in sync and
- visible in compact layout
+Subject: [PATCH 2/7] fix(sidebar): keep worktree grouping in sync and visible
+ in compact layout
 
 - compare worktreeOf when deciding whether a project refresh changed
   anything, so a project whose parent resolves later is regrouped

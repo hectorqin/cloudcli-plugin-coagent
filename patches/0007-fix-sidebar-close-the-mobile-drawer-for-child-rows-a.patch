@@ -1,0 +1,327 @@
+From e19898b48f6624811f1526670793305a95da9d6a Mon Sep 17 00:00:00 2001
+From: hectorqin <14220132+hectorqin@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 03:39:10 +0000
+Subject: [PATCH 7/7] fix(sidebar): close the mobile drawer for child rows and
+ mark their background work
+
+Tapping a child that runs in the already-selected project left the
+mobile drawer open, because only a project change closed it and child
+rows must not select the listing project. Session picks now take a
+closeSidebar option, which compact child rows pass; the chosen session
+is kept.
+
+A child whose turn ended but whose background work still runs showed
+only its age and looked finished; it now shows the background-work
+indicator and tooltip normal rows use.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../hooks/useProjectsState.ts                 |  7 +++--
+ .../tests/projectsStateChildSessions.test.ts  | 21 ++++++++++++++
+ src/modules/sidebar/Sidebar.tsx               |  4 +--
+ .../sidebar/SidebarChildSessionItem.tsx       | 22 ++++++++++++---
+ src/modules/sidebar/SidebarProjectItem.tsx    |  4 +--
+ .../sidebar/SidebarProjectSessions.tsx        |  4 +--
+ .../sidebar/hooks/useSidebarController.ts     |  8 +++---
+ .../sidebar/tests/childSessionsView.test.tsx  | 28 ++++++++++++++++++-
+ src/shared/types.ts                           | 12 +++++++-
+ 9 files changed, 91 insertions(+), 19 deletions(-)
+
+diff --git a/src/modules/project-workspace/hooks/useProjectsState.ts b/src/modules/project-workspace/hooks/useProjectsState.ts
+index 565e5eb5..bb6415ba 100644
+--- a/src/modules/project-workspace/hooks/useProjectsState.ts
++++ b/src/modules/project-workspace/hooks/useProjectsState.ts
+@@ -7,7 +7,8 @@ import type { ServerEvent,
+   LLMProvider,
+   LoadingProgress,
+   Project,
+-  ProjectSession,IsSessionProcessing } from '@/shared/types';
++  ProjectSession,
++  SessionSelectOptions,IsSessionProcessing } from '@/shared/types';
+ import {
+   removeChildSession,
+   renameChildSession,
+@@ -1091,7 +1092,7 @@ export function useProjectsState({
+   );
+ 
+   const handleSessionSelect = useCallback(
+-    (session: ProjectSession) => {
++    (session: ProjectSession, options?: SessionSelectOptions) => {
+       clearSessionAttention(session.id);
+       setSelectedSession(session);
+ 
+@@ -1107,7 +1108,7 @@ export function useProjectsState({
+         const sessionProjectId = session.__projectId;
+         const currentProjectId = selectedProject?.projectId;
+ 
+-        if (sessionProjectId !== currentProjectId) {
++        if (options?.closeSidebar || sessionProjectId !== currentProjectId) {
+           setSidebarOpen(false);
+         }
+       }
+diff --git a/src/modules/project-workspace/tests/projectsStateChildSessions.test.ts b/src/modules/project-workspace/tests/projectsStateChildSessions.test.ts
+index 5a241130..bea7a6a9 100644
+--- a/src/modules/project-workspace/tests/projectsStateChildSessions.test.ts
++++ b/src/modules/project-workspace/tests/projectsStateChildSessions.test.ts
+@@ -108,3 +108,24 @@ test('opening a child selects its own project, even one the sidebar does not lis
+   assert.equal(result.current.selectedSession?.__provider, 'codex');
+   assert.deepEqual(mocks.sessionDetails.mock.calls, [['coder']]);
+ });
++
++test('on mobile, opening a same-project child closes the drawer and keeps the chosen session', async () => {
++  mocks.projects.mockResolvedValue({ ok: true, json: async () => [acme, worktree] });
++  const navigate = vi.fn();
++  const { result } = renderHook(() => useProjectsState({
++    sessionId: undefined, navigate, subscribe, isMobile: true, isSessionProcessing: () => false,
++  }));
++  await waitFor(() => assert.equal(result.current.projects.length, 2));
++  act(() => result.current.handleProjectSelect(result.current.projects[0]));
++  act(() => result.current.setSidebarOpen(true));
++
++  const reviewer: ProjectSession = { id: 'reviewer', summary: 'reviewer', __provider: 'claude', __projectId: 'acme' };
++  act(() => result.current.handleSessionSelect(reviewer));
++  assert.equal(result.current.sidebarOpen, true, 'a plain same-project pick leaves the drawer as it was');
++
++  act(() => result.current.handleSessionSelect(reviewer, { closeSidebar: true }));
++  assert.equal(result.current.sidebarOpen, false);
++  assert.equal(result.current.selectedSession?.id, 'reviewer');
++  assert.equal(result.current.selectedProject?.projectId, 'acme');
++  assert.deepEqual(navigate.mock.calls.at(-1), ['/session/reviewer']);
++});
+diff --git a/src/modules/sidebar/Sidebar.tsx b/src/modules/sidebar/Sidebar.tsx
+index b17c09bc..97c5a69f 100644
+--- a/src/modules/sidebar/Sidebar.tsx
++++ b/src/modules/sidebar/Sidebar.tsx
+@@ -8,7 +8,7 @@ import { useSidebarController } from '@/modules/sidebar/hooks/useSidebarControll
+ import { useTaskMaster, useTasksSettings } from '@/modules/task-master';
+ import { usePaletteOps } from '@/modules/command-palette';
+ import { useBackgroundSessionIdSet, useBusySessionIdSet } from '@/shared/context/SessionProtectionContext';
+-import type { LLMProvider, LoadingProgress, MCPServerStatus, Project, ProjectSession, SidebarProjectListProps } from '@/shared/types';
++import type { LLMProvider, LoadingProgress, MCPServerStatus, Project, ProjectSession, SessionSelectOptions, SidebarProjectListProps } from '@/shared/types';
+ import SidebarCollapsed from '@/modules/sidebar/SidebarCollapsed';
+ import SidebarContent from '@/modules/sidebar/SidebarContent';
+ import SidebarModals from '@/modules/sidebar/SidebarModals';
+@@ -20,7 +20,7 @@ type SidebarProps = {
+   selectedSession: ProjectSession | null;
+   attentionSessionIds: ReadonlySet<string>;
+   onProjectSelect: (project: Project) => void;
+-  onSessionSelect: (session: ProjectSession) => void;
++  onSessionSelect: (session: ProjectSession, options?: SessionSelectOptions) => void;
+   onNewSession: (project: Project) => void;
+   onSessionDelete?: (sessionId: string) => void;
+   onLoadMoreSessions?: (projectId: string) => Promise<void> | void;
+diff --git a/src/modules/sidebar/SidebarChildSessionItem.tsx b/src/modules/sidebar/SidebarChildSessionItem.tsx
+index 1eeea27c..e024d6d2 100644
+--- a/src/modules/sidebar/SidebarChildSessionItem.tsx
++++ b/src/modules/sidebar/SidebarChildSessionItem.tsx
+@@ -4,7 +4,7 @@ import type { TFunction } from 'i18next';
+ 
+ import { LLMProviderLogo, Tooltip, buttonVariants } from '@/shared/ui';
+ import { cn } from '@/shared/utils';
+-import type { ProjectSession, SessionWithProvider } from '@/shared/types';
++import type { ProjectSession, SessionSelectOptions, SessionWithProvider } from '@/shared/types';
+ import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
+ import { PROVIDER_LABELS, createSessionViewModel, formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
+ 
+@@ -17,8 +17,12 @@ type SidebarChildSessionItemProps = {
+   /** The turn ended but work it launched still runs. */
+   hasBackgroundWork: boolean;
+   currentTime: Date;
+-  /** Opens the session; the second argument is the projectId the session belongs to, which may not be the listing project. */
+-  onSessionSelect: (session: SessionWithProvider, projectId: string) => void;
++  /**
++   * Opens the session; the second argument is the projectId the session
++   * belongs to, which may not be the listing project. The compact layout asks
++   * for the drawer to close, as a normal row does by selecting its project.
++   */
++  onSessionSelect: (session: SessionWithProvider, projectId: string, options?: SessionSelectOptions) => void;
+   t: TFunction;
+ };
+ 
+@@ -46,6 +50,10 @@ function SidebarChildSessionItem({
+   const age = formatCompactAge(sessionView.sessionTime, currentTime);
+   const projectPath = typeof session.projectPath === 'string' ? session.projectPath : '';
+   const providerLabel = PROVIDER_LABELS[session.__provider] ?? session.__provider;
++  // The turn ended but work it launched still runs: not done, so not muted,
++  // and marked the way normal session rows mark it.
++  const showBackgroundIndicator = hasBackgroundWork && !isProcessing;
++  const backgroundLabel = t('tooltips.backgroundWorkIndicator', { defaultValue: 'Background work running' });
+ 
+   return (
+     <a
+@@ -65,7 +73,7 @@ function SidebarChildSessionItem({
+       onClick={(event) => {
+         if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+         event.preventDefault();
+-        onSessionSelect(session, session.__projectId ?? '');
++        onSessionSelect(session, session.__projectId ?? '', isCompact ? { closeSidebar: true } : undefined);
+       }}
+     >
+       <div className="flex w-full min-w-0 items-center gap-1.5">
+@@ -91,6 +99,12 @@ function SidebarChildSessionItem({
+               <Loader2 className="h-3 w-3 animate-spin" />
+             </span>
+           </Tooltip>
++        ) : showBackgroundIndicator ? (
++          <Tooltip content={backgroundLabel} position="top">
++            <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center" data-child-session-background="">
++              <span role="status" aria-label={backgroundLabel} className="h-2 w-2 animate-pulse rounded-full bg-purple-500 dark:bg-purple-400" />
++            </span>
++          </Tooltip>
+         ) : age ? (
+           <span className="ml-auto flex-shrink-0 text-[11px] text-muted-foreground">{age}</span>
+         ) : null}
+diff --git a/src/modules/sidebar/SidebarProjectItem.tsx b/src/modules/sidebar/SidebarProjectItem.tsx
+index 6c7775a2..d3275032 100644
+--- a/src/modules/sidebar/SidebarProjectItem.tsx
++++ b/src/modules/sidebar/SidebarProjectItem.tsx
+@@ -4,7 +4,7 @@ import type { TFunction } from 'i18next';
+ 
+ import { Button } from '@/shared/ui';
+ import { cn } from '@/shared/utils';
+-import type { LLMProvider, MCPServerStatus, Project, ProjectSession, SessionWithProvider, SidebarSessionSelection } from '@/shared/types';
++import type { LLMProvider, MCPServerStatus, Project, ProjectSession, SessionSelectOptions, SessionWithProvider, SidebarSessionSelection } from '@/shared/types';
+ import { getTaskIndicatorStatus } from '@/modules/sidebar/utils/sidebarProjectFormatting';
+ import TaskIndicator from '@/modules/sidebar/TaskIndicator';
+ import SidebarProjectSessions from '@/modules/sidebar/SidebarProjectSessions';
+@@ -38,7 +38,7 @@ type SidebarProjectItemProps = {
+   onCancelEditingProject: () => void;
+   onSaveProjectName: (projectId: string, nextName: string) => void;
+   onDeleteProject: (project: Project) => void;
+-  onSessionSelect: (session: SessionWithProvider, projectName: string) => void;
++  onSessionSelect: (session: SessionWithProvider, projectName: string, options?: SessionSelectOptions) => void;
+   onArchiveSession: (sessionId: string) => void;
+   onDeleteSession: (sessionId: string, sessionTitle: string) => void;
+   onForkSession?: (session: SessionWithProvider) => void;
+diff --git a/src/modules/sidebar/SidebarProjectSessions.tsx b/src/modules/sidebar/SidebarProjectSessions.tsx
+index 2ad4599a..f29e4fdc 100644
+--- a/src/modules/sidebar/SidebarProjectSessions.tsx
++++ b/src/modules/sidebar/SidebarProjectSessions.tsx
+@@ -4,7 +4,7 @@ import type { TFunction } from 'i18next';
+ 
+ import { Button } from '@/shared/ui';
+ import { cn } from '@/shared/utils';
+-import type { LLMProvider, Project, ProjectSession, SessionWithProvider, SidebarSessionSelection } from '@/shared/types';
++import type { LLMProvider, Project, ProjectSession, SessionSelectOptions, SessionWithProvider, SidebarSessionSelection } from '@/shared/types';
+ import SidebarChildSessionItem from '@/modules/sidebar/SidebarChildSessionItem';
+ import SidebarSessionItem from '@/modules/sidebar/SidebarSessionItem';
+ import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
+@@ -35,7 +35,7 @@ type SidebarProjectSessionsProps = {
+   onCancelEditingSession: () => void;
+   onSaveEditingSession: (projectName: string, sessionId: string, summary: string, provider: LLMProvider) => void;
+   onProjectSelect: (project: Project) => void;
+-  onSessionSelect: (session: SessionWithProvider, projectName: string) => void;
++  onSessionSelect: (session: SessionWithProvider, projectName: string, options?: SessionSelectOptions) => void;
+   onArchiveSession: (sessionId: string) => void;
+   onDeleteSession: (sessionId: string, sessionTitle: string) => void;
+   onForkSession?: (session: SessionWithProvider) => void;
+diff --git a/src/modules/sidebar/hooks/useSidebarController.ts b/src/modules/sidebar/hooks/useSidebarController.ts
+index c87c511f..115f1009 100644
+--- a/src/modules/sidebar/hooks/useSidebarController.ts
++++ b/src/modules/sidebar/hooks/useSidebarController.ts
+@@ -4,7 +4,7 @@ import type { TFunction } from 'i18next';
+ import { api } from '@/shared/api';
+ import { subscribeToUserPreferences } from '@/shared/userSettings';
+ import { usePaletteOps } from '@/modules/command-palette';
+-import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationProjectResult, ConversationSearchResults, LLMProvider, Project, ProjectSession, ProjectSortOrder, RecentConversationListItem, SearchProgress, ActiveSidebarRename, PendingSidebarDeletion, SessionTitleSearchResult, SessionWithProvider, SidebarSearchMode, SidebarSessionSelection } from '@/shared/types';
++import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationProjectResult, ConversationSearchResults, LLMProvider, Project, ProjectSession, ProjectSortOrder, RecentConversationListItem, SearchProgress, ActiveSidebarRename, PendingSidebarDeletion, SessionSelectOptions, SessionTitleSearchResult, SessionWithProvider, SidebarSearchMode, SidebarSessionSelection } from '@/shared/types';
+ import {
+   filterProjects,
+   getAllSessions,
+@@ -68,7 +68,7 @@ type UseSidebarControllerArgs = {
+   t: TFunction;
+   onRefresh: () => Promise<void> | void;
+   onProjectSelect: (project: Project) => void;
+-  onSessionSelect: (session: ProjectSession) => void;
++  onSessionSelect: (session: ProjectSession, options?: SessionSelectOptions) => void;
+   onSessionDelete?: (sessionId: string) => void;
+   onLoadMoreSessions?: (projectId: string) => Promise<void> | void;
+   // `projectId` is the DB-assigned identifier; callbacks use that post-migration.
+@@ -640,10 +640,10 @@ export function useSidebarController({
+   );
+ 
+   const handleSessionClick = useCallback(
+-    (session: SessionWithProvider, projectId: string) => {
++    (session: SessionWithProvider, projectId: string, options?: SessionSelectOptions) => {
+       // Tag the session with its owning projectId so downstream handlers
+       // can correlate it with the selectedProject in the app state.
+-      onSessionSelect({ ...session, __projectId: projectId });
++      onSessionSelect({ ...session, __projectId: projectId }, options);
+     },
+     [onSessionSelect],
+   );
+diff --git a/src/modules/sidebar/tests/childSessionsView.test.tsx b/src/modules/sidebar/tests/childSessionsView.test.tsx
+index 93864792..732e1c76 100644
+--- a/src/modules/sidebar/tests/childSessionsView.test.tsx
++++ b/src/modules/sidebar/tests/childSessionsView.test.tsx
+@@ -1,6 +1,6 @@
+ import assert from 'node:assert/strict';
+ 
+-import { fireEvent, render, screen } from '@testing-library/react';
++import { fireEvent, render, screen, within } from '@testing-library/react';
+ import type { ComponentProps } from 'react';
+ import type { TFunction } from 'i18next';
+ import { test, vi } from 'vitest';
+@@ -108,3 +108,29 @@ test('the selected child is highlighted and revealed under a collapsed parent',
+   assert.equal(link.getAttribute('aria-current'), 'page');
+   assert.doesNotMatch(link.className, /opacity-60/);
+ });
++
++test.each([false, true])('opening a child asks the mobile drawer to close only in compact=%s', (isCompact) => {
++  compact.value = isCompact;
++  const select = vi.fn();
++  render(<SidebarProjectSessions {...props({ onSessionSelect: select })} />);
++  // `reviewer` runs in the listing project itself: the drawer would otherwise stay open.
++  fireEvent.click(screen.getByText('reviewer-c38d53'));
++  const [opened, projectId, options] = select.mock.calls[0];
++  assert.equal(opened.id, 'reviewer');
++  assert.equal(projectId, 'acme');
++  assert.deepEqual(options, isCompact ? { closeSidebar: true } : undefined);
++});
++
++test('a child whose turn ended but whose background work still runs shows the background indicator, not an age', () => {
++  compact.value = false;
++  const { container } = render(<SidebarProjectSessions {...props({
++    activeSessions: new Set(['reviewer']), backgroundSessionIds: new Set(['reviewer']),
++  })} />);
++  const link = container.querySelector('[data-child-session-id="reviewer"]')!;
++  assert.equal(link.getAttribute('data-child-session-state'), 'running');
++  assert.doesNotMatch(link.className, /opacity-60/);
++  assert.equal(link.querySelector('[data-child-session-running]'), null, 'no spinner: no turn is in flight');
++  assert.ok(link.querySelector('[data-child-session-background]'));
++  assert.equal(within(link as HTMLElement).getByRole('status').getAttribute('aria-label'), 'tooltips.backgroundWorkIndicator');
++  assert.ok(!link.textContent?.includes('20m'), 'the age is replaced by the indicator');
++});
+diff --git a/src/shared/types.ts b/src/shared/types.ts
+index 4ab1f7f0..7084d091 100644
+--- a/src/shared/types.ts
++++ b/src/shared/types.ts
+@@ -1743,7 +1743,7 @@ export type SidebarProjectListProps = SessionRowActions & {
+   onCancelEditingProject: () => void;
+   onSaveProjectName: (projectId: string, nextName: string) => void;
+   onDeleteProject: (project: Project) => void;
+-  onSessionSelect: (session: SessionWithProvider, projectName: string) => void;
++  onSessionSelect: (session: SessionWithProvider, projectName: string, options?: SessionSelectOptions) => void;
+   onNewSession: (project: Project) => void;
+   /** The project whose session list is in bulk-selection mode and the rows ticked in it, or null while no list is selecting. */
+   sessionSelection: SidebarSessionSelection | null;
+@@ -1778,6 +1778,16 @@ export type SidebarSearchMode = 'projects' | 'conversations' | 'running' | 'arch
+ export type ArchivedProjectListItem = Project & { isArchived: true };
+ 
+ /** A ProjectSession whose LLM provider has been resolved into the required __provider field, so list rendering never has to re-derive it. */
++/**
++ * How a sidebar pick should open a session. `closeSidebar` closes the mobile
++ * drawer even when the session belongs to the project already selected —
++ * normal rows get that from selecting their project first, which a child row
++ * (listed under a parent, often in another project) must not do.
++ */
++export type SessionSelectOptions = {
++  closeSidebar?: boolean;
++};
++
+ export type SessionWithProvider = ProjectSession & {
+   __provider: LLMProvider;
+ };
+-- 
+2.53.0
+

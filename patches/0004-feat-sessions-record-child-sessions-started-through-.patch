@@ -1,0 +1,1271 @@
+From c3951ced53c5dfbf51d2f6143546201861b67b12 Mon Sep 17 00:00:00 2001
+From: hectorqin <14220132+hectorqin@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 03:22:05 +0000
+Subject: [PATCH 4/7] feat(sessions): record child sessions started through the
+ Agent API
+
+Add a nullable sessions.parent_session_id (idempotent migration plus
+index), separate from fork lineage, so an orchestrator's worker sessions
+can be nested under the session that started them across projects and
+providers.
+
+- POST /api/agent accepts parentSessionId (app or provider id). It is
+  stored on a new session; an unknown id is a 400. On continuation it may
+  be omitted, but a different parent (or the session itself) is a 400:
+  the parent is fixed at creation.
+- GET /api/agent/capabilities reports childSessions: true.
+- Project session pages leave out children attached to an active parent
+  and list them in the parent's childSessions (recursive, with their own
+  provider, title, activity and project); projects report
+  childSessionCount. session_upserted, pinned and archived lists carry
+  parentSessionId. A fork of a child inherits its parent.
+- Synchronizer upserts never write parent_session_id.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ public/api-docs.html                          |   6 +
+ server/modules/agent/agent.module.ts          |   4 +-
+ server/modules/agent/agent.routes.ts          |  51 ++++-
+ .../modules/agent/tests/agent.routes.test.ts  | 104 +++++++++++
+ server/modules/database/migrations.ts         |  14 ++
+ .../database/repositories/session-pins.db.ts  |   1 +
+ .../database/repositories/sessions.db.ts      | 176 +++++++++++++++++-
+ server/modules/database/schema.ts             |   6 +
+ .../sessions-parent.db.integration.test.ts    | 137 ++++++++++++++
+ .../projects-with-sessions-fetch.service.ts   |  34 +++-
+ .../tests/project-child-sessions.test.ts      | 115 ++++++++++++
+ .../providers/services/sessions.service.ts    |  13 +-
+ .../provider-token-usage.service.test.ts      |   1 +
+ .../providers/tests/session-fork.test.ts      |  15 +-
+ .../session-upsert-broadcast.service.ts       |   4 +
+ .../tests/session-upsert-broadcast.test.ts    |  28 ++-
+ server/shared/index.ts                        |   4 +-
+ server/shared/types.ts                        |  31 +++
+ 18 files changed, 720 insertions(+), 24 deletions(-)
+ create mode 100644 server/modules/database/tests/sessions-parent.db.integration.test.ts
+ create mode 100644 server/modules/projects/tests/project-child-sessions.test.ts
+
+diff --git a/public/api-docs.html b/public/api-docs.html
+index a46de874..47c76b2b 100644
+--- a/public/api-docs.html
++++ b/public/api-docs.html
+@@ -558,6 +558,12 @@
+                                         <td><span class="badge badge-optional">Optional</span></td>
+                                         <td>How the run's tool calls are approved (default: <code>bypassPermissions</code>). Claude: <code>bypassPermissions</code>, <code>default</code>, <code>acceptEdits</code>, <code>plan</code>. Codex: <code>bypassPermissions</code>, <code>acceptEdits</code> (runs sandboxed to the workspace without approval requests). OpenCode: <code>bypassPermissions</code>, <code>default</code>. Cursor: <code>bypassPermissions</code> only. Claude <code>default</code>/<code>acceptEdits</code> and OpenCode <code>default</code> show approval requests in the session's tab. <code>GET /api/agent/capabilities</code> lists what this server accepts.</td>
+                                     </tr>
++                                    <tr>
++                                        <td><code>parentSessionId</code></td>
++                                        <td>string</td>
++                                        <td><span class="badge badge-optional">Optional</span></td>
++                                        <td>The session that starts this one, by app or provider-native id (for example an orchestrator's lead session starting a worker). The UI lists the new session under that parent in the sidebar, even when it runs in another project or on another provider, and stops listing a project on its own when all its sessions are such children. Recorded only when a new session is created and cannot change later: an unknown id returns <code>400</code>, and when continuing a session with <code>sessionId</code> it may be omitted, but if given it must name the parent the session was created with (otherwise <code>400</code>). <code>GET /api/agent/capabilities</code> reports <code>childSessions: true</code> when this server accepts it.</td>
++                                    </tr>
+                                     <tr>
+                                         <td><code>cleanup</code></td>
+                                         <td>boolean</td>
+diff --git a/server/modules/agent/agent.module.ts b/server/modules/agent/agent.module.ts
+index aa8bbfdb..61a848f0 100644
+--- a/server/modules/agent/agent.module.ts
++++ b/server/modules/agent/agent.module.ts
+@@ -52,8 +52,8 @@ export function createAgentModule(externalDependencies: AgentExternalDependencie
+     sessions: {
+       getSessionById: (sessionId) => sessionsDb.getSessionById(sessionId),
+       getSessionByProviderSessionId: (providerSessionId) => sessionsDb.getSessionByProviderSessionId(providerSessionId),
+-      createAppSession: (provider, projectPath, initialMessage) =>
+-        sessionsService.createAppSession(provider as LLMProvider, projectPath, initialMessage),
++      createAppSession: (provider, projectPath, initialMessage, options) =>
++        sessionsService.createAppSession(provider as LLMProvider, projectPath, initialMessage, options),
+     },
+     runs: chatRunRegistry,
+     GithubClient: Octokit,
+diff --git a/server/modules/agent/agent.routes.ts b/server/modules/agent/agent.routes.ts
+index f8442773..8916160b 100644
+--- a/server/modules/agent/agent.routes.ts
++++ b/server/modules/agent/agent.routes.ts
+@@ -35,6 +35,8 @@ type AgentSessionRow = {
+   provider: string;
+   provider_session_id: string | null;
+   project_path: string | null;
++  /** The session that started this one, set once at creation; see `parentSessionId` on POST /api/agent. */
++  parent_session_id: string | null;
+ };
+ 
+ type AgentRouterDependencies = {
+@@ -52,7 +54,12 @@ type AgentRouterDependencies = {
+   sessions: {
+     getSessionById(sessionId: string): AgentSessionRow | null;
+     getSessionByProviderSessionId(providerSessionId: string): AgentSessionRow | null;
+-    createAppSession(provider: string, projectPath: string, initialMessage: string): { sessionId: string };
++    createAppSession(
++      provider: string,
++      projectPath: string,
++      initialMessage: string,
++      options?: { parentSessionId?: string | null },
++    ): { sessionId: string };
+   };
+   /** The live-run registry the chat socket uses; registering here is what puts an API run on the running-sessions list. */
+   runs: Pick<typeof import('../websocket/index.js').chatRunRegistry, 'startRun' | 'completeRunIfCurrent' | 'isProcessing'>;
+@@ -663,6 +670,15 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
+    *                             A session already mid-run is refused (409); an unknown id, 404.
+    *                             Omitted: a new session is created for the run.
+    *
++   * @param {string} parentSessionId - (Optional) The session that starts this one, by app or
++   *                             provider-native id (resolved like `sessionId`), e.g. an
++   *                             orchestrator's lead session starting a worker. The UI nests the new
++   *                             session under it in the sidebar, even when it runs in another project
++   *                             or on another provider. Recorded only when a new session is created;
++   *                             it cannot be changed later. Unknown id: 400.
++   *                             When continuing (`sessionId` given) it may be omitted; if given it must
++   *                             name the parent the session was created with, otherwise 400.
++   *
+    * @param {string} model - (Optional) Model identifier for providers.
+    *                        Omitted: the provider's catalog DEFAULT from GET /api/providers/:provider/models,
+    *                        which is the first custom model while "Use only my models" is on. Cursor
+@@ -802,6 +818,8 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
+    *   - provider must be 'claude', 'cursor', 'codex', or 'opencode'
+    *   - createBranch/createPR requires githubUrl OR projectPath (not neither)
+    *   - branchName must pass Git naming rules (if provided)
++   *   - parentSessionId must name an existing session, and on a continued session the one it was
++   *     created with (a session cannot be its own parent)
+    *
+    * Runtime Validations (500 Internal Server Error or specific error in response):
+    *   - projectPath must exist (if used alone)
+@@ -903,7 +921,7 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
+    * probing with failing requests. Same API-key authentication as POST /api/agent.
+    */
+   router.get('/capabilities', validateExternalApiKey, (_req, res) => {
+-    res.json({ permissionModes: AGENT_PERMISSION_MODES, unattended: true, sessionStatus: true });
++    res.json({ permissionModes: AGENT_PERMISSION_MODES, unattended: true, sessionStatus: true, childSessions: true });
+   });
+ 
+   /**
+@@ -934,6 +952,12 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
+       return res.status(400).json({ error: 'sessionId must be a string' });
+     }
+     const sessionId = typeof req.body.sessionId === 'string' && req.body.sessionId.trim() ? req.body.sessionId.trim() : null;
++    if (req.body.parentSessionId !== undefined && req.body.parentSessionId !== null && typeof req.body.parentSessionId !== 'string') {
++      return res.status(400).json({ error: 'parentSessionId must be a string' });
++    }
++    const parentSessionId = typeof req.body.parentSessionId === 'string' && req.body.parentSessionId.trim()
++      ? req.body.parentSessionId.trim()
++      : null;
+     const requestedProvider = req.body.provider === undefined || req.body.provider === null ? null : req.body.provider;
+     const effort = typeof req.body.effort === 'string' && req.body.effort.trim()
+       ? req.body.effort.trim()
+@@ -990,6 +1014,25 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
+         return res.status(409).json({ error: `Session "${sessionRow.session_id}" already has a run in progress` });
+       }
+     }
++    // The parent is resolved like `sessionId` and stored by its app id. It is
++    // fixed when the session is created: a continuation may repeat it, but a
++    // different one is refused rather than ignored, so a caller that mixed up
++    // its sessions finds out instead of seeing the tree silently disagree.
++    let parentRow = null;
++    if (parentSessionId) {
++      parentRow = sessionGateway.getSessionById(parentSessionId) ?? sessionGateway.getSessionByProviderSessionId(parentSessionId);
++      if (!parentRow) {
++        return res.status(400).json({ error: `parentSessionId "${parentSessionId}" was not found` });
++      }
++      if (sessionRow && parentRow.session_id === sessionRow.session_id) {
++        return res.status(400).json({ error: 'A session cannot be its own parent' });
++      }
++      if (sessionRow && parentRow.session_id !== (sessionRow.parent_session_id ?? null)) {
++        return res.status(400).json({
++          error: `Session "${sessionRow.session_id}" was created with ${sessionRow.parent_session_id ? `parent "${sessionRow.parent_session_id}"` : 'no parent'}; parentSessionId cannot change`,
++        });
++      }
++    }
+     const provider = sessionRow?.provider ?? requestedProvider ?? 'claude';
+     const allowedPermissionModes = AGENT_PERMISSION_MODES[provider] ?? ['bypassPermissions'];
+     const requestedPermissionMode = req.body.permissionMode ?? null;
+@@ -1058,7 +1101,9 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
+       // the provider-native id is mapped onto it when the runtime announces it.
+       const appSessionId = sessionRow
+         ? sessionRow.session_id
+-        : sessionGateway.createAppSession(provider, finalProjectPath, message.trim()).sessionId;
++        : sessionGateway.createAppSession(provider, finalProjectPath, message.trim(), {
++          parentSessionId: parentRow?.session_id ?? null,
++        }).sessionId;
+ 
+       // Registered before any header goes out, so a session already mid-run
+       // is refused with a plain 409 rather than an empty stream. The HTTP
+diff --git a/server/modules/agent/tests/agent.routes.test.ts b/server/modules/agent/tests/agent.routes.test.ts
+index aae38d4b..5f6f649e 100644
+--- a/server/modules/agent/tests/agent.routes.test.ts
++++ b/server/modules/agent/tests/agent.routes.test.ts
+@@ -444,6 +444,7 @@ test('Agent route reads no model catalog for a continued session of an unregiste
+         provider: 'gemini',
+         provider_session_id: null,
+         project_path: '/home/test/project',
++        parent_session_id: null,
+       }),
+       getSessionByProviderSessionId: () => null,
+       createAppSession: () => { throw new Error('a continued session must not create a row'); },
+@@ -545,3 +546,106 @@ test('Agent route enforces an explicitly requested Claude mode and leaves the im
+   assert.equal(implicit.permissionMode, 'bypassPermissions');
+   assert.equal(implicit.enforcePermissionMode, false);
+ });
++
++test('Agent capabilities advertise child sessions', async () => {
++  await withAgentServer(createDependencies(), async (baseUrl) => {
++    const body = await (await fetch(`${baseUrl}/api/agent/capabilities`)).json() as { childSessions?: boolean };
++    assert.equal(body.childSessions, true);
++  });
++});
++
++/** A session table stand-in for the parentSessionId tests: rows by app id, also reachable by provider id. */
++function childSessionDependencies(rows: Array<{ session_id: string; provider_session_id: string | null; provider: string; project_path: string; parent_session_id: string | null }>) {
++  const created: Array<{ provider: string; projectPath: string; parentSessionId: string | null | undefined }> = [];
++  const runs: string[] = [];
++  const dependencies = createDependencies({
++    fileSystem: { access: async () => undefined } as unknown as AgentDependencies['fileSystem'],
++    models: {
++      getProviderModels: async (provider: string) => ({ OPTIONS: [], DEFAULT: `${provider}-default` }),
++    } as unknown as AgentDependencies['models'],
++    sessions: {
++      getSessionById: (id: string) => rows.find((row) => row.session_id === id) ?? null,
++      getSessionByProviderSessionId: (id: string) => rows.find((row) => row.provider_session_id === id) ?? null,
++      createAppSession: (provider: string, projectPath: string, _message: string, options?: { parentSessionId?: string | null }) => {
++        created.push({ provider, projectPath, parentSessionId: options?.parentSessionId });
++        return { sessionId: 'new-child' };
++      },
++    },
++    queryCodex: (async () => { runs.push('codex'); }) as unknown as AgentDependencies['queryCodex'],
++    queryClaude: (async () => { runs.push('claude'); }) as unknown as AgentDependencies['queryClaude'],
++  });
++  return { dependencies, created, runs };
++}
++
++const LEAD_ROW = { session_id: 'lead-app', provider_session_id: 'lead-native', provider: 'claude', project_path: '/home/test/app', parent_session_id: null };
++const CHILD_ROW = { session_id: 'child-app', provider_session_id: 'child-native', provider: 'codex', project_path: '/home/test/app-worktree', parent_session_id: 'lead-app' };
++
++async function postAgent(baseUrl: string, body: Record<string, unknown>) {
++  const response = await fetch(`${baseUrl}/api/agent`, {
++    method: 'POST',
++    headers: { 'content-type': 'application/json' },
++    body: JSON.stringify({ message: 'Run', stream: false, ...body }),
++  });
++  return { status: response.status, body: await response.json() as { error?: string } };
++}
++
++test('Agent route stores the resolved app id of parentSessionId on a new session in another project and provider', async () => {
++  const { dependencies, created, runs } = childSessionDependencies([LEAD_ROW]);
++  await withAgentServer(dependencies, async (baseUrl) => {
++    // Named by its provider-native id; stored by its app id.
++    const result = await postAgent(baseUrl, { projectPath: '/home/test/app-worktree', provider: 'codex', parentSessionId: 'lead-native' });
++    assert.equal(result.status, 200);
++  });
++  assert.deepEqual(created, [{ provider: 'codex', projectPath: '/home/test/app-worktree', parentSessionId: 'lead-app' }]);
++  assert.deepEqual(runs, ['codex']);
++});
++
++test('Agent route creates a session without a parent when parentSessionId is omitted or blank', async () => {
++  const { dependencies, created } = childSessionDependencies([LEAD_ROW]);
++  await withAgentServer(dependencies, async (baseUrl) => {
++    assert.equal((await postAgent(baseUrl, { projectPath: '/home/test/app' })).status, 200);
++    assert.equal((await postAgent(baseUrl, { projectPath: '/home/test/app', parentSessionId: '  ' })).status, 200);
++  });
++  assert.deepEqual(created.map((entry) => entry.parentSessionId ?? null), [null, null]);
++});
++
++test('Agent route rejects an unknown or non-string parentSessionId before creating anything', async () => {
++  const { dependencies, created, runs } = childSessionDependencies([LEAD_ROW]);
++  await withAgentServer(dependencies, async (baseUrl) => {
++    const unknown = await postAgent(baseUrl, { projectPath: '/home/test/app', parentSessionId: 'nope' });
++    assert.equal(unknown.status, 400);
++    assert.match(unknown.body.error ?? '', /parentSessionId "nope" was not found/);
++    const wrongType = await postAgent(baseUrl, { projectPath: '/home/test/app', parentSessionId: 42 });
++    assert.equal(wrongType.status, 400);
++    assert.equal(wrongType.body.error, 'parentSessionId must be a string');
++  });
++  assert.deepEqual(created, []);
++  assert.deepEqual(runs, []);
++});
++
++test('Agent route continues a child with its own parent, and refuses a different parent or itself', async () => {
++  const OTHER_ROW = { ...LEAD_ROW, session_id: 'other-app', provider_session_id: 'other-native' };
++  const { dependencies, created, runs } = childSessionDependencies([LEAD_ROW, CHILD_ROW, OTHER_ROW]);
++  await withAgentServer(dependencies, async (baseUrl) => {
++    const omitted = await postAgent(baseUrl, { projectPath: '/home/test/app-worktree', sessionId: 'child-app' });
++    assert.equal(omitted.status, 200);
++    // The same parent, by either id, is accepted.
++    const same = await postAgent(baseUrl, { projectPath: '/home/test/app-worktree', sessionId: 'child-app', parentSessionId: 'lead-native' });
++    assert.equal(same.status, 200);
++
++    const different = await postAgent(baseUrl, { projectPath: '/home/test/app-worktree', sessionId: 'child-app', parentSessionId: 'other-app' });
++    assert.equal(different.status, 400);
++    assert.match(different.body.error ?? '', /parentSessionId cannot change/);
++
++    const itself = await postAgent(baseUrl, { projectPath: '/home/test/app-worktree', sessionId: 'child-native', parentSessionId: 'child-app' });
++    assert.equal(itself.status, 400);
++    assert.equal(itself.body.error, 'A session cannot be its own parent');
++
++    // A session created without a parent cannot gain one later.
++    const late = await postAgent(baseUrl, { projectPath: '/home/test/app', sessionId: 'other-app', parentSessionId: 'lead-app' });
++    assert.equal(late.status, 400);
++    assert.match(late.body.error ?? '', /no parent; parentSessionId cannot change/);
++  });
++  assert.deepEqual(created, [], 'a continuation never creates a row');
++  assert.deepEqual(runs, ['codex', 'codex']);
++});
+diff --git a/server/modules/database/migrations.ts b/server/modules/database/migrations.ts
+index b0d26aae..785a7194 100644
+--- a/server/modules/database/migrations.ts
++++ b/server/modules/database/migrations.ts
+@@ -442,6 +442,18 @@ const addForkedFromSessionIdColumn = (db: Database): void => {
+   addColumnToTableIfNotExists(db, 'sessions', columnNames, 'forked_from_session_id', 'TEXT');
+ };
+ 
++/**
++ * Adds the `parent_session_id` column recording which session started this
++ * one, for the sidebar's child-session nesting.
++ *
++ * Nothing is backfilled: no session predating the column was started with a
++ * parent.
++ */
++const addParentSessionIdColumn = (db: Database): void => {
++  const columnNames = getTableInfo(db, 'sessions').map((column) => column.name);
++  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'parent_session_id', 'TEXT');
++};
++
+ /**
+  * Adds the `model` column that records which model each session runs with.
+  *
+@@ -560,6 +572,7 @@ export const runMigrations = (db: Database) => {
+     addSessionEffortColumn(db);
+     addSessionPermissionModeColumn(db);
+     addForkedFromSessionIdColumn(db);
++    addParentSessionIdColumn(db);
+     // Create after legacy session-table repairs so the foreign key names the canonical app id.
+     db.exec(SESSION_PINS_TABLE_SCHEMA_SQL);
+     ensureProjectsForSessionPaths(db);
+@@ -569,6 +582,7 @@ export const runMigrations = (db: Database) => {
+     db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_provider_session_id ON sessions(provider_session_id)');
+     db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_project_path ON sessions(project_path)');
+     db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from_session_id)');
++    db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_parent_session_id ON sessions(parent_session_id)');
+     // The due-message poll runs on a timer; without this it table-scans.
+     db.exec('CREATE INDEX IF NOT EXISTS idx_scheduled_messages_due ON scheduled_messages(status, scheduled_for)');
+     db.exec('CREATE INDEX IF NOT EXISTS idx_scheduled_messages_session ON scheduled_messages(session_id)');
+diff --git a/server/modules/database/repositories/session-pins.db.ts b/server/modules/database/repositories/session-pins.db.ts
+index 024e85ea..cc2d1764 100644
+--- a/server/modules/database/repositories/session-pins.db.ts
++++ b/server/modules/database/repositories/session-pins.db.ts
+@@ -7,6 +7,7 @@ export const sessionPinsDb = {
+   list(userId: number): SessionPinRecord[] {
+     return getConnection().prepare(`
+       SELECT sessions.session_id, sessions.provider, sessions.project_path, sessions.forked_from_session_id,
++             sessions.parent_session_id,
+              projects.project_id, projects.custom_project_name, sessions.custom_name,
+              COALESCE(sessions.updated_at, sessions.created_at) AS last_activity
+       FROM session_pins
+diff --git a/server/modules/database/repositories/sessions.db.ts b/server/modules/database/repositories/sessions.db.ts
+index 0a06ae37..2e7afa99 100644
+--- a/server/modules/database/repositories/sessions.db.ts
++++ b/server/modules/database/repositories/sessions.db.ts
+@@ -1,7 +1,7 @@
+ import { getConnection } from '@/modules/database/connection.js';
+ import { projectsDb } from '@/modules/database/repositories/projects.db.js';
+ import { normalizeProjectPath } from '@/shared/index.js';
+-import type { ClearedContextSegment, SessionForkAncestor } from '@/shared/index.js';
++import type { ChildSessionSummary, ClearedContextSegment, SessionForkAncestor } from '@/shared/index.js';
+ 
+ type SessionRow = {
+   session_id: string;
+@@ -18,6 +18,8 @@ type SessionRow = {
+   permission_mode: string | null;
+   /** The app session this one was branched from; NULL unless it is a fork. */
+   forked_from_session_id: string | null;
++  /** The app session that started this one; NULL unless it is a child session. */
++  parent_session_id: string | null;
+   isArchived: number;
+   created_at: string;
+   updated_at: string;
+@@ -41,7 +43,40 @@ function preservePinsOnReplacement(sourceId: string, targetId: string, replace:
+ }
+ 
+ const SESSION_ROW_COLUMNS =
+-  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, permission_mode, forked_from_session_id, isArchived, created_at, updated_at';
++  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, permission_mode, forked_from_session_id, parent_session_id, isArchived, created_at, updated_at';
++
++/**
++ * True for a row (aliased `alias`) that is nested under its parent in the
++ * sidebar: it names a parent, and that parent is an active session in an
++ * active project. Such rows are listed only under their parent, never in their
++ * own project's session page. A child whose parent is archived or deleted is
++ * not attached and lists in its own project again.
++ */
++const attachedChildSql = (alias: string) => `(
++  ${alias}.parent_session_id IS NOT NULL AND EXISTS (
++    SELECT 1 FROM sessions AS attached_parent
++    LEFT JOIN projects AS attached_parent_project ON attached_parent_project.project_path = attached_parent.project_path
++    WHERE attached_parent.session_id = ${alias}.parent_session_id
++      AND attached_parent.session_id <> ${alias}.session_id
++      AND attached_parent.isArchived = 0
++      AND COALESCE(attached_parent_project.isArchived, 0) = 0
++  )
++)`;
++
++/** Children nest at most this deep; deeper rows are cut off rather than walked forever on damaged data. */
++const MAX_CHILD_SESSION_DEPTH = 8;
++
++type ChildSessionRow = {
++  session_id: string;
++  provider: string;
++  custom_name: string | null;
++  project_path: string | null;
++  project_id: string | null;
++  parent_session_id: string;
++  forked_from_session_id: string | null;
++  created_at: string;
++  updated_at: string;
++};
+ 
+ const SQLITE_UTC_TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+ 
+@@ -195,6 +230,7 @@ export const sessionsDb = {
+     provider: string,
+     projectPath: string,
+     customName?: string,
++    parentSessionId?: string | null,
+   ): string {
+     const db = getConnection();
+     const normalizedProjectPath = normalizeProjectPathForProvider(provider, projectPath);
+@@ -202,9 +238,9 @@ export const sessionsDb = {
+     projectsDb.createProjectPath(normalizedProjectPath);
+ 
+     db.prepare(
+-      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, isArchived, created_at, updated_at)
+-       VALUES (?, ?, NULL, ?, ?, NULL, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+-    ).run(sessionId, provider, customName ?? null, normalizedProjectPath);
++      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, parent_session_id, isArchived, created_at, updated_at)
++       VALUES (?, ?, NULL, ?, ?, NULL, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
++    ).run(sessionId, provider, customName ?? null, normalizedProjectPath, parentSessionId ?? null);
+ 
+     return sessionId;
+   },
+@@ -216,6 +252,9 @@ export const sessionsDb = {
+    * `jsonl_path` immediately, because a fork's transcript file exists before
+    * the row does — and the filesystem watcher would otherwise index it as an
+    * unrelated session under its own id.
++   *
++   * A fork of a child session keeps the child's parent, so it is listed among
++   * that parent's children and nests under its source there.
+    */
+   createForkedSession(input: {
+     sessionId: string;
+@@ -225,6 +264,7 @@ export const sessionsDb = {
+     providerSessionId: string;
+     jsonlPath: string;
+     forkedFromSessionId: string;
++    parentSessionId?: string | null;
+     model: string | null;
+     effort: string | null;
+     permissionMode?: string | null;
+@@ -241,8 +281,8 @@ export const sessionsDb = {
+       db.prepare('DELETE FROM sessions WHERE session_id = ? AND session_id <> ?')
+         .run(input.providerSessionId, input.sessionId);
+       db.prepare(
+-        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, model, effort, permission_mode, forked_from_session_id, isArchived, created_at, updated_at)
+-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
++        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, model, effort, permission_mode, forked_from_session_id, parent_session_id, isArchived, created_at, updated_at)
++         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+       ).run(
+         input.sessionId,
+         input.provider,
+@@ -254,6 +294,7 @@ export const sessionsDb = {
+         input.effort,
+         input.permissionMode ?? null,
+         input.forkedFromSessionId,
++        input.parentSessionId ?? null,
+       );
+     }))();
+ 
+@@ -623,6 +664,99 @@ export const sessionsDb = {
+     }));
+   },
+ 
++  /**
++   * The parent a session is nested under in the sidebar: its stored
++   * `parent_session_id` while that parent is an active session in an active
++   * project, otherwise null (see `attachedChildSql`).
++   */
++  getAttachedParentId(sessionId: string): string | null {
++    const row = getConnection().prepare(
++      `SELECT sessions.parent_session_id AS parent_session_id FROM sessions
++       WHERE sessions.session_id = ? AND ${attachedChildSql('sessions')}`
++    ).get(sessionId) as { parent_session_id: string } | undefined;
++    return row?.parent_session_id ?? null;
++  },
++
++  /**
++   * The active children of each given session, recursively, keyed by parent
++   * id; parents without children are absent from the map. Children are
++   * ordered by creation (the order their parent started them) and may live in
++   * any project and run on any provider. Archived children and children in
++   * archived projects are left out. One query per nesting level, so a page of
++   * parents costs the same as one.
++   */
++  getChildSessionsByParentIds(parentSessionIds: readonly string[]): Map<string, ChildSessionSummary[]> {
++    const db = getConnection();
++    const result = new Map<string, ChildSessionSummary[]>();
++    const roots = [...new Set(parentSessionIds)];
++    // Which requested parent each placed child descends from. A requested
++    // parent can itself be another one's child; it is only skipped below
++    // its own descendants, where damaged data would form a loop.
++    const rootOf = new Map(roots.map((id) => [id, id]));
++    const placed = new Set<string>();
++    const childrenOf = new Map<string, ChildSessionSummary[]>();
++    let frontier = roots;
++
++    for (let depth = 0; depth < MAX_CHILD_SESSION_DEPTH && frontier.length > 0; depth += 1) {
++      const rows: ChildSessionRow[] = [];
++      // Stay well below SQLite's bound-parameter limit on very large pages.
++      for (let start = 0; start < frontier.length; start += 500) {
++        const batch = frontier.slice(start, start + 500);
++        rows.push(...db.prepare(
++          `SELECT sessions.session_id, sessions.provider, sessions.custom_name, sessions.project_path,
++                  projects.project_id, sessions.parent_session_id, sessions.forked_from_session_id,
++                  sessions.created_at, sessions.updated_at
++           FROM sessions
++           LEFT JOIN projects ON projects.project_path = sessions.project_path
++           WHERE sessions.parent_session_id IN (${batch.map(() => '?').join(', ')})
++             AND sessions.session_id <> sessions.parent_session_id
++             AND sessions.isArchived = 0
++             AND COALESCE(projects.isArchived, 0) = 0
++           ORDER BY julianday(sessions.created_at) ASC, sessions.session_id ASC`
++        ).all(...batch) as ChildSessionRow[]);
++      }
++
++      const next: string[] = [];
++      for (const row of rows) {
++        // A cycle in damaged data, or a row already placed under another parent.
++        const root = rootOf.get(row.parent_session_id);
++        if (placed.has(row.session_id) || !root || row.session_id === root) continue;
++        placed.add(row.session_id);
++        if (!rootOf.has(row.session_id)) rootOf.set(row.session_id, root);
++        const createdAt = normalizeTimestamp(row.created_at) ?? row.created_at;
++        const child: ChildSessionSummary = {
++          id: row.session_id,
++          provider: row.provider as ChildSessionSummary['provider'],
++          summary: row.custom_name || '',
++          lastActivity: normalizeTimestamp(row.updated_at) ?? createdAt,
++          createdAt,
++          projectId: row.project_id ?? null,
++          projectPath: row.project_path ?? null,
++          parentSessionId: row.parent_session_id,
++          forkedFromSessionId: row.forked_from_session_id ?? null,
++          childSessions: [],
++        };
++        const siblings = childrenOf.get(row.parent_session_id) ?? [];
++        siblings.push(child);
++        childrenOf.set(row.parent_session_id, siblings);
++        next.push(row.session_id);
++      }
++      frontier = next;
++    }
++
++    // Wire each level onto its parent now that every level is read.
++    for (const children of childrenOf.values()) {
++      for (const child of children) {
++        child.childSessions = childrenOf.get(child.id) ?? [];
++      }
++    }
++    for (const parentId of new Set(parentSessionIds)) {
++      const children = childrenOf.get(parentId);
++      if (children?.length) result.set(parentId, children);
++    }
++    return result;
++  },
++
+   /**
+    * Resolves one session row through the provider-native id.
+    *
+@@ -795,6 +929,7 @@ export const sessionsDb = {
+          FROM sessions
+          WHERE project_path = ?
+            AND isArchived = 0
++           AND NOT ${attachedChildSql('sessions')}
+          ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, session_id DESC
+          LIMIT ? OFFSET ?`
+       )
+@@ -803,6 +938,10 @@ export const sessionsDb = {
+     return normalizeSessionRows(rows);
+   },
+ 
++  /**
++   * Counts the sessions a project's paginated session list holds: active
++   * ones, less the child sessions that are listed under their parent instead.
++   */
+   countSessionsByProjectPath(projectPath: string): number {
+     const db = getConnection();
+     const normalizedProjectPath = normalizeProjectPath(projectPath);
+@@ -811,13 +950,34 @@ export const sessionsDb = {
+         `SELECT COUNT(*) AS count
+          FROM sessions
+          WHERE project_path = ?
+-           AND isArchived = 0`
++           AND isArchived = 0
++           AND NOT ${attachedChildSql('sessions')}`
+       )
+       .get(normalizedProjectPath) as { count: number } | undefined;
+ 
+     return Number(row?.count ?? 0);
+   },
+ 
++  /**
++   * Counts a project's active sessions that are listed under a parent session
++   * rather than in the project's own list. The sidebar hides a project whose
++   * only sessions are such children.
++   */
++  countAttachedChildSessionsByProjectPath(projectPath: string): number {
++    const db = getConnection();
++    const row = db
++      .prepare(
++        `SELECT COUNT(*) AS count
++         FROM sessions
++         WHERE project_path = ?
++           AND isArchived = 0
++           AND ${attachedChildSql('sessions')}`
++      )
++      .get(normalizeProjectPath(projectPath)) as { count: number } | undefined;
++
++    return Number(row?.count ?? 0);
++  },
++
+   deleteSessionsByProjectPath(projectPath: string): void {
+     const db = getConnection();
+     const normalizedProjectPath = normalizeProjectPath(projectPath);
+diff --git a/server/modules/database/schema.ts b/server/modules/database/schema.ts
+index 4937b8f0..47bc70a0 100644
+--- a/server/modules/database/schema.ts
++++ b/server/modules/database/schema.ts
+@@ -145,6 +145,12 @@ CREATE TABLE IF NOT EXISTS sessions (
+     -- normally. Informational only: a fork is a fully independent provider
+     -- session, and deleting the source does not affect it.
+     forked_from_session_id TEXT,
++    -- The app session that started this one (e.g. an orchestrator's lead
++    -- session starting a worker through the Agent API), NULL otherwise.
++    -- Separate from fork lineage: a child may live in another project and run
++    -- on another provider. Set once when the row is created; the session
++    -- synchronizer never writes it.
++    parent_session_id TEXT,
+     isArchived BOOLEAN DEFAULT 0,
+     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+diff --git a/server/modules/database/tests/sessions-parent.db.integration.test.ts b/server/modules/database/tests/sessions-parent.db.integration.test.ts
+new file mode 100644
+index 00000000..0ba81a06
+--- /dev/null
++++ b/server/modules/database/tests/sessions-parent.db.integration.test.ts
+@@ -0,0 +1,137 @@
++import assert from 'node:assert/strict';
++import { mkdtemp, rm } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import test from 'node:test';
++
++import { closeConnection, getConnection } from '@/modules/database/connection.js';
++import { initializeDatabase } from '@/modules/database/init-db.js';
++import { runMigrations } from '@/modules/database/migrations.js';
++import { projectsDb } from '@/modules/database/repositories/projects.db.js';
++import { sessionsDb } from '@/modules/database/repositories/sessions.db.js';
++
++async function withDatabase(run: () => void | Promise<void>): Promise<void> {
++  const previous = process.env.DATABASE_PATH;
++  const directory = await mkdtemp(path.join(tmpdir(), 'sessions-parent-'));
++  closeConnection();
++  process.env.DATABASE_PATH = path.join(directory, 'auth.db');
++  try {
++    await initializeDatabase();
++    await run();
++  } finally {
++    closeConnection();
++    if (previous === undefined) delete process.env.DATABASE_PATH;
++    else process.env.DATABASE_PATH = previous;
++    await rm(directory, { recursive: true, force: true });
++  }
++}
++
++const columnsOf = () => (getConnection().prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>).map((column) => column.name);
++const indexesOf = () => (getConnection().prepare('PRAGMA index_list(sessions)').all() as Array<{ name: string }>).map((index) => index.name);
++
++test('migration adds parent_session_id and its index to an existing sessions table, idempotently and without touching rows', async () => {
++  await withDatabase(() => {
++    const db = getConnection();
++    sessionsDb.createAppSession('existing', 'claude', '/workspace/one', 'Existing');
++    // Downgrade to the schema before the column existed.
++    db.exec('DROP INDEX idx_sessions_parent_session_id');
++    db.exec('ALTER TABLE sessions DROP COLUMN parent_session_id');
++    assert.ok(!columnsOf().includes('parent_session_id'));
++
++    runMigrations(db);
++    assert.ok(columnsOf().includes('parent_session_id'));
++    assert.ok(indexesOf().includes('idx_sessions_parent_session_id'));
++    assert.equal(sessionsDb.getSessionById('existing')?.parent_session_id, null, 'nothing is backfilled');
++    assert.equal(sessionsDb.getSessionById('existing')?.custom_name, 'Existing');
++
++    sessionsDb.createAppSession('child', 'codex', '/workspace/two', 'Child', 'existing');
++    runMigrations(db);
++    assert.equal(sessionsDb.getSessionById('child')?.parent_session_id, 'existing', 'a rerun keeps stored parents');
++  });
++});
++
++test('synchronizer upserts never clear a stored parent', async () => {
++  await withDatabase(() => {
++    sessionsDb.createAppSession('lead', 'claude', '/workspace/app', 'Lead');
++
++    // App-created child, later announced and re-indexed from its transcript (UPDATE path).
++    sessionsDb.createAppSession('child', 'codex', '/workspace/app-wt', 'Child', 'lead');
++    sessionsDb.assignProviderSessionId('child', 'native-child');
++    sessionsDb.createSession('native-child', 'codex', '/workspace/app-wt', 'Indexed name', undefined, '2099-01-01T00:00:00.000Z', '/t/child.jsonl');
++    sessionsDb.createSession('native-child', 'codex', '/workspace/app-wt', 'Indexed again', undefined, '2099-01-02T00:00:00.000Z', '/t/child.jsonl');
++    assert.equal(sessionsDb.getSessionById('child')?.parent_session_id, 'lead');
++
++    // The watcher indexed the transcript first; merging the duplicate keeps the app row's parent.
++    sessionsDb.createAppSession('raced', 'codex', '/workspace/app-wt', 'Raced', 'lead');
++    sessionsDb.createSession('native-raced', 'codex', '/workspace/app-wt', 'Watcher row', undefined, undefined, '/t/raced.jsonl');
++    sessionsDb.assignProviderSessionId('raced', 'native-raced');
++    assert.equal(sessionsDb.getSessionById('raced')?.parent_session_id, 'lead');
++    assert.equal(sessionsDb.getSessionById('native-raced'), null);
++
++    // A row keyed by the provider id whose mapping is not recorded goes through ON CONFLICT.
++    sessionsDb.createAppSession('legacy-native', 'claude', '/workspace/app-wt', 'Legacy', 'lead');
++    sessionsDb.createSession('legacy-native', 'claude', '/workspace/app-wt', 'Legacy indexed', undefined, '2099-01-01T00:00:00.000Z');
++    assert.equal(sessionsDb.getSessionById('legacy-native')?.parent_session_id, 'lead');
++    assert.equal(sessionsDb.getSessionById('legacy-native')?.provider_session_id, 'legacy-native');
++  });
++});
++
++test('attached children leave their project page and count; orphans return to it', async () => {
++  await withDatabase(() => {
++    sessionsDb.createAppSession('lead', 'claude', '/workspace/app', 'Lead');
++    sessionsDb.createAppSession('own', 'codex', '/workspace/app-wt', 'Own session');
++    sessionsDb.createAppSession('worker', 'codex', '/workspace/app-wt', 'Worker', 'lead');
++    sessionsDb.createAppSession('dangling', 'codex', '/workspace/app-wt', 'Dangling', 'missing-parent');
++
++    const pageIds = () => sessionsDb.getSessionsByProjectPathPage('/workspace/app-wt', 20, 0).map((row) => row.session_id).sort();
++    assert.deepEqual(pageIds(), ['dangling', 'own']);
++    assert.equal(sessionsDb.countSessionsByProjectPath('/workspace/app-wt'), 2);
++    assert.equal(sessionsDb.countAttachedChildSessionsByProjectPath('/workspace/app-wt'), 1);
++    assert.equal(sessionsDb.getAttachedParentId('worker'), 'lead');
++    assert.equal(sessionsDb.getAttachedParentId('dangling'), null);
++    assert.equal(sessionsDb.getAttachedParentId('own'), null);
++
++    // Archiving the parent, or its project, detaches the child.
++    sessionsDb.updateSessionIsArchived('lead', true);
++    assert.deepEqual(pageIds(), ['dangling', 'own', 'worker']);
++    assert.equal(sessionsDb.getAttachedParentId('worker'), null);
++    sessionsDb.updateSessionIsArchived('lead', false);
++    projectsDb.updateProjectIsArchived('/workspace/app', true);
++    assert.equal(sessionsDb.getAttachedParentId('worker'), null);
++    projectsDb.updateProjectIsArchived('/workspace/app', false);
++    assert.equal(sessionsDb.getAttachedParentId('worker'), 'lead');
++  });
++});
++
++test('child trees nest recursively in creation order, skip archived children and survive cycles', async () => {
++  await withDatabase(() => {
++    const db = getConnection();
++    sessionsDb.createAppSession('lead', 'claude', '/workspace/app', 'Lead');
++    sessionsDb.createAppSession('coder', 'codex', '/workspace/app-wt', 'Coder', 'lead');
++    sessionsDb.createAppSession('reviewer', 'claude', '/workspace/app', 'Reviewer', 'lead');
++    sessionsDb.createAppSession('helper', 'opencode', '/workspace/other', 'Helper', 'coder');
++    sessionsDb.createAppSession('gone', 'claude', '/workspace/app', 'Gone', 'lead');
++    sessionsDb.updateSessionIsArchived('gone', true);
++    for (const [index, id] of ['lead', 'coder', 'reviewer', 'helper', 'gone'].entries()) {
++      db.prepare('UPDATE sessions SET created_at = ? WHERE session_id = ?').run(`2026-11-0${index + 1}T00:00:00.000Z`, id);
++    }
++
++    const tree = sessionsDb.getChildSessionsByParentIds(['lead', 'reviewer']);
++    assert.deepEqual([...tree.keys()], ['lead'], 'parents without active children are absent');
++    const children = tree.get('lead') ?? [];
++    assert.deepEqual(children.map((child) => [child.id, child.provider, child.projectPath]), [
++      ['coder', 'codex', '/workspace/app-wt'],
++      ['reviewer', 'claude', '/workspace/app'],
++    ]);
++    assert.equal(children[0].parentSessionId, 'lead');
++    assert.equal(children[0].summary, 'Coder');
++    assert.ok(children[0].projectId);
++    assert.deepEqual(children[0].childSessions.map((child) => [child.id, child.provider]), [['helper', 'opencode']]);
++
++    // Damaged data: a parent loop terminates and lists each session once.
++    db.prepare("UPDATE sessions SET parent_session_id = 'helper' WHERE session_id = 'lead'").run();
++    const looped = sessionsDb.getChildSessionsByParentIds(['lead']).get('lead') ?? [];
++    assert.deepEqual(looped.map((child) => child.id), ['coder', 'reviewer']);
++    assert.deepEqual(looped[0].childSessions[0].childSessions, []);
++  });
++});
+diff --git a/server/modules/projects/services/projects-with-sessions-fetch.service.ts b/server/modules/projects/services/projects-with-sessions-fetch.service.ts
+index 4afa43b9..88600edf 100644
+--- a/server/modules/projects/services/projects-with-sessions-fetch.service.ts
++++ b/server/modules/projects/services/projects-with-sessions-fetch.service.ts
+@@ -4,7 +4,7 @@ import path from 'node:path';
+ import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+ import { sessionSynchronizerService } from '@/modules/providers/index.js';
+ import { WS_OPEN_STATE, connectedClients } from '@/modules/websocket/index.js';
+-import type { RealtimeClientConnection, SessionForkAncestor } from '@/shared/types.js';
++import type { ChildSessionSummary, RealtimeClientConnection, SessionForkAncestor } from '@/shared/types.js';
+ import { AppError } from '@/shared/utils.js';
+ import { resolveWorktreeParent } from '@/modules/projects/services/project-worktree-parent.service.js';
+ 
+@@ -16,6 +16,15 @@ type SessionSummary = {
+   lastActivity: string;
+   forkedFromSessionId: string | null;
+   forkAncestors: SessionForkAncestor[];
++  /**
++   * The active session this one is nested under (see
++   * `sessionsDb.getAttachedParentId`). Always null on an active project's
++   * session page, which leaves such children out and lists them in their
++   * parent's `childSessions` instead.
++   */
++  parentSessionId: string | null;
++  /** Active sessions this one started, possibly in other projects and providers. */
++  childSessions: ChildSessionSummary[];
+ };
+ 
+ type SessionRepositoryRow = {
+@@ -25,6 +34,7 @@ type SessionRepositoryRow = {
+   updated_at?: string | null;
+   created_at?: string | null;
+   forked_from_session_id?: string | null;
++  parent_session_id?: string | null;
+ };
+ 
+ export type ProjectListItem = {
+@@ -40,6 +50,12 @@ export type ProjectListItem = {
+     hasMore: boolean;
+     total: number;
+   };
++  /**
++   * Active sessions of this project that are listed under a parent session
++   * instead of here. The sidebar hides a project that has these and no
++   * sessions of its own.
++   */
++  childSessionCount: number;
+ };
+ 
+ export type ArchivedProjectListItem = ProjectListItem & {
+@@ -123,8 +139,9 @@ function normalizeSessionPagination(options: SessionPaginationOptions = {}): { l
+   };
+ }
+ 
+-function mapSessionRowToSummary(row: SessionRepositoryRow): SessionSummary {
+-  return {
++function mapSessionRowsToSummaries(rows: SessionRepositoryRow[]): SessionSummary[] {
++  const childSessions = sessionsDb.getChildSessionsByParentIds(rows.map((row) => row.session_id));
++  return rows.map((row) => ({
+     id: row.session_id,
+     provider: row.provider,
+     summary: row.custom_name || '',
+@@ -132,14 +149,16 @@ function mapSessionRowToSummary(row: SessionRepositoryRow): SessionSummary {
+     lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString(),
+     forkedFromSessionId: row.forked_from_session_id ?? null,
+     forkAncestors: row.forked_from_session_id ? sessionsDb.getForkAncestors(row.session_id) : [],
+-  };
++    parentSessionId: row.parent_session_id ? sessionsDb.getAttachedParentId(row.session_id) : null,
++    childSessions: childSessions.get(row.session_id) ?? [],
++  }));
+ }
+ 
+ function readProjectSessionsIncludingArchived(projectPath: string): ProjectSessionsPageResult {
+   const rows = sessionsDb.getSessionsByProjectPathIncludingArchived(projectPath) as SessionRepositoryRow[];
+ 
+   return {
+-    sessions: rows.map(mapSessionRowToSummary),
++    sessions: mapSessionRowsToSummaries(rows),
+     total: rows.length,
+     hasMore: false,
+   };
+@@ -161,7 +180,7 @@ function readProjectSessionsPageByPath(
+   const total = sessionsDb.countSessionsByProjectPath(projectPath);
+ 
+   return {
+-    sessions: rows.map(mapSessionRowToSummary),
++    sessions: mapSessionRowsToSummaries(rows),
+     total,
+     hasMore: pagination.offset + rows.length < total,
+   };
+@@ -238,6 +257,7 @@ export async function getProjectsWithSessions(
+         hasMore: sessionsPage.hasMore,
+         total: sessionsPage.total,
+       },
++      childSessionCount: sessionsDb.countAttachedChildSessionsByProjectPath(projectPath),
+     });
+   }
+ 
+@@ -292,6 +312,8 @@ export async function getArchivedProjectsWithSessions(
+         hasMore: sessionsPage.hasMore,
+         total: sessionsPage.total,
+       },
++      // An archived project lists every session it holds, children included.
++      childSessionCount: 0,
+     });
+   }
+ 
+diff --git a/server/modules/projects/tests/project-child-sessions.test.ts b/server/modules/projects/tests/project-child-sessions.test.ts
+new file mode 100644
+index 00000000..347579df
+--- /dev/null
++++ b/server/modules/projects/tests/project-child-sessions.test.ts
+@@ -0,0 +1,115 @@
++import assert from 'node:assert/strict';
++import { mkdtemp, rm } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import test from 'node:test';
++
++import { closeConnection, getConnection, initializeDatabase, sessionsDb, userDb } from '@/modules/database/index.js';
++import { getProjectSessionsPage, getProjectsWithSessions } from '@/modules/projects/services/projects-with-sessions-fetch.service.js';
++import { sessionsService } from '@/modules/providers/index.js';
++
++const LEAD_PROJECT = '/workspace/acme-app';
++const WORKTREE = '/workspace/acme-app-worktrees/coder';
++
++async function withDatabase(run: () => Promise<void>) {
++  const previousPath = process.env.DATABASE_PATH;
++  const directory = await mkdtemp(path.join(tmpdir(), 'project-child-sessions-'));
++  closeConnection();
++  process.env.DATABASE_PATH = path.join(directory, 'auth.db');
++  try {
++    await initializeDatabase();
++    await run();
++  } finally {
++    closeConnection();
++    if (previousPath === undefined) delete process.env.DATABASE_PATH;
++    else process.env.DATABASE_PATH = previousPath;
++    await rm(directory, { recursive: true, force: true });
++  }
++}
++
++/** A lead in one project with a cross-project codex worker and a same-project claude reviewer. */
++function seedFamily() {
++  sessionsService.createAppSession('claude', LEAD_PROJECT, 'Use coagent to delegate the work');
++  const lead = sessionsDb.getSessionsByProjectPath(LEAD_PROJECT)[0].session_id;
++  const coder = sessionsService.createAppSession('codex', WORKTREE, 'coder task', { parentSessionId: lead }).sessionId;
++  const reviewer = sessionsService.createAppSession('claude', LEAD_PROJECT, 'reviewer task', { parentSessionId: lead }).sessionId;
++  for (const [index, id] of [lead, coder, reviewer].entries()) {
++    getConnection().prepare('UPDATE sessions SET created_at = ?, updated_at = ? WHERE session_id = ?')
++      .run(`2026-11-2${index}T00:00:00.000Z`, `2026-11-2${index}T00:00:00.000Z`, id);
++  }
++  return { lead, coder, reviewer };
++}
++
++test('project lists nest children under their parent and leave them out of their own project page', async () => {
++  await withDatabase(async () => {
++    const { lead, coder, reviewer } = seedFamily();
++
++    const projects = await getProjectsWithSessions({ skipSynchronization: true });
++    const leadProject = projects.find((project) => project.path === LEAD_PROJECT)!;
++    const worktree = projects.find((project) => project.path === WORKTREE)!;
++
++    assert.deepEqual(leadProject.sessions.map((session) => session.id), [lead]);
++    assert.deepEqual(leadProject.sessionMeta, { total: 1, hasMore: false });
++    assert.equal(leadProject.childSessionCount, 1, 'the same-project reviewer is listed under the lead');
++    const [leadSummary] = leadProject.sessions;
++    assert.equal(leadSummary.parentSessionId, null);
++    assert.deepEqual(
++      leadSummary.childSessions.map((child) => ({
++        id: child.id, provider: child.provider, projectPath: child.projectPath, parentSessionId: child.parentSessionId,
++      })),
++      [
++        { id: coder, provider: 'codex', projectPath: WORKTREE, parentSessionId: lead },
++        { id: reviewer, provider: 'claude', projectPath: LEAD_PROJECT, parentSessionId: lead },
++      ],
++    );
++    assert.equal(leadSummary.childSessions[0].summary, 'coder task');
++    assert.equal(leadSummary.childSessions[0].projectId, worktree.projectId);
++    assert.equal(leadSummary.childSessions[0].lastActivity, '2026-11-21T00:00:00.000Z');
++
++    // The worktree holds only a child: no sessions of its own, which the sidebar uses to hide it.
++    assert.deepEqual(worktree.sessions, []);
++    assert.deepEqual(worktree.sessionMeta, { total: 0, hasMore: false });
++    assert.equal(worktree.childSessionCount, 1);
++
++    const page = await getProjectSessionsPage(leadProject.projectId, { limit: 20, offset: 0 });
++    assert.deepEqual(page.sessions[0].childSessions.map((child) => child.id), [coder, reviewer]);
++
++    // The Conversations feed stays flat and still lists every session.
++    assert.deepEqual(sessionsService.listRecentSessions(20, 0).conversations.map((item) => item.sessionId).sort(), [lead, coder, reviewer].sort());
++  });
++});
++
++test('archived children are not listed; an archived parent releases its children to their own project', async () => {
++  await withDatabase(async () => {
++    const { lead, coder, reviewer } = seedFamily();
++    sessionsDb.updateSessionIsArchived(reviewer, true);
++
++    let projects = await getProjectsWithSessions({ skipSynchronization: true });
++    let leadProject = projects.find((project) => project.path === LEAD_PROJECT)!;
++    assert.deepEqual(leadProject.sessions[0].childSessions.map((child) => child.id), [coder]);
++    assert.equal(leadProject.childSessionCount, 0);
++
++    const archived = sessionsService.listArchivedSessions();
++    assert.deepEqual(archived.map((item) => [item.sessionId, item.parentSessionId]), [[reviewer, lead]]);
++
++    sessionsDb.updateSessionIsArchived(lead, true);
++    projects = await getProjectsWithSessions({ skipSynchronization: true });
++    const worktree = projects.find((project) => project.path === WORKTREE)!;
++    assert.deepEqual(worktree.sessions.map((session) => [session.id, session.parentSessionId]), [[coder, null]]);
++    assert.equal(worktree.childSessionCount, 0);
++    leadProject = projects.find((project) => project.path === LEAD_PROJECT)!;
++    assert.deepEqual(leadProject.sessions, []);
++  });
++});
++
++test('pinned summaries say which pins are attached children', async () => {
++  await withDatabase(async () => {
++    const { lead, coder } = seedFamily();
++    const userId = Number(userDb.createUser('pinner', 'unused-hash').id);
++    sessionsService.setSessionPinned(userId, lead, true);
++    sessionsService.setSessionPinned(userId, coder, true);
++
++    const pins = sessionsService.listPinnedSessions(userId);
++    assert.deepEqual(pins.map((pin) => [pin.sessionId, pin.parentSessionId]), [[coder, lead], [lead, null]]);
++  });
++});
+diff --git a/server/modules/providers/services/sessions.service.ts b/server/modules/providers/services/sessions.service.ts
+index 37e420ef..ff903a45 100644
+--- a/server/modules/providers/services/sessions.service.ts
++++ b/server/modules/providers/services/sessions.service.ts
+@@ -55,6 +55,8 @@ type CreateAppSessionResult = {
+ type ArchivedSessionListItem = {
+   sessionId: string;
+   provider: LLMProvider;
++  /** The stored parent session id, whether or not that parent is still active. */
++  parentSessionId: string | null;
+   projectId: string | null;
+   projectPath: string | null;
+   projectDisplayName: string;
+@@ -72,6 +74,8 @@ type RecentSessionListItem = Pick<
+ 
+ type PinnedSessionListItem = RecentSessionListItem & {
+   forkedFromSessionId: string | null;
++  /** The active session this one is nested under; such pins are not listed in their own project's tree. */
++  parentSessionId: string | null;
+   forkAncestors: ReturnType<typeof sessionsDb.getForkAncestors>;
+ };
+ 
+@@ -399,6 +403,7 @@ export const sessionsService = {
+         lastActivity: normalizedTimestamp,
+         forkedFromSessionId: session.forked_from_session_id,
+         forkAncestors: session.forked_from_session_id ? sessionsDb.getForkAncestors(session.session_id) : [],
++        parentSessionId: session.parent_session_id ? sessionsDb.getAttachedParentId(session.session_id) : null,
+       };
+     });
+   },
+@@ -459,11 +464,15 @@ export const sessionsService = {
+    * this row later, when the provider runtime announces it mid-run. Its title
+    * comes directly from the first visible CloudCLI message and is limited to
+    * four whole words before any provider-owned storage exists.
++   *
++   * `parentSessionId` (canonical app id, validated by the caller) records the
++   * session that started this one, which the sidebar nests it under.
+    */
+   createAppSession(
+     provider: LLMProvider,
+     projectPath: string,
+     initialMessage: string,
++    options: { parentSessionId?: string | null } = {},
+   ): CreateAppSessionResult {
+     const normalizedProjectPath = projectPath.trim();
+     if (!normalizedProjectPath) {
+@@ -475,7 +484,7 @@ export const sessionsService = {
+ 
+     const sessionId = randomUUID();
+     const sessionName = buildCloudCliSessionName(initialMessage);
+-    sessionsDb.createAppSession(sessionId, provider, normalizedProjectPath, sessionName);
++    sessionsDb.createAppSession(sessionId, provider, normalizedProjectPath, sessionName, options.parentSessionId ?? null);
+ 
+     return {
+       sessionId,
+@@ -542,6 +551,7 @@ export const sessionsService = {
+       providerSessionId: forked.providerSessionId,
+       jsonlPath: forked.jsonlPath,
+       forkedFromSessionId: sessionId,
++      parentSessionId: source.parent_session_id,
+       // A fork that silently dropped to the catalog default would answer
+       // differently from the conversation it was branched from.
+       model: source.model,
+@@ -861,6 +871,7 @@ export const sessionsService = {
+       return {
+         sessionId: session.session_id,
+         provider: session.provider as LLMProvider,
++        parentSessionId: session.parent_session_id ?? null,
+         projectId: project?.project_id ?? null,
+         projectPath,
+         projectDisplayName: resolveProjectDisplayName(projectPath, project?.custom_project_name),
+diff --git a/server/modules/providers/tests/provider-token-usage.service.test.ts b/server/modules/providers/tests/provider-token-usage.service.test.ts
+index d9ce95b7..c544c813 100644
+--- a/server/modules/providers/tests/provider-token-usage.service.test.ts
++++ b/server/modules/providers/tests/provider-token-usage.service.test.ts
+@@ -24,6 +24,7 @@ function createSessionRow(overrides: Record<string, unknown> = {}) {
+     effort: null,
+     permission_mode: null,
+     forked_from_session_id: null,
++    parent_session_id: null,
+     isArchived: 0,
+     created_at: '2026-01-01T00:00:00.000Z',
+     updated_at: '2026-01-01T00:00:00.000Z',
+diff --git a/server/modules/providers/tests/session-fork.test.ts b/server/modules/providers/tests/session-fork.test.ts
+index beb39c0d..dd89440b 100644
+--- a/server/modules/providers/tests/session-fork.test.ts
++++ b/server/modules/providers/tests/session-fork.test.ts
+@@ -4,7 +4,7 @@ import os from 'node:os';
+ import path from 'node:path';
+ import test from 'node:test';
+ 
+-import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
++import { closeConnection, getConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+ import { providerRegistry } from '@/modules/providers/provider.registry.js';
+ import { sessionsService } from '@/modules/providers/services/sessions.service.js';
+ import type { IProviderFork } from '@/shared/interfaces.js';
+@@ -171,3 +171,16 @@ test('forking a session that does not exist is a 404', async () => {
+     );
+   });
+ });
++
++test('a fork of a child session keeps the child parent, so it stays in that family', async () => {
++  await withForkableClaude(async ({ directory }) => {
++    sessionsDb.createAppSession('lead', 'codex', '/workspace/lead', 'Lead');
++    seedSource(directory);
++    getConnection().prepare("UPDATE sessions SET parent_session_id = 'lead' WHERE session_id = ?").run(SOURCE_ID);
++
++    const result = await sessionsService.forkSessionById(SOURCE_ID);
++    const fork = sessionsDb.getSessionById(result.sessionId);
++    assert.equal(fork?.forked_from_session_id, SOURCE_ID);
++    assert.equal(fork?.parent_session_id, 'lead');
++  });
++});
+diff --git a/server/modules/websocket/services/session-upsert-broadcast.service.ts b/server/modules/websocket/services/session-upsert-broadcast.service.ts
+index 10033af2..219c0d9f 100644
+--- a/server/modules/websocket/services/session-upsert-broadcast.service.ts
++++ b/server/modules/websocket/services/session-upsert-broadcast.service.ts
+@@ -51,6 +51,10 @@ async function buildSessionUpsertedEvent(
+       lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString(),
+       forkedFromSessionId: row.forked_from_session_id ?? null,
+       forkAncestors: row.forked_from_session_id ? sessionsDb.getForkAncestors(row.session_id) : [],
++      // A child is placed under this parent by the client and kept out of its
++      // own project's list; `project` still names the project it runs in.
++      parentSessionId: row.parent_session_id ? sessionsDb.getAttachedParentId(row.session_id) : null,
++      childSessions: sessionsDb.getChildSessionsByParentIds([row.session_id]).get(row.session_id) ?? [],
+     },
+     project: project
+       ? {
+diff --git a/server/modules/websocket/tests/session-upsert-broadcast.test.ts b/server/modules/websocket/tests/session-upsert-broadcast.test.ts
+index a3e89a9b..d18e72b7 100644
+--- a/server/modules/websocket/tests/session-upsert-broadcast.test.ts
++++ b/server/modules/websocket/tests/session-upsert-broadcast.test.ts
+@@ -4,10 +4,12 @@ import { tmpdir } from 'node:os';
+ import path from 'node:path';
+ import test from 'node:test';
+ 
+-import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
++import { closeConnection, getConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
++import { sessionsService } from '@/modules/providers/index.js';
+ import {
+   broadcastSessionUpserted,
+   broadcastSessionUpsertedBatch,
++  buildSessionUpsertedEvent,
+ } from '@/modules/websocket/services/session-upsert-broadcast.service.js';
+ import { connectedClients } from '@/modules/websocket/services/websocket-state.service.js';
+ 
+@@ -157,3 +159,27 @@ test('a closed socket is skipped', async () => {
+     assert.deepEqual(closing.frames, []);
+   });
+ });
++
++test('session_upserted carries the attached parent for a child and the children for a parent', async () => {
++  await withIsolatedDatabase(async () => {
++    sessionsService.createAppSession('claude', '/workspace/acme-app', 'Use coagent to delegate');
++    const lead = sessionsDb.getSessionsByProjectPath('/workspace/acme-app')[0].session_id;
++    const coder = sessionsService.createAppSession('codex', '/workspace/acme-app-worktrees/coder', 'coder task', { parentSessionId: lead }).sessionId;
++    const reviewer = sessionsService.createAppSession('claude', '/workspace/acme-app', 'reviewer task', { parentSessionId: lead }).sessionId;
++    getConnection().prepare('UPDATE sessions SET created_at = ? WHERE session_id = ?').run('2026-11-21T00:00:00.000Z', coder);
++    getConnection().prepare('UPDATE sessions SET created_at = ? WHERE session_id = ?').run('2026-11-22T00:00:00.000Z', reviewer);
++
++    const childEvent = await buildSessionUpsertedEvent(coder);
++    assert.equal(childEvent?.session.parentSessionId, lead);
++    assert.deepEqual(childEvent?.session.childSessions, []);
++    assert.equal(childEvent?.provider, 'codex');
++    assert.equal(childEvent?.project?.path, '/workspace/acme-app-worktrees/coder', 'the child keeps naming the project it runs in');
++
++    const parentEvent = await buildSessionUpsertedEvent(lead);
++    assert.equal(parentEvent?.session.parentSessionId, null);
++    assert.deepEqual(parentEvent?.session.childSessions?.map((child) => child.id), [coder, reviewer]);
++
++    sessionsDb.updateSessionIsArchived(lead, true);
++    assert.equal((await buildSessionUpsertedEvent(coder))?.session.parentSessionId, null);
++  });
++});
+diff --git a/server/shared/index.ts b/server/shared/index.ts
+index 57227502..d89527c6 100644
+--- a/server/shared/index.ts
++++ b/server/shared/index.ts
+@@ -12,6 +12,6 @@ export { AppError, asyncHandler, createApiSuccessResponse, SIDE_QUESTION_ID_PATT
+ export type { BackgroundTaskSummary, ClearedContextSegment, FetchHistoryOptions, FetchHistoryResult, NormalizedMessage, WorkflowAgentActivity } from './types.js';
+ export { sliceTailPage } from './utils.js';
+ 
+-// Session persistence uses canonical path normalization and fork/history metadata.
++// Session persistence uses canonical path normalization and fork/child/history metadata.
+ export { normalizeProjectPath } from './utils.js';
+-export type { SessionForkAncestor } from './types.js';
++export type { ChildSessionSummary, SessionForkAncestor } from './types.js';
+diff --git a/server/shared/types.ts b/server/shared/types.ts
+index a118c358..f1c63b94 100644
+--- a/server/shared/types.ts
++++ b/server/shared/types.ts
+@@ -419,6 +419,14 @@ export type SessionUpsertedEvent = {
+     forkedFromSessionId?: string | null;
+     /** Active ancestors outside the current page, for the Projects tree only. */
+     forkAncestors?: SessionForkAncestor[];
++    /**
++     * App id of the active session this one is nested under in the sidebar
++     * (it started this one); null when there is none or that session is
++     * archived or deleted. See `sessionsDb.getAttachedParentId`.
++     */
++    parentSessionId?: string | null;
++    /** Active sessions this one started, nested under it in the sidebar. */
++    childSessions?: ChildSessionSummary[];
+   };
+   project: SessionUpsertedProject | null;
+   timestamp: string;
+@@ -438,6 +446,27 @@ export type SessionForkAncestor = {
+   forkedFromSessionId: string | null;
+ };
+ 
++/**
++ * One active session started by another session (`sessions.parent_session_id`),
++ * as the sidebar renders it under its parent. Children may belong to another
++ * project and another provider than the parent, so each carries its own
++ * provider and project. Built only by the database module; archived children,
++ * and children in archived projects, are left out.
++ */
++export type ChildSessionSummary = {
++  id: string;
++  provider: LLMProvider;
++  summary: string;
++  lastActivity: string;
++  createdAt: string;
++  projectId: string | null;
++  projectPath: string | null;
++  parentSessionId: string;
++  /** Fork source, so forks of a child nest under it among its siblings. */
++  forkedFromSessionId: string | null;
++  childSessions: ChildSessionSummary[];
++};
++
+ //----------------- SESSION PINS ------------
+ 
+ /**
+@@ -451,6 +480,8 @@ export type SessionPinRecord = {
+   session_id: string;
+   /** Canonical app parent id, used with bounded active ancestry in pin summaries. */
+   forked_from_session_id: string | null;
++  /** Stored parent; the pin summary resolves whether it is still attached. */
++  parent_session_id: string | null;
+   provider: LLMProvider;
+   project_id: string | null;
+   project_path: string | null;
+-- 
+2.53.0
+

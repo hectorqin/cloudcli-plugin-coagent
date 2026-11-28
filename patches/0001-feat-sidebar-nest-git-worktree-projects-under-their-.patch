@@ -1,7 +1,7 @@
-From 02a20553b1a83068267ac895a0d2cb8dfd64f27c Mon Sep 17 00:00:00 2001
+From 3de81cacd2b99540dcb132bdc203767fae3b231a Mon Sep 17 00:00:00 2001
 From: hectorqin <14220132+hectorqin@users.noreply.github.com>
 Date: Wed, 25 Nov 2026 10:00:04 +0000
-Subject: [PATCH 01/13] feat(sidebar): nest git worktree projects under their
+Subject: [PATCH 1/7] feat(sidebar): nest git worktree projects under their
  repository
 
 Worktree directories (CloudCLI's own <repo>-worktrees/<name> and any linked
@@ -533,7 +533,7 @@ index 00000000..044449a0
 +  return ordered;
 +}
 diff --git a/src/shared/types.ts b/src/shared/types.ts
-index cabac01a..997ecfba 100644
+index 91c62485..7a1e6066 100644
 --- a/src/shared/types.ts
 +++ b/src/shared/types.ts
 @@ -134,6 +134,8 @@ export type Project = {

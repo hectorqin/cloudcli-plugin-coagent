@@ -152,7 +152,7 @@ tab 改为泳道时序图：每个 agent 一条泳道（最左为 You），时�
 
 - 事实：CloudCLI 的会话同步器按会话 cwd 反复覆盖 `sessions.project_path`（`sessions.db.ts`），所以无法让 worktree 会话归属 lead 项目；归档项目又会隐藏会话。
 - 做法：项目带 `worktreeOf`（主仓库路径：活 worktree 读 `.git` 文件；已删除的按 `<repo>-worktrees/<name>` 布局，且仅当 `<repo>` 是已知项目），侧边栏把 worktree 项目缩进显示在主仓库下（主仓库展开时可见，选中时总可见）。不移动任何会话。参照 Zed：“Threads running in linked Git worktrees appear under the same project as their main worktree.”
-- 位置：fork 仓库 https://github.com/hectorqin/claudecodeui 分支 `coagent/v1.37.10-coagent.5`（基于 v1.37.10，含 patch 1–4 及上游评审修复），补丁 `patches/*.patch`。
+- 位置：fork 仓库 https://github.com/hectorqin/claudecodeui 分支 `coagent/v1.37.11-coagent.6`（基于 v1.37.10，含 patch 1–4 及上游评审修复），补丁 `patches/*.patch`。
 
 ## 11. 同类工具调研要点（2026-11-25）
 
