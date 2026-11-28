@@ -6,6 +6,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ToolRequest } from '../shared/protocol.js';
 import { PROTOCOL_VERSION, VERSION } from '../shared/version.js';
+
+const cursorInt = (value: string | null): number | null => {
+  if (value === null) return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+};
 import { Broker, ToolError } from './broker.js';
 import { HttpCloudCli } from './cloudcli.js';
 import { Git } from './git.js';
@@ -135,12 +141,22 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
     if (!authorized) throw new HttpError(401, 'set the plugin secret "apiKey" to a CloudCLI API key');
 
     if (p === '/setup' && method === 'POST') { await d.cloudcli.saveApiKey(String((await readJson(req)).apiKey ?? '')); return { ok: true }; }
-    if (p === '/state' && method === 'GET') return d.broker.state(url.searchParams.get('session'), url.searchParams.get('run'));
+    if (p === '/state' && method === 'GET') return d.broker.state(url.searchParams.get('session'), url.searchParams.get('run'),
+      cursorInt(url.searchParams.get('before_event')), cursorInt(url.searchParams.get('before_message')),
+      cursorInt(url.searchParams.get('after_event')), cursorInt(url.searchParams.get('after_message')));
     if (p === '/diagnostics' && method === 'GET') return {
       version: VERSION, protocol: PROTOCOL_VERSION, node: process.version,
       db: { path: d.dbFile, ...d.store.diagnostics(now()) }, registration: d.registration(),
       cloudcli: await d.cloudcli.health(2000),
     };
+    const resultMatch = p.match(/^\/agents\/([^/]+)\/result$/);
+    if (resultMatch && method === 'GET') {
+      let worker: string;
+      try { worker = decodeURIComponent(resultMatch[1]); } catch { throw new HttpError(400, 'malformed agent id encoding'); }
+      const agent = d.store.agent(worker);
+      if (!agent) throw new HttpError(404, `No agent ${worker}`);
+      return d.store.resultDetails(worker);
+    }
     if (p === '/config' && method === 'GET') return config();
     if (p === '/config' && method === 'PUT') {
       const body = await readJson(req);

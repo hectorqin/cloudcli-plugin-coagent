@@ -23,6 +23,8 @@ this chat (an approval form) or from the CoAgent tab. Keep talking to the user i
    It also returns early when a worker is **paused** by a provider usage/rate limit ("<id> paused (usage limit),
    auto-resume at <time>"). The broker resumes that worker by itself in its own session at that time, and it keeps its
    slot. Usually just call `wait_for_agents` again; hand it off (step 5) only if the wait is too long.
+   Worker deliveries contain compact summaries, verification and open issues. Call `get_result(worker)` only when you
+   need that worker's full details; this keeps routine results out of your context.
 4. **Review.** For a worker's result, either `send_message` it back with concrete rework (then wait again), spawn a
    reviewer, or call `request_merge` for that worker. A merge needs the user's approval (in this chat or the tab);
    the broker performs the merge into your checked-out branch and tells you the outcome, including conflicts.
@@ -41,7 +43,8 @@ this chat (an approval form) or from the CoAgent tab. Keep talking to the user i
    gives it the original task, the old worker's recent activity, result or error, and undelivered messages. Put any
    review feedback it must address in `note`. A pending merge request for the old worker is rejected; request a merge
    for the new one when it reports.
-6. Use `list_agents` to see everyone's status.
+6. Use `list_agents` to see active/reworkable workers. Pass `include_finished: true` only when you need merged or ended
+   history. Read-only workers auto-end after reporting but remain reworkable: `send_message` reopens their session.
 
 ## Pipeline template
 If the user asks for the standard pipeline, plan it as:

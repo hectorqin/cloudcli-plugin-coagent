@@ -76,6 +76,33 @@ describe('versioned schema migrations', () => {
     expect(fs.readdirSync(path.join(dir, 'backups'))).toHaveLength(1);
   });
 
+  it('upgrades v7 to v8 result details, preserves agent data, and backs up exactly once', () => {
+    const { dir, file } = tempFile();
+    new Store(file).close();
+    const old = new DatabaseSync(file);
+    old.exec('PRAGMA foreign_keys = OFF');
+    for (const column of ['result_details', 'result_files', 'result_verification', 'result_open_issues']) {
+      old.exec(`ALTER TABLE agents DROP COLUMN ${column}`);
+    }
+    old.exec('PRAGMA user_version = 7');
+    old.prepare(`INSERT INTO runs (id, lead_agent_id, project_path, created_at) VALUES ('r', 'lead', '/repo', 't')`).run();
+    old.prepare(`INSERT INTO agents (id, run_id, role, provider, cwd, status, result, created_at)
+      VALUES ('lead', 'r', 'lead', 'claude', '/repo', 'lead', 'existing summary', 't')`).run();
+    old.close();
+
+    new Store(file).close();
+    const upgraded = new DatabaseSync(file, { readOnly: true });
+    expect(userVersion(upgraded)).toBe(8);
+    expect((upgraded.prepare('PRAGMA table_info(agents)').all() as { name: string }[]).map((x) => x.name))
+      .toEqual(expect.arrayContaining(['result_details', 'result_files', 'result_verification', 'result_open_issues']));
+    expect(upgraded.prepare("SELECT result FROM agents WHERE id = 'lead'").get()).toEqual({ result: 'existing summary' });
+    expect(pendingMigrations(upgraded)).toEqual([]);
+    upgraded.close();
+    expect(fs.readdirSync(path.join(dir, 'backups'))).toHaveLength(1);
+    new Store(file).close();
+    expect(fs.readdirSync(path.join(dir, 'backups'))).toHaveLength(1);
+  });
+
   it('backs up only when the ledger version changes, not for same-version drift repair', () => {
     const { dir, file } = tempFile();
     new Store(file).close();

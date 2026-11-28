@@ -128,13 +128,15 @@ function agentRow(a: AgentDTO, opts: { activity: boolean; pending?: boolean; not
     ${acts.length ? `<div class="cat-act">${acts.map((x) => `<div title="${esc(x.text)}">${esc(x.text)}</div>`).join('')}</div>` : ''}
     ${a.lastError ? `<div class="m" style="color:var(--bad)">${esc(clip(a.lastError, 200))}</div>` : ''}
     ${resume ? `<div class="row cat-resume">${resume}</div>` : ''}${opts.note ? `<div class="m">${esc(opts.note)}</div>` : ''}
-    ${a.result ? `<details><summary>Result</summary><pre>${esc(a.result)}</pre></details>` : ''}</div>`;
+    ${a.result ? `<details data-result="${esc(a.id)}"><summary>Result summary</summary><pre>${esc(a.result)}</pre>
+      <button data-full-result="${esc(a.id)}">Load full text</button><pre data-result-body></pre></details>` : ''}</div>`;
 }
 
 const workersOf = (run: RunDetailDTO) => run.agents.filter((a) => a.role !== 'lead');
 
 /** wait_start windows of the run's lead, oldest first (`end` null = still waiting). */
 function waitWindows(run: RunDetailDTO): { agents: string[]; end: number | null }[] {
+  if (run.facts) return run.facts.waitWindows;
   const windows: { agents: string[]; end: number | null }[] = [];
   for (const e of run.events) {
     if (e.agentId !== run.run.leadAgentId) continue;
@@ -253,7 +255,8 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null, cleanup: Clea
       return `<div class="cat-h"><span class="t">Spawned</span><span class="s">${esc(who)} — ${esc(clip(String(args.task ?? ''), 90))}</span>`
         + `${a ? statusBadge(a) + usageSpan(a) : callBadge(ctx)}${open}</div>`
         + (resume || resumeNote ? `<div class="cat-a"><div class="row cat-resume">${resume}</div>${resumeNote ? `<div class="m">${esc(resumeNote)}</div>` : ''}</div>` : '')
-        + (a?.result ? `<div class="cat-a"><details><summary>Result</summary><pre>${esc(a.result)}</pre></details></div>` : '')
+        + (a?.result ? `<div class="cat-a"><details data-result="${esc(a.id)}"><summary>Result summary</summary><pre>${esc(a.result)}</pre>
+          <button data-full-result="${esc(a.id)}">Load full text</button><pre data-result-body></pre></details></div>` : '')
         + (a ? '' : resultBlock);
     }
     case 'wait_for_agents': {
@@ -330,6 +333,18 @@ export function renderTool(container: HTMLElement, initial: ToolContext, host: T
     if (live()) timer = setTimeout(() => { void refresh(); }, POLL_MS);
   }
   root.addEventListener('click', (ev) => {
+    const full = (ev.target as Element).closest<HTMLButtonElement>('[data-full-result]');
+    if (full) {
+      const details = full.closest<HTMLDetailsElement>('details[data-result]');
+      full.disabled = true;
+      void host.rpc('GET', `agents/${encodeURIComponent(full.dataset.fullResult!)}/result`).then((value) => {
+        const result = value as { details?: unknown; summary?: unknown };
+        const body = details?.querySelector<HTMLElement>('[data-result-body]');
+        if (body) body.textContent = String(result.details ?? result.summary ?? '(none)');
+        full.remove();
+      }, (e) => { full.disabled = false; full.textContent = `Error: ${(e as Error).message}`; });
+      return;
+    }
     const btn = (ev.target as Element).closest<HTMLElement>('[data-open]');
     if (btn) host.openSession(btn.dataset.open!);
     const resumeBtn = (ev.target as Element).closest<HTMLButtonElement>('[data-resume],[data-cancel-resume]');

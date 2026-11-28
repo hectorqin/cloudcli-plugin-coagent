@@ -9,6 +9,7 @@ export type ToolName =
   | 'send_message'
   | 'read_inbox'
   | 'report_result'
+  | 'get_result'
   | 'request_merge'
   | 'list_agents'
   | 'wait_for_agents'
@@ -148,6 +149,9 @@ export interface AgentDTO {
   status: AgentStatus;
   task: string | null;
   result: string | null;
+  resultFiles?: string[];
+  resultVerification?: string | null;
+  resultOpenIssues?: string | null;
   lastError: string | null;
   /** Paused workers: when the broker resumes it (ISO), and why it paused ("usage limit" / "rate limit"). */
   resumeAt?: string | null;
@@ -188,6 +192,7 @@ export interface GateDTO {
 export type EventType =
   | 'run_started' | 'run_ended' | 'spawned' | 'turn_start' | 'turn_end' | 'gate_opened' | 'gate_decided' | 'merge'
   | 'wait_start' | 'wait_end' | 'recovered' | 'agent_ended'
+  | 'agent_reopened'
   | 'workspace_archived' | 'workspace_deleted' | 'branches_deleted'
   | 'paused' | 'resumed' | 'resume_cancelled' | 'handoff';
 
@@ -207,6 +212,16 @@ export interface RunDetailDTO {
   messages: MessageDTO[];
   gates: GateDTO[];
   events: EventDTO[];
+  /** Facts derived from complete history, so paged timeline rows cannot break controls or notifications. */
+  facts?: {
+    cleanup: Record<string, 'archived' | 'deleted'>;
+    waitWindows: { agents: string[]; end: number | null; reason?: string; allFinished?: boolean }[];
+  };
+}
+
+export interface HistoryCursorDTO {
+  beforeEvent: number | null;
+  beforeMessage: number | null;
 }
 
 /** Response of GET /state for the tab. */
@@ -216,4 +231,8 @@ export interface StateDTO {
   me: string | null;
   current: RunDetailDTO | null;
   runs: (RunDTO & { agentCount: number; pendingGates: number })[];
+  /** Total run count; `runs` contains only the newest 50. */
+  runsCount?: number;
+  /** Non-null ids mean older timeline rows can be requested with the corresponding `before_*` query. */
+  history?: HistoryCursorDTO | null;
 }
