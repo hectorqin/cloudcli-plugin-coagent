@@ -771,7 +771,7 @@ describe('wait_for_agents and batched results', () => {
 
   it('records the wait in the timeline', async () => {
     const run = await startApprovedRun();
-    await spawnHeld();
+    const w = await spawnHeld();
     await wait();
     cc.holds.splice(0).forEach((x) => x());
     await broker.settle();
@@ -779,6 +779,7 @@ describe('wait_for_agents and batched results', () => {
     const types = store.events(run.id).map((e) => e.type);
     expect(types.filter((t) => t === 'wait_start')).toHaveLength(1);
     expect(types.at(-1)).toBe('wait_end');
+    expect(store.events(run.id).at(-1)!.data).toMatchObject({ reason: 'done', agents: [w.id], allFinished: true });
   });
 });
 

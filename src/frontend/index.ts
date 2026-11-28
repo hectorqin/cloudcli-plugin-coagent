@@ -6,7 +6,7 @@ import { drawerUsageHtml, laneUsageHtml, runUsageHtml, runUsageText } from './us
 import { controlsLocked, runPhase, runPhaseBadge } from './runPhase.js';
 import { cleanupTarget, recordedCleanupStatus, safeWorkerProject } from './workspaceCleanup.js';
 import { utcClock } from './clock.js';
-import { loadNotificationOptIn, notificationCounts, NotificationDeduper, saveNotificationOptIn } from './notifications.js';
+import { loadNotificationOptIn, notificationCounts, NotificationDeduper, safeStorage, saveNotificationOptIn } from './notifications.js';
 
 interface PluginContext {
   theme: 'dark' | 'light';
@@ -97,8 +97,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   /** Gate diffs the user opened: kept open across re-renders (the diff itself is cached by diffView). */
   const openDiffs = new Set<number>();
   const notificationDeduper = new NotificationDeduper();
-  let notificationsEnabled = false;
-  try { notificationsEnabled = loadNotificationOptIn(window.localStorage); } catch { /* storage unavailable */ }
+  let notificationsEnabled = loadNotificationOptIn(safeStorage());
 
   const applyTheme = () => root.classList.toggle('dark', api.context.theme === 'dark');
   applyTheme();
@@ -112,29 +111,40 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       const next = (await api.rpc('GET', `state?${q}`)) as StateDTO;
       error = '';
       const json = JSON.stringify(next);
-      showNotifications(next);
       if (!force && json === lastJson) return;
       state = next;
       lastJson = json;
+      showNotifications(next);
     } catch (e) {
       error = (e as Error).message;
     }
     render();
   }
 
+  /** Never throws: a notification problem must not stop the refresh that called it. */
   function showNotifications(next: StateDTO) {
-    const intents = notificationDeduper.next(next.current);
-    if (!notificationsEnabled || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
-    for (const intent of intents) {
-      const notice = new Notification(intent.title, { body: intent.body, tag: intent.key });
-      notice.onclick = () => {
-        window.focus();
-        if (intent.target) selected = intent.target.type === 'agent'
-          ? { type: 'agent', id: intent.target.id } : { type: 'gate', id: intent.target.id };
-        render();
-        notice.close();
-      };
-    }
+    try {
+      const intents = notificationDeduper.next(next.current);
+      if (!notificationsEnabled || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+      for (const intent of intents) {
+        let notice: Notification;
+        try {
+          notice = new Notification(intent.title, { body: intent.body, tag: intent.key });
+        } catch {
+          // e.g. "Illegal constructor" on Chrome Android (only service workers may notify there): turn off quietly.
+          notificationsEnabled = false;
+          saveNotificationOptIn(safeStorage(), false);
+          return;
+        }
+        notice.onclick = () => {
+          window.focus();
+          if (intent.target) selected = intent.target.type === 'agent'
+            ? { type: 'agent', id: intent.target.id } : { type: 'gate', id: intent.target.id };
+          render();
+          notice.close();
+        };
+      }
+    } catch { /* never block refresh */ }
   }
 
   async function act(fn: () => Promise<unknown>) {
@@ -497,8 +507,8 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     const ds = (el as HTMLElement).dataset;
     const id = ds.id ?? '';
     switch (ds.act) {
-      case 'open-run': selectedRun = id; selected = null; firstPaint = true; void refresh(true); break;
-      case 'back': selectedRun = null; selected = null; void refresh(true); break;
+      case 'open-run': selectedRun = id; selected = null; firstPaint = true; notificationDeduper.reset(); void refresh(true); break;
+      case 'back': selectedRun = null; selected = null; notificationDeduper.reset(); void refresh(true); break;
       case 'select':
         selected = ds.type === 'agent' ? { type: 'agent', id } : { type: ds.type as Ref['type'], id: Number(id) } as Ref;
         render();
@@ -508,18 +518,24 @@ export function mount(container: HTMLElement, api: PluginAPI) {
         const checkbox = el as HTMLInputElement;
         if (!checkbox.checked) {
           notificationsEnabled = false;
-          saveNotificationOptIn(window.localStorage, false);
+          saveNotificationOptIn(safeStorage(), false);
           render();
           break;
         }
         void (async () => {
           let permission: NotificationPermission = 'denied';
-          if (typeof Notification !== 'undefined') permission = Notification.permission === 'default'
-            ? await Notification.requestPermission() : Notification.permission;
-          notificationsEnabled = permission === 'granted';
-          saveNotificationOptIn(window.localStorage, notificationsEnabled);
-          if (!notificationsEnabled) error = 'Browser notifications were not enabled (permission denied or unavailable).';
-          render();
+          try {
+            if (typeof Notification !== 'undefined') permission = Notification.permission === 'default'
+              ? await Notification.requestPermission() : Notification.permission;
+          } catch {
+            permission = 'denied';
+          } finally {
+            // A rejected requestPermission() still re-renders, which unchecks the box.
+            notificationsEnabled = permission === 'granted';
+            saveNotificationOptIn(safeStorage(), notificationsEnabled);
+            if (!notificationsEnabled) error = 'Browser notifications were not enabled (permission denied or unavailable).';
+            render();
+          }
         })();
         break;
       }
@@ -657,7 +673,9 @@ export function mount(container: HTMLElement, api: PluginAPI) {
 
   const onResize = () => render();
   window.addEventListener('resize', onResize);
-  const unsub = api.onContextChange(() => { applyTheme(); selectedRun = null; selected = null; firstPaint = true; void refresh(true); });
+  const unsub = api.onContextChange(() => {
+    applyTheme(); selectedRun = null; selected = null; firstPaint = true; notificationDeduper.reset(); void refresh(true);
+  });
   const timer = window.setInterval(() => { void refresh(); }, POLL_MS);
   void refresh(true);
 

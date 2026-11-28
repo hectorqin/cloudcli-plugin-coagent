@@ -207,8 +207,6 @@ export interface RunDetailDTO {
   messages: MessageDTO[];
   gates: GateDTO[];
   events: EventDTO[];
-  /** Process-local: the lead currently has a wait_for_agents call open. */
-  leadWaiting?: boolean;
 }
 
 /** Response of GET /state for the tab. */
