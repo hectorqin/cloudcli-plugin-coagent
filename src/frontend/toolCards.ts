@@ -203,7 +203,10 @@ export function agentsFor(ctx: ToolContext, run: RunDetailDTO | null): AgentDTO[
     return workersOf(run).filter((a) => ids.includes(a.id));
   }
   if (name === 'request_merge') return run.agents.filter((a) => a.id === input(ctx).worker);
-  if (name === 'request_review') return run.agents.filter((a) => a.id === input(ctx).worker || a.role === 'reviewer');
+  if (name === 'request_review') {
+    const reviewer = text.match(/Spawned (reviewer-[a-z0-9]+)/)?.[1];
+    return run.agents.filter((a) => a.id === input(ctx).worker || a.id === reviewer);
+  }
   return [];
 }
 

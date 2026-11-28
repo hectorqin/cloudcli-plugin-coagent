@@ -79,6 +79,12 @@ describe('tool cards', () => {
     expect(html).not.toContain('Bash: npm test');
   });
 
+  it('request_review resolves only its subject and newly spawned reviewer, not reviewers from older rounds', () => {
+    const r2: RunDetailDTO = { ...run, agents: [...run.agents, agent('reviewer-old', 'reviewer', { status: 'ended' })] };
+    const c = ctx('request_review', { worker: 'coder-1' }, 'Requested review round 2. Spawned reviewer-2 on codex.');
+    expect(agentsFor(c, r2).map((a) => a.id)).toEqual(['coder-1', 'reviewer-2']);
+  });
+
   it('wait_for_agents shows live activity while running', () => {
     expect(cardHtml(ctx('wait_for_agents', {}, null, 'running'), state)).toContain('Bash: npm test');
   });

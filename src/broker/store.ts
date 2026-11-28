@@ -831,6 +831,9 @@ export class Store {
   setReviewRunning(id: number) {
     this.db.prepare("UPDATE reviews SET status = 'running' WHERE id = ? AND status = 'pending'").run(id);
   }
+  updateGateReviews(id: number, reviews: ReviewDTO[]) {
+    this.db.prepare('UPDATE gates SET review_rounds = ? WHERE id = ?').run(JSON.stringify(reviews), id);
+  }
   skipReview(runId: string, subjectWorker: string, round: number, provider: Provider, workerHead: string): number {
     const id = this.addReview(runId, subjectWorker, round, null, provider, workerHead, 'skipped');
     this.db.prepare('UPDATE reviews SET decided_at = ? WHERE id = ?').run(this.ts(), id);

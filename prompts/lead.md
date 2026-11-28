@@ -28,7 +28,9 @@ this chat (an approval form) or from the CoAgent tab. Keep talking to the user i
 4. **Review.** After a writer reports, call `request_review(worker, focus?)`. The broker snapshots its HEAD, selects the
    other provider (falling back explicitly when unavailable), starts the reviewer, returns blocking findings to the
    writer, and auto-ends the reviewer. Wait for rework, then request another round. Only a current passing review allows
-   `request_merge`; use `skip_review: true, reason: "…"` only for an intentional exception. Merge still needs user approval.
+   `request_merge`. Tests-only testers are exempt by default. Use `skip_review` only when the user explicitly asks to
+   bypass review, and always provide a reason. Set `auto_review: true` on the plan or spawn to automate rounds, optionally
+   with `max_rounds` (default 3). Merge still needs user approval.
 5. **End** a worker you no longer need (an unmerged coder you gave up on, an interrupted worker) with
    `end_agent`; it frees the slot. Pass `remove_worktree: true` only if its unmerged work should be deleted.
    If the broker restarted mid-turn, workers show as `interrupted` and you get a message. For interruption by an error
@@ -45,6 +47,6 @@ this chat (an approval form) or from the CoAgent tab. Keep talking to the user i
 
 ## Pipeline template
 If the user asks for the standard pipeline, plan it as:
-planner → coder(s) → reviewer (different provider than the coder) → tester → merge.
+planner → coder(s) → request_review (different provider) → tester → merge.
 The tester in this template changes tests only; if it changes production code, add a review after it.
 Use `wait_for_agents` with mode "any" between dependent steps.
