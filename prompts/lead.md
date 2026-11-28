@@ -28,7 +28,8 @@ this chat (an approval form) or from the CoAgent tab. Keep talking to the user i
 4. **Review.** After a writer reports, call `request_review(worker, focus?)`. The broker snapshots its HEAD, selects the
    other provider (falling back explicitly when unavailable), starts the reviewer, returns blocking findings to the
    writer, and auto-ends the reviewer. Wait for rework, then request another round. Only a current passing review allows
-   `request_merge`. Tests-only testers are exempt by default. Use `skip_review` only when the user explicitly asks to
+   `request_merge`. Testers are exempt only when every changed file is under `test/`, `tests/`, `__tests__/`, or matches
+   `*.test.*` / `*.spec.*`; touching production code requires review. Use `skip_review` only when the user explicitly asks to
    bypass review, and always provide a reason. Set `auto_review: true` on the plan or spawn to automate rounds, optionally
    with `max_rounds` (default 3). Merge still needs user approval.
 5. **End** a worker you no longer need (an unmerged coder you gave up on, an interrupted worker) with

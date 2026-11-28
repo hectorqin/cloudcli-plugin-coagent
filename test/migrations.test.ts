@@ -103,7 +103,7 @@ describe('versioned schema migrations', () => {
     expect(fs.readdirSync(path.join(dir, 'backups'))).toHaveLength(1);
   });
 
-  it('upgrades v7 to v8 result details, preserves agent data, and backs up exactly once', () => {
+  it('upgrades v7 through v9, preserving result data and adding reviews with one backup', () => {
     const { dir, file } = tempFile();
     new Store(file).close();
     const old = new DatabaseSync(file);
@@ -119,10 +119,11 @@ describe('versioned schema migrations', () => {
 
     new Store(file).close();
     const upgraded = new DatabaseSync(file, { readOnly: true });
-    expect(userVersion(upgraded)).toBe(8);
+    expect(userVersion(upgraded)).toBe(9);
     expect((upgraded.prepare('PRAGMA table_info(agents)').all() as { name: string }[]).map((x) => x.name))
       .toEqual(expect.arrayContaining(['result_details', 'result_files', 'result_verification', 'result_open_issues']));
     expect(upgraded.prepare("SELECT result FROM agents WHERE id = 'lead'").get()).toEqual({ result: 'existing summary' });
+    expect(upgraded.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='reviews'").get()).toEqual({ name: 'reviews' });
     expect(pendingMigrations(upgraded)).toEqual([]);
     upgraded.close();
     expect(fs.readdirSync(path.join(dir, 'backups'))).toHaveLength(1);

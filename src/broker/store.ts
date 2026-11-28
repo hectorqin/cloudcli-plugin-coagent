@@ -648,8 +648,9 @@ export class Store {
     const data = JSON.parse(String(r.data)) as Record<string, unknown>;
     return data.reason === 'auto' && (data.after === 'report' || data.after === 'review');
   }
-  /** A3 overrides this with persisted review state; the hook keeps A1 lifecycle safe before reviews land. */
-  hasActiveReview(_agentId: string): boolean { return false; }
+  hasActiveReview(agentId: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM reviews WHERE reviewer_agent = ? AND status IN ('pending','running') LIMIT 1").get(agentId);
+  }
   /** Marks a worker paused until `resumeAt` (ISO). `nudge`: its resume must tell it that a turn was cut off. */
   pauseAgent(id: string, resumeAt: string, reason: string, nudge: boolean, lastError: string | null) {
     this.db.prepare(`UPDATE agents SET status = 'paused', resume_at = ?, pause_reason = ?, pause_nudge = ?, last_error = ?
