@@ -39,6 +39,15 @@ describe('buildTimeline', () => {
     expect(tl.lanes.map((l) => l.id)).toEqual([USER_LANE, 'lead', 'coder-1']);
   });
 
+  it('shows escaped-by-renderer review round labels on the subject worker lane', () => {
+    const d = detail();
+    d.reviews = [{
+      id: 1, runId: 'r', subjectWorker: 'coder-1', round: 2, reviewerAgent: 'reviewer-x', provider: 'codex',
+      status: 'blocked', verdict: 'block', findings: [], workerHead: 'abc', createdAt: t(8), decidedAt: t(9),
+    }];
+    expect(buildTimeline(d).lanes.find((l) => l.id === 'coder-1')!.sub).toContain('round 2 · block');
+  });
+
   it('orders rows chronologically and hides gate_decided (its message shows it)', () => {
     const labels = tl.rows.map((r) => (r.kind === 'tick' ? `tick@${r.lane}` : r.label));
     expect(labels).toEqual([

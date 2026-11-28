@@ -203,6 +203,10 @@ export function agentsFor(ctx: ToolContext, run: RunDetailDTO | null): AgentDTO[
     return workersOf(run).filter((a) => ids.includes(a.id));
   }
   if (name === 'request_merge') return run.agents.filter((a) => a.id === input(ctx).worker);
+  if (name === 'request_review') {
+    const reviewer = text.match(/Spawned (reviewer-[a-z0-9]+)/)?.[1];
+    return run.agents.filter((a) => a.id === input(ctx).worker || a.id === reviewer);
+  }
   return [];
 }
 
@@ -282,7 +286,8 @@ export function cardHtml(ctx: ToolContext, state: StateDTO | null, cleanup: Clea
       const title = kind === 'plan' ? 'Plan approval' : `Merge approval · ${String(args.worker ?? '')}`;
       const body = String(kind === 'plan' ? args.plan ?? '' : args.note ?? gate?.payload ?? '');
       const hint = st === 'pending' ? '<div class="cat-a m">Waiting for you: answer the form below, or in the CoAgent tab.</div>' : '';
-      const review = kind === 'merge' && gate?.snapshot ? `<div class="cat-a"><div class="m">Reviewed commit ${esc(gate.snapshot.workerHead.slice(0, 10))}</div>
+      const rounds = gate?.snapshot?.reviews?.map((r) => `<div class="m">round ${r.round} · ${esc(r.verdict ?? r.status)} · ${esc(r.provider)}</div>${r.findings.map((f) => `<div class="m">[${esc(f.severity)}] ${esc(f.file)}${f.line ? `:${f.line}` : ''}: ${esc(f.problem)} — ${esc(f.fix)}</div>`).join('')}`).join('') ?? '';
+      const review = kind === 'merge' && gate?.snapshot ? `<div class="cat-a"><div class="m">Reviewed commit ${esc(gate.snapshot.workerHead.slice(0, 10))}</div>${rounds}${gate.snapshot.skipReviewReason ? `<div class="m">Review skipped: ${esc(gate.snapshot.skipReviewReason)}</div>` : ''}
         <div class="cat-files">${gate.snapshot.files.map((f) => `<div class="cat-file"><span>${esc(f.status)}</span><span class="path">${f.oldPath ? `${esc(f.oldPath)} → ` : ''}${esc(f.path)}</span>${f.binary
           ? '<span>binary</span>' : `<span class="plus">+${f.additions ?? 0}</span><span class="minus">-${f.deletions ?? 0}</span>`}</div>`).join('')}</div>
         <details data-diff="${gate.id}"><summary>View diff${gate.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details></div>` : '';

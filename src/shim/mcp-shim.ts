@@ -160,7 +160,11 @@ const TOOLS: { name: ToolName; description: string; shape: z.ZodRawShape }[] = [
     description: 'Start (or continue) leading a coagent multi-agent run: submit your plan for the user to approve. '
       + 'Calling this makes the current session the LEAD and returns the lead protocol. Use it when the user asks you to '
       + 'delegate work to sub-agents / workers. The user may approve right here; otherwise end your turn and wait.',
-    shape: { plan: z.string().describe('Sub-tasks, the role for each (planner/coder/reviewer/tester), order, and how to verify.') },
+    shape: {
+      plan: z.string().describe('Sub-tasks, the role for each (planner/coder/reviewer/tester), order, and how to verify.'),
+      auto_review: z.boolean().optional().describe('Automatically review every writer after report_result.'),
+      max_rounds: z.number().int().positive().optional().describe('Automatic review cap (default 3).'),
+    },
   },
   {
     name: 'spawn_agent',
@@ -170,6 +174,8 @@ const TOOLS: { name: ToolName; description: string; shape: z.ZodRawShape }[] = [
       role: z.string().describe('planner | coder | reviewer | tester | custom role name'),
       task: z.string().describe('Self-contained task: goal, relevant files, constraints, definition of done.'),
       provider: z.enum(['claude', 'codex']).optional().describe('Defaults per role (writer and reviewer differ).'),
+      auto_review: z.boolean().optional().describe('Automatically request review after each report_result.'),
+      max_rounds: z.number().int().positive().optional().describe('Automatic review cap (default 3).'),
     },
   },
   {
@@ -214,10 +220,32 @@ const TOOLS: { name: ToolName; description: string; shape: z.ZodRawShape }[] = [
     },
   },
   {
+    name: 'request_review',
+    description: 'LEAD ONLY: snapshot a reported writer and start a structured review round, normally on the other provider.',
+    shape: {
+      worker: z.string().describe('Reported writer agent id'), focus: z.string().optional(),
+      provider: z.enum(['claude', 'codex']).optional().describe('Override the default other-provider reviewer.'),
+    },
+  },
+  {
+    name: 'report_review',
+    description: 'REVIEWERS created by request_review: submit a pass/block verdict and structured findings. The reviewer is auto-ended.',
+    shape: {
+      verdict: z.enum(['pass', 'block']),
+      findings: z.array(z.object({
+        severity: z.string(), file: z.string(), line: z.number().int().positive().optional(), problem: z.string(), fix: z.string(),
+      })),
+      agent_id: agentId,
+    },
+  },
+  {
     name: 'request_merge',
     description: "LEAD ONLY: ask the user to approve merging a worker's branch into your checked-out branch. "
       + 'The user may decide right here; otherwise end your turn and wait.',
-    shape: { worker: z.string().describe('Worker agent id'), note: z.string().optional() },
+    shape: {
+      worker: z.string().describe('Worker agent id'), note: z.string().optional(), skip_review: z.boolean().optional(),
+      reason: z.string().optional().describe('Required when skip_review is true; recorded in the merge gate.'),
+    },
   },
   {
     name: 'end_agent',

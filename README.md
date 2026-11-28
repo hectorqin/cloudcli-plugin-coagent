@@ -21,9 +21,10 @@ them, and merges their branches. The user approves the plan and every merge in t
 - **Tab** (`dist/index.js`) shows the run the current session belongs to (or all runs): agents, messages, and
   pending plan/merge approvals.
 
-Tools: `submit_plan`, `spawn_agent`, `wait_for_agents`, `send_message`, `read_inbox`, `report_result`, `request_merge`,
-`get_result`, `end_agent`, `handoff_agent`, `list_agents`. Worker reports keep a compact summary in ordinary delivery;
-`get_result` fetches full details on demand. With a Claude lead, plan and merge approvals appear as a form in the lead's chat (MCP elicitation), and
+Tools: `submit_plan`, `spawn_agent`, `wait_for_agents`, `send_message`, `read_inbox`, `report_result`, `request_review`,
+`report_review`, `request_merge`, `get_result`, `end_agent`, `handoff_agent`, `list_agents`. Worker reports keep a compact
+summary in ordinary delivery; `get_result` fetches full details on demand. With a Claude lead, plan and merge approvals
+appear as a form in the lead's chat (MCP elicitation), and
 `wait_for_agents` keeps the call open until the workers are done, so delegation reads like native subagents. With the
 CloudCLI fork's `toolRenderers` extension point, these calls render as live worker cards.
 Protocol prompts live in `prompts/` and are read fresh on every use.

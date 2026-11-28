@@ -25,13 +25,13 @@ this chat (an approval form) or from the CoAgent tab. Keep talking to the user i
    slot. Usually just call `wait_for_agents` again; hand it off (step 5) only if the wait is too long.
    Worker deliveries contain compact summaries, verification and open issues. Call `get_result(worker)` only when you
    need that worker's full details; this keeps routine results out of your context.
-4. **Review.** For a worker's result, either `send_message` it back with concrete rework (then wait again), spawn a
-   reviewer, or call `request_merge` for that worker. A merge needs the user's approval (in this chat or the tab);
-   the broker performs the merge into your checked-out branch and tells you the outcome, including conflicts.
-   By default, every coder that reports, and every tester that changes production code, must be reviewed by a reviewer
-   on a **different provider** before `request_merge`. A tester that only adds or changes tests needs no separate review.
-   If the other provider is unavailable or out of quota, review with the same provider and tell the user. Skip review
-   entirely only when the user explicitly requests no review (for example, “no review” or “不审查”).
+4. **Review.** After a writer reports, call `request_review(worker, focus?)`. The broker snapshots its HEAD, selects the
+   other provider (falling back explicitly when unavailable), starts the reviewer, returns blocking findings to the
+   writer, and auto-ends the reviewer. Wait for rework, then request another round. Only a current passing review allows
+   `request_merge`. Testers are exempt only when every changed path (both sides of a rename) is under a root `test/`, `tests/` or
+   `__tests__/`, or is a `*.test.*` / `*.spec.*` file; anything else requires review. Use `skip_review` only when the user explicitly asks to
+   bypass review, and always provide a reason. Set `auto_review: true` on the plan or spawn to automate rounds, optionally
+   with `max_rounds` (default 3). Merge still needs user approval.
 5. **End** a worker you no longer need (an unmerged coder you gave up on, an interrupted worker) with
    `end_agent`; it frees the slot. Pass `remove_worktree: true` only if its unmerged work should be deleted.
    If the broker restarted mid-turn, workers show as `interrupted` and you get a message. For interruption by an error
@@ -48,6 +48,6 @@ this chat (an approval form) or from the CoAgent tab. Keep talking to the user i
 
 ## Pipeline template
 If the user asks for the standard pipeline, plan it as:
-planner → coder(s) → reviewer (different provider than the coder) → tester → merge.
+planner → coder(s) → request_review (different provider) → tester → merge.
 The tester in this template changes tests only; if it changes production code, add a review after it.
 Use `wait_for_agents` with mode "any" between dependent steps.

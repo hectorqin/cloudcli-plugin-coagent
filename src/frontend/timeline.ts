@@ -31,7 +31,11 @@ const firstLine = (s: string) => s.split('\n').find((l) => l.trim())?.trim() ?? 
 
 export function buildTimeline(d: RunDetailDTO): Timeline {
   const lanes: Lane[] = [{ id: USER_LANE, label: 'You', sub: 'approvals & messages' }];
-  for (const a of d.agents) lanes.push({ id: a.id, label: a.id, sub: `${a.role} · ${a.provider}` });
+  for (const a of d.agents) {
+    const rounds = (d.reviews ?? []).filter((r) => r.subjectWorker === a.id)
+      .map((r) => `round ${r.round} · ${r.verdict ?? r.status}`).join(' · ');
+    lanes.push({ id: a.id, label: a.id, sub: `${a.role} · ${a.provider}${rounds ? ` · ${rounds}` : ''}` });
+  }
   const laneOf = (id: string | null) => {
     const i = lanes.findIndex((l) => l.id === (id ?? USER_LANE));
     return i < 0 ? 0 : i;

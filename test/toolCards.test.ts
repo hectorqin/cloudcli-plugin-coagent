@@ -25,6 +25,25 @@ const ctx = (toolName: string, toolInput: unknown, result: string | null, status
 });
 
 describe('tool cards', () => {
+  it('renders merge review rounds/findings and escapes their content', () => {
+    const reviewed: RunDetailDTO = {
+      ...run,
+      gates: [{
+        id: 9, runId: 'r', kind: 'merge', requestedBy: 'lead', subjectAgent: 'coder-1', payload: 'merge', status: 'pending',
+        comment: null, createdAt: '', snapshot: {
+          workerHead: '1234567890abcdef', leadHead: 'lead', mergeBase: 'base', files: [], diffTruncated: false,
+          reviews: [{ id: 1, runId: 'r', subjectWorker: 'coder-1', round: 1, reviewerAgent: 'reviewer-2', provider: 'codex',
+            status: 'blocked', verdict: 'block', workerHead: '123', createdAt: '', decidedAt: '',
+            findings: [{ severity: 'high<script>', file: 'src/<x>.ts', line: 7, problem: '<broken>', fix: 'escape & fix' }] }],
+        },
+      }],
+    };
+    const html = cardHtml(ctx('request_merge', { worker: 'coder-1' }, 'gate #9'), { ...state, current: reviewed });
+    expect(html).toContain('round 1 · block · codex');
+    expect(html).toContain('high&#60;script&#62;');
+    expect(html).toContain('src/&#60;x&#62;.ts');
+    expect(html).not.toContain('<broken>');
+  });
   it('offers Resume for failed/interrupted workers and Resume now / Cancel auto-resume for paused ones', () => {
     const r2: RunDetailDTO = {
       ...run,
@@ -58,6 +77,12 @@ describe('tool cards', () => {
     expect(html).toContain('working');
     expect(html).toContain('data-open="app-coder-1"');
     expect(html).not.toContain('Bash: npm test');
+  });
+
+  it('request_review resolves only its subject and newly spawned reviewer, not reviewers from older rounds', () => {
+    const r2: RunDetailDTO = { ...run, agents: [...run.agents, agent('reviewer-old', 'reviewer', { status: 'ended' })] };
+    const c = ctx('request_review', { worker: 'coder-1' }, 'Requested review round 2. Spawned reviewer-2 on codex.');
+    expect(agentsFor(c, r2).map((a) => a.id)).toEqual(['coder-1', 'reviewer-2']);
   });
 
   it('wait_for_agents shows live activity while running', () => {
