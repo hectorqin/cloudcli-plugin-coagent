@@ -45,6 +45,8 @@ export function cleanupTarget(agent: AgentDTO, run: RunDetailDTO): CleanupTarget
 export function recordedCleanupStatus(agent: AgentDTO, run: RunDetailDTO): WorkspaceCleanupStatus | null {
   const target = cleanupTarget(agent, run);
   if (!target) return null;
+  const fact = run.facts?.cleanup[`${agent.id}:${target.kind}`];
+  if (fact) return fact;
   const events = run.events.filter((event) => event.agentId === agent.id && event.data.kind === target.kind);
   if (events.some((event) => event.type === 'workspace_deleted')) return 'deleted';
   return events.some((event) => event.type === 'workspace_archived') ? 'archived' : null;

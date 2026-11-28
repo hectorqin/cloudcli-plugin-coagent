@@ -81,6 +81,17 @@ describe('tab attention notifications', () => {
     expect(deduper.next(a)).toEqual([]);
   });
 
+  it('uses complete-history wait facts, so loading an older event page cannot emit a stale finished notification', () => {
+    const d = detail();
+    d.facts = { cleanup: {}, waitWindows: [{ agents: ['old'], end: 7, reason: 'done', allFinished: true }] };
+    const deduper = new NotificationDeduper();
+    expect(deduper.next(d)).toEqual([]);
+    d.events.unshift(waitEnd(7, { reason: 'done', agents: ['old'], allFinished: true }));
+    expect(deduper.next(d)).toEqual([]);
+    d.facts.waitWindows.push({ agents: ['new'], end: 9, reason: 'done', allFinished: true });
+    expect(deduper.next(d).map((n) => n.key)).toEqual(['finished:r:9']);
+  });
+
   it('renders both badge counts and safely handles denied permission', async () => {
     const d = detail();
     d.gates.push({ id: 4, runId: 'r', kind: 'plan', requestedBy: 'lead', subjectAgent: null, payload: '', status: 'pending', comment: null, createdAt: '', snapshot: null });

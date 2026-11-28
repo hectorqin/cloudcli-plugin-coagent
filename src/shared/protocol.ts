@@ -192,6 +192,7 @@ export interface GateDTO {
 export type EventType =
   | 'run_started' | 'run_ended' | 'spawned' | 'turn_start' | 'turn_end' | 'gate_opened' | 'gate_decided' | 'merge'
   | 'wait_start' | 'wait_end' | 'recovered' | 'agent_ended'
+  | 'agent_reopened'
   | 'workspace_archived' | 'workspace_deleted' | 'branches_deleted'
   | 'paused' | 'resumed' | 'resume_cancelled' | 'handoff';
 
@@ -211,6 +212,11 @@ export interface RunDetailDTO {
   messages: MessageDTO[];
   gates: GateDTO[];
   events: EventDTO[];
+  /** Facts derived from complete history, so paged timeline rows cannot break controls or notifications. */
+  facts?: {
+    cleanup: Record<string, 'archived' | 'deleted'>;
+    waitWindows: { agents: string[]; end: number | null; reason?: string; allFinished?: boolean }[];
+  };
 }
 
 export interface HistoryCursorDTO {

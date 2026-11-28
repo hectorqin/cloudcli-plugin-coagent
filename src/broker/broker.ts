@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type {
-  AgentDTO, GateDTO, MergeSnapshot, MergeSnapshotData, MessageDTO, Provider, RunDetailDTO, StateDTO, ToolRequest, ToolResponse,
+  AgentDTO, EventDTO, GateDTO, MergeSnapshot, MergeSnapshotData, MessageDTO, Provider, RunDetailDTO, StateDTO, ToolRequest, ToolResponse,
 } from '../shared/protocol.js';
 import { SUPPORTED_PROVIDERS } from '../shared/protocol.js';
 import type { CloudCli } from './cloudcli.js';
@@ -279,15 +279,12 @@ export class Broker {
 
       case 'send_message': {
         const toRaw = str(a.to, 'to');
+        const body = str(a.body, 'body');
         const to = toRaw === 'lead' ? lead.id : toRaw;
-        let target = store.agent(to);
+        const target = store.agent(to);
         if (!target || target.runId !== run.id) fail(`No agent "${toRaw}" in this run. Use list_agents.`);
-        target = this.reopenAutoEndedReadOnly(target!);
-        if (target!.status === 'merged' || target!.status === 'ended') fail(`${to} is ${target!.status} and no longer receives messages.`);
         if (to === agent.id) fail('You cannot message yourself.');
-        const wait = this.slotWait(target!) ?? this.pausedWait(target!);
-        store.addMessage(run.id, agent.id, to, 'message', str(a.body, 'body'));
-        this.resume(target!);
+        const { wait } = this.queueMessage(target!, agent.id, body);
         this.kick();
         return `Message queued for ${to}. ${wait ?? `It is delivered when ${to} is idle (or when it calls read_inbox).`}`;
       }
@@ -338,7 +335,7 @@ export class Broker {
         const part = typeof a.part === 'string' ? a.part : 'details';
         const values: Record<string, unknown> = { summary: reported.summary, details: reported.details ?? reported.summary,
           files: reported.files, verification: reported.verification, open_issues: reported.openIssues };
-        if (!(part in values)) fail('part must be details, summary, files, verification, or open_issues.');
+        if (!Object.hasOwn(values, part)) fail('part must be details, summary, files, verification, or open_issues.');
         const value = values[part];
         return `${wid} result ${part}:\n${Array.isArray(value) ? value.join('\n') : value ?? '(none)'}`;
       }
@@ -609,13 +606,10 @@ export class Broker {
 
   userMessage(agentId: string, body: string) {
     const { store } = this.d;
-    let a = store.agent(agentId) ?? fail(`No agent ${agentId}`);
+    const cleanBody = str(body, 'body');
+    const a = store.agent(agentId) ?? fail(`No agent ${agentId}`);
     if (!this.runOpen(a.runId)) fail('This run has ended.', 409);
-    a = this.reopenAutoEndedReadOnly(a);
-    if (a.status === 'merged' || a.status === 'ended') fail(`${a.id} is ${a.status} and no longer receives messages.`);
-    const wait = this.slotWait(a) ?? this.pausedWait(a);
-    store.addMessage(a.runId, null, a.id, 'message', str(body, 'body'));
-    this.resume(a);
+    const { wait } = this.queueMessage(a, null, cleanBody);
     this.kick();
     return wait;
   }
@@ -802,23 +796,37 @@ export class Broker {
   private autoEndReportedReadOnly(agentId: string) {
     const { store } = this.d;
     const worker = store.agent(agentId);
-    if (!worker || !READONLY_ROLES.has(worker.role) || worker.status !== 'reported' || store.busy.has(worker.id)) return;
+    if (!worker || !READONLY_ROLES.has(worker.role) || worker.status !== 'reported' || store.busy.has(worker.id)
+      || this.detached.has(worker.id) || store.pendingCount(worker.id) > 0 || store.hasActiveReview(worker.id)) return;
     store.transaction(() => {
       const current = store.agent(agentId)!;
-      if (current.status !== 'reported' || store.busy.has(current.id)) return;
+      if (current.status !== 'reported' || store.busy.has(current.id) || this.detached.has(current.id)
+        || store.pendingCount(current.id) > 0 || store.hasActiveReview(current.id)) return;
       store.updateAgent(current.id, { status: 'ended' });
-      const cancelled = store.cancelQueued(current.id);
-      store.addEvent(current.runId, current.id, 'agent_ended', { reason: 'auto', after: 'report', cancelled });
+      store.addEvent(current.runId, current.id, 'agent_ended', { reason: 'auto', after: 'report' });
     });
   }
 
-  /** Auto-ended readers retain their CloudCLI session and can be brought back for another review/planning pass. */
-  private reopenAutoEndedReadOnly(worker: AgentDTO): AgentDTO {
+  /** Validated rework is queued atomically with reopening, so auto-end can never cancel or strand it. */
+  private queueMessage(worker: AgentDTO, from: string | null, body: string): { wait: string | null } {
     const { store } = this.d;
-    if (worker.status !== 'ended' || !READONLY_ROLES.has(worker.role) || !(worker.appSessionId || worker.providerSessionId)
-      || !store.wasAutoEndedAfterReport(worker.id)) return worker;
-    store.updateAgent(worker.id, { status: 'idle' });
-    return store.agent(worker.id)!;
+    let wait: string | null = null;
+    store.transaction(() => {
+      let current = store.agent(worker.id) ?? fail(`No agent ${worker.id}`);
+      if (current.status === 'ended' && READONLY_ROLES.has(current.role) && store.wasAutoEndedAfterReport(current.id)) {
+        if (!(current.appSessionId || current.providerSessionId)) {
+          fail(`${current.id} was auto-ended but its session is missing; spawn a fresh reader.`);
+        }
+        store.updateAgent(current.id, { status: 'idle' });
+        store.addEvent(current.runId, current.id, 'agent_reopened', { reason: 'rework', by: from ?? 'user' });
+        current = store.agent(current.id)!;
+      }
+      if (current.status === 'merged' || current.status === 'ended') fail(`${current.id} is ${current.status} and no longer receives messages.`);
+      wait = this.slotWait(current) ?? this.pausedWait(current);
+      this.resume(current);
+      store.addMessage(current.runId, from, current.id, 'message', body);
+    });
+    return { wait };
   }
 
   /**
@@ -1189,7 +1197,8 @@ export class Broker {
   }
 
   // ── state for the tab ─────────────────────────────────────────────
-  state(appSessionId: string | null, runId: string | null, beforeEvent: number | null = null, beforeMessage: number | null = null): StateDTO {
+  state(appSessionId: string | null, runId: string | null, beforeEvent: number | null = null, beforeMessage: number | null = null,
+    afterEvent: number | null = null, afterMessage: number | null = null): StateDTO {
     const { store, cloudcli } = this.d;
     const me = appSessionId ? store.agentByAppSession(appSessionId) : null;
     const showRun = runId ?? me?.runId ?? null;
@@ -1199,19 +1208,23 @@ export class Broker {
         autoRegister: store.getJson('autoRegister', true),
       },
       me: me?.id ?? null,
-      current: showRun ? this.detail(showRun, beforeEvent, beforeMessage) : null,
+      current: showRun ? this.detail(showRun, beforeEvent, beforeMessage, afterEvent, afterMessage) : null,
       runs: store.runSummaries(),
       runsCount: store.runCount(),
       history: showRun ? this.historyCursor(showRun, beforeEvent, beforeMessage) : null,
     };
   }
 
-  detail(runId: string, beforeEvent: number | null = null, beforeMessage: number | null = null): RunDetailDTO | null {
+  detail(runId: string, beforeEvent: number | null = null, beforeMessage: number | null = null,
+    afterEvent: number | null = null, afterMessage: number | null = null): RunDetailDTO | null {
     const { store } = this.d;
     const run = store.run(runId);
     return run
-      ? { run, agents: store.agents(runId), messages: store.messages(runId, 200, beforeMessage), gates: store.gates(runId),
-        events: store.events(runId, 200, beforeEvent) }
+      ? { run, agents: store.agents(runId),
+        messages: afterMessage !== null ? store.messagesAfter(runId, afterMessage) : store.messages(runId, 200, beforeMessage),
+        gates: store.gates(runId),
+        events: afterEvent !== null ? store.eventsAfter(runId, afterEvent) : store.events(runId, 200, beforeEvent),
+        facts: historyFacts(store.factEvents(runId), run.leadAgentId) }
       : null;
   }
 
@@ -1391,11 +1404,14 @@ export class Broker {
       for (const [id, due] of [...this.detached]) {
         if (due > this.now()) continue;
         const a = store.agent(id);
-        if (!a || a.status !== 'running' || store.run(a.runId)?.status !== 'active') { this.detached.delete(id); continue; }
+        if (!a || !['running', 'reported'].includes(a.status) || store.run(a.runId)?.status !== 'active') {
+          this.detached.delete(id); continue;
+        }
         const processing = await this.processing(a);
         if (processing !== false) { this.detached.set(id, this.now() + DETACHED_CHECK_MS); continue; }
         this.detached.delete(id);
         const now = store.agent(id)!;
+        if (now.status === 'reported') { this.autoEndReportedReadOnly(id); continue; }
         if (now.status !== 'running') continue; // it reported (or was ended) meanwhile
         store.transaction(() => {
           store.updateAgent(id, { status: 'idle' });
@@ -1630,6 +1646,30 @@ export class Broker {
   }
 }
 
+function historyFacts(events: EventDTO[], leadId: string): NonNullable<RunDetailDTO['facts']> {
+  const cleanup: Record<string, 'archived' | 'deleted'> = {};
+  const waitWindows: NonNullable<RunDetailDTO['facts']>['waitWindows'] = [];
+  for (const event of events) {
+    if ((event.type === 'workspace_archived' || event.type === 'workspace_deleted') && event.agentId) {
+      const kind = typeof event.data.kind === 'string' ? event.data.kind : '';
+      const key = `${event.agentId}:${kind}`;
+      if (event.type === 'workspace_deleted' || cleanup[key] !== 'deleted') {
+        cleanup[key] = event.type === 'workspace_deleted' ? 'deleted' : 'archived';
+      }
+    } else if (event.agentId === leadId && event.type === 'wait_start') {
+      waitWindows.push({ agents: Array.isArray(event.data.agents) ? event.data.agents.map(String) : [], end: null });
+    } else if (event.agentId === leadId && event.type === 'wait_end') {
+      const open = waitWindows.findLast((window) => window.end === null);
+      if (open) {
+        open.end = event.id;
+        open.reason = typeof event.data.reason === 'string' ? event.data.reason : undefined;
+        open.allFinished = event.data.allFinished === true;
+      }
+    }
+  }
+  return { cleanup, waitWindows };
+}
+
 function groupBy<T>(xs: T[], key: (x: T) => string): Map<string, T[]> {
   const m = new Map<string, T[]>();
   for (const x of xs) m.set(key(x), [...(m.get(key(x)) ?? []), x]);
@@ -1689,9 +1729,15 @@ function formatResultSummary(worker: string, result: {
   summary: string; files: string[]; verification: string | null; openIssues: string | null;
 }) {
   const parts = [result.summary];
-  if (result.files.length) parts.push(`Files: ${result.files.join(', ')}`);
-  if (result.verification) parts.push(`Verification: ${result.verification}`);
-  if (result.openIssues) parts.push(`Open issues: ${result.openIssues}`);
-  parts.push(`Full text: get_result(worker: "${worker}")`);
+  if (result.files.length) parts.push(`Files: ${compactResultPart(result.files.join(', '), worker, 'files')}`);
+  if (result.verification) parts.push(`Verification: ${compactResultPart(result.verification, worker, 'verification')}`);
+  if (result.openIssues) parts.push(`Open issues: ${compactResultPart(result.openIssues, worker, 'open_issues')}`);
+  parts.push(`Full text: get_result(worker: "${worker}"). If get_result is unavailable, restart the session.`);
   return parts.join('\n\n');
 }
+
+const compactResultPart = (text: string, worker: string, part: string, max = 750) => {
+  if (text.length <= max) return text;
+  const note = `… (truncated; full text via get_result(worker: "${worker}", part: "${part}"))`;
+  return `${text.slice(0, Math.max(0, max - note.length))}${note}`;
+};

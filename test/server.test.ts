@@ -131,6 +131,11 @@ describe('broker HTTP hardening and diagnostics', () => {
     });
   });
 
+  it('returns 400 for malformed result agent-id escapes', async () => {
+    const result = await request('GET', '/agents/%ZZ/result', { headers: { 'x-plugin-secret-apikey': 'tab-key' } });
+    expect(result).toMatchObject({ status: 400, body: { error: 'malformed agent id encoding' } });
+  });
+
   it('preserves reliability worker message notes and the end-agent route', async () => {
     const headers = { 'x-plugin-secret-apikey': 'tab-key' };
     expect(await request('POST', '/agents/coder-1/messages', { headers, body: '{"body":"continue"}' }))

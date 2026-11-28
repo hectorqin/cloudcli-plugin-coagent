@@ -33,7 +33,11 @@ export class NotificationDeduper {
     const attention = detail.agents.filter((a) => a.status === 'paused' || a.status === 'error');
     // The broker ends a wait with reason 'done' + allFinished when every targeted worker finished (its own notion of
     // finished, idle/reported included). Keyed by that wait_end event, i.e. by wait.
-    const finishedWaits = detail.events.filter((e) => e.type === 'wait_end' && e.data.reason === 'done' && e.data.allFinished === true);
+    const finishedWaits = detail.facts
+      ? detail.facts.waitWindows.filter((w) => w.end !== null && w.reason === 'done' && w.allFinished).map((w) => ({
+        id: w.end!, agentId: detail.run.leadAgentId, data: { agents: w.agents },
+      }))
+      : detail.events.filter((e) => e.type === 'wait_end' && e.data.reason === 'done' && e.data.allFinished === true);
     // Agents leave the set when they recover, so pausing again later notifies again.
     const attentionIds = new Set(attention.map((a) => a.id));
     if (this.runId !== detail.run.id) {

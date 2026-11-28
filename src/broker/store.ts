@@ -611,8 +611,10 @@ export class Store {
     const r = this.db.prepare("SELECT data FROM events WHERE agent_id = ? AND type = 'agent_ended' ORDER BY id DESC LIMIT 1").get(id) as Row | undefined;
     if (!r) return false;
     const data = JSON.parse(String(r.data)) as Record<string, unknown>;
-    return data.reason === 'auto' && data.after === 'report';
+    return data.reason === 'auto' && (data.after === 'report' || data.after === 'review');
   }
+  /** A3 overrides this with persisted review state; the hook keeps A1 lifecycle safe before reviews land. */
+  hasActiveReview(_agentId: string): boolean { return false; }
   /** Marks a worker paused until `resumeAt` (ISO). `nudge`: its resume must tell it that a turn was cut off. */
   pauseAgent(id: string, resumeAt: string, reason: string, nudge: boolean, lastError: string | null) {
     this.db.prepare(`UPDATE agents SET status = 'paused', resume_at = ?, pause_reason = ?, pause_nudge = ?, last_error = ?
@@ -732,6 +734,10 @@ export class Store {
     return (this.db.prepare(`SELECT * FROM (SELECT * FROM messages WHERE run_id = ?${clause} ORDER BY id DESC LIMIT ?) ORDER BY id`)
       .all(...args) as Row[]).map(toMessage);
   }
+  messagesAfter(runId: string, after: number, limit = 200): MessageDTO[] {
+    return (this.db.prepare('SELECT * FROM messages WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?')
+      .all(runId, after, limit) as Row[]).map(toMessage);
+  }
 
   // ── gates ─────────────────────────────────────────────────────────
   addGate(runId: string, kind: GateKind, requestedBy: string, subjectAgent: string | null, payload: string,
@@ -778,6 +784,21 @@ export class Store {
     const args = before ? [runId, before, limit] : [runId, limit];
     return (this.db.prepare(`SELECT * FROM (SELECT * FROM events WHERE run_id = ?${clause} ORDER BY id DESC LIMIT ?) ORDER BY id`)
       .all(...args) as Row[]).map((r) => ({
+      id: Number(r.id), runId: String(r.run_id), agentId: s(r.agent_id), type: String(r.type) as EventType,
+      data: JSON.parse(String(r.data)) as Record<string, unknown>, createdAt: String(r.created_at),
+    }));
+  }
+  eventsAfter(runId: string, after: number, limit = 200): EventDTO[] {
+    return (this.db.prepare('SELECT * FROM events WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?')
+      .all(runId, after, limit) as Row[]).map((r) => ({
+      id: Number(r.id), runId: String(r.run_id), agentId: s(r.agent_id), type: String(r.type) as EventType,
+      data: JSON.parse(String(r.data)) as Record<string, unknown>, createdAt: String(r.created_at),
+    }));
+  }
+  /** Small complete-history subset used to derive stable UI facts outside the paged timeline. */
+  factEvents(runId: string): EventDTO[] {
+    return (this.db.prepare(`SELECT * FROM events WHERE run_id = ? AND type IN
+      ('workspace_archived','workspace_deleted','wait_start','wait_end') ORDER BY id`).all(runId) as Row[]).map((r) => ({
       id: Number(r.id), runId: String(r.run_id), agentId: s(r.agent_id), type: String(r.type) as EventType,
       data: JSON.parse(String(r.data)) as Record<string, unknown>, createdAt: String(r.created_at),
     }));

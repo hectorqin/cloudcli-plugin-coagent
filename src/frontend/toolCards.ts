@@ -136,6 +136,7 @@ const workersOf = (run: RunDetailDTO) => run.agents.filter((a) => a.role !== 'le
 
 /** wait_start windows of the run's lead, oldest first (`end` null = still waiting). */
 function waitWindows(run: RunDetailDTO): { agents: string[]; end: number | null }[] {
+  if (run.facts) return run.facts.waitWindows;
   const windows: { agents: string[]; end: number | null }[] = [];
   for (const e of run.events) {
     if (e.agentId !== run.run.leadAgentId) continue;

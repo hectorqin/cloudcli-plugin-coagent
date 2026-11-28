@@ -142,7 +142,8 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
 
     if (p === '/setup' && method === 'POST') { await d.cloudcli.saveApiKey(String((await readJson(req)).apiKey ?? '')); return { ok: true }; }
     if (p === '/state' && method === 'GET') return d.broker.state(url.searchParams.get('session'), url.searchParams.get('run'),
-      cursorInt(url.searchParams.get('before_event')), cursorInt(url.searchParams.get('before_message')));
+      cursorInt(url.searchParams.get('before_event')), cursorInt(url.searchParams.get('before_message')),
+      cursorInt(url.searchParams.get('after_event')), cursorInt(url.searchParams.get('after_message')));
     if (p === '/diagnostics' && method === 'GET') return {
       version: VERSION, protocol: PROTOCOL_VERSION, node: process.version,
       db: { path: d.dbFile, ...d.store.diagnostics(now()) }, registration: d.registration(),
@@ -150,7 +151,8 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
     };
     const resultMatch = p.match(/^\/agents\/([^/]+)\/result$/);
     if (resultMatch && method === 'GET') {
-      const worker = decodeURIComponent(resultMatch[1]);
+      let worker: string;
+      try { worker = decodeURIComponent(resultMatch[1]); } catch { throw new HttpError(400, 'malformed agent id encoding'); }
       const agent = d.store.agent(worker);
       if (!agent) throw new HttpError(404, `No agent ${worker}`);
       return d.store.resultDetails(worker);

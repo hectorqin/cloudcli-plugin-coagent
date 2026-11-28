@@ -94,8 +94,10 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   const cleanupResults = new Map<string, string>();
   const cleanupPending = new Set<string>();
   const fullResults = new Map<string, string>();
-  const olderMessages = new Map<string, MessageDTO[]>();
-  const olderEvents = new Map<string, EventDTO[]>();
+  const loadedMessages = new Map<string, Map<number, MessageDTO>>();
+  const loadedEvents = new Map<string, Map<number, EventDTO>>();
+  const moreOlderMessages = new Map<string, boolean>();
+  const moreOlderEvents = new Map<string, boolean>();
   let endPanelRun: string | null = null;
   /** Gate diffs the user opened: kept open across re-renders (the diff itself is cached by diffView). */
   const openDiffs = new Set<number>();
@@ -110,6 +112,11 @@ export function mount(container: HTMLElement, api: PluginAPI) {
     const q = new URLSearchParams();
     if (ctx.session?.id) q.set('session', ctx.session.id);
     if (selectedRun) q.set('run', selectedRun);
+    const loadedRun = selectedRun ?? state?.current?.run.id;
+    if (loadedRun && loadedMessages.has(loadedRun)) {
+      q.set('after_message', String(Math.max(...loadedMessages.get(loadedRun)!.keys(), 0)));
+      q.set('after_event', String(Math.max(...loadedEvents.get(loadedRun)!.keys(), 0)));
+    }
     try {
       const next = (await api.rpc('GET', `state?${q}`)) as StateDTO;
       error = '';
@@ -118,12 +125,20 @@ export function mount(container: HTMLElement, api: PluginAPI) {
       state = next;
       if (next.current) {
         const id = next.current.run.id;
-        const messages = olderMessages.get(id) ?? [];
-        const events = olderEvents.get(id) ?? [];
-        const newestMessageIds = new Set(next.current.messages.map((x) => x.id));
-        const newestEventIds = new Set(next.current.events.map((x) => x.id));
-        next.current.messages = [...messages.filter((x) => !newestMessageIds.has(x.id)), ...next.current.messages];
-        next.current.events = [...events.filter((x) => !newestEventIds.has(x.id)), ...next.current.events];
+        const messages = loadedMessages.get(id) ?? new Map<number, MessageDTO>();
+        const events = loadedEvents.get(id) ?? new Map<number, EventDTO>();
+        const first = !loadedMessages.has(id);
+        for (const message of next.current.messages) messages.set(message.id, message);
+        for (const event of next.current.events) events.set(event.id, event);
+        loadedMessages.set(id, messages);
+        loadedEvents.set(id, events);
+        if (first) {
+          moreOlderMessages.set(id, next.history?.beforeMessage != null);
+          moreOlderEvents.set(id, next.history?.beforeEvent != null);
+        }
+        next.current.messages = [...messages.values()].sort((a, b) => a.id - b.id);
+        next.current.events = [...events.values()].sort((a, b) => a.id - b.id);
+        next.history = loadedCursor(id);
       }
       lastJson = json;
       showNotifications(next);
@@ -165,22 +180,35 @@ export function mount(container: HTMLElement, api: PluginAPI) {
   }
 
   async function loadOlder() {
-    const cursor = state?.history;
     const runId = state?.current?.run.id;
-    if (!cursor || !runId || (!cursor.beforeEvent && !cursor.beforeMessage)) return;
+    if (!runId) return;
+    const cursor = loadedCursor(runId);
+    if (!cursor.beforeEvent && !cursor.beforeMessage) return;
     const q = new URLSearchParams({ run: runId });
     if (api.context.session?.id) q.set('session', api.context.session.id);
     q.set('before_event', String(cursor.beforeEvent ?? 0));
     q.set('before_message', String(cursor.beforeMessage ?? 0));
     const older = await api.rpc('GET', `state?${q}`) as StateDTO;
     if (!state?.current || !older.current) return;
-    olderMessages.set(runId, [...older.current.messages, ...(olderMessages.get(runId) ?? [])]);
-    olderEvents.set(runId, [...older.current.events, ...(olderEvents.get(runId) ?? [])]);
-    state.current.messages = [...older.current.messages, ...state.current.messages];
-    state.current.events = [...older.current.events, ...state.current.events];
-    state.history = older.history;
+    const messages = loadedMessages.get(runId)!;
+    const events = loadedEvents.get(runId)!;
+    for (const message of older.current.messages) messages.set(message.id, message);
+    for (const event of older.current.events) events.set(event.id, event);
+    if (cursor.beforeMessage) moreOlderMessages.set(runId, older.history?.beforeMessage != null);
+    if (cursor.beforeEvent) moreOlderEvents.set(runId, older.history?.beforeEvent != null);
+    state.current.messages = [...messages.values()].sort((a, b) => a.id - b.id);
+    state.current.events = [...events.values()].sort((a, b) => a.id - b.id);
+    state.history = loadedCursor(runId);
     lastJson = ''; // the next ordinary poll may replace this accumulated view with the newest page.
     render();
+  }
+
+  function loadedCursor(runId: string) {
+    const min = <T extends { id: number }>(items: Map<number, T> | undefined) => items?.size ? Math.min(...items.keys()) : null;
+    return {
+      beforeMessage: moreOlderMessages.get(runId) ? min(loadedMessages.get(runId)) : null,
+      beforeEvent: moreOlderEvents.get(runId) ? min(loadedEvents.get(runId)) : null,
+    };
   }
 
   function render() {

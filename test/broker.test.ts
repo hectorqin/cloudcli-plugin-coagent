@@ -324,6 +324,38 @@ describe('v0.4 result summaries and finished-agent hygiene', () => {
     expect(store.agent(coder.id)!.status).toBe('reported');
   });
 
+  it('does not auto-end or cancel rework queued while a reader report turn is closing', async () => {
+    await startApprovedRun();
+    cc.next.push('hold');
+    const started = await broker.handleTool({ tool: 'spawn_agent', args: { role: 'reviewer', task: 'review' }, caller: LEAD });
+    const id = started.text.match(/Spawned (\S+)/)![1];
+    for (let i = 0; i < 50 && !cc.holds.length; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+    const reviewer = store.agent(id)!;
+    const reported = await broker.handleTool({ tool: 'report_result', args: { summary: 'LGTM', agent_id: id },
+      caller: workerCaller(reviewer.providerSessionId!, reviewer.provider) });
+    expect(reported.ok).toBe(true);
+    expect(store.agent(id)!.status).toBe('reported');
+    broker.userMessage(id, 'please also check X');
+    cc.holds.shift()!();
+    await broker.settle();
+    const rework = store.messages(reviewer.runId).find((m) => m.to === id && m.body === 'please also check X')!;
+    expect(rework.state).toBe('delivered');
+    expect(store.agent(id)!.status).not.toBe('ended');
+    expect(store.events(reviewer.runId).filter((e) => e.agentId === id && e.type === 'agent_ended')).toEqual([]);
+  });
+
+  it('validates rework before reopening and gives recovery guidance when the reader session is missing', async () => {
+    await startApprovedRun();
+    const reviewer = await spawn('reviewer');
+    await call('report_result', { summary: 'done' }, workerCaller(reviewer.providerSessionId!, reviewer.provider));
+    expect((await call('send_message', { to: reviewer.id, body: '   ' })).ok).toBe(false);
+    expect(store.agent(reviewer.id)!.status).toBe('ended');
+    store.updateAgent(reviewer.id, { appSessionId: null, providerSessionId: null });
+    const missing = await call('send_message', { to: reviewer.id, body: 'again' });
+    expect(missing.ok).toBe(false);
+    expect(missing.text).toMatch(/spawn a fresh reader/);
+  });
+
   it('stores structured details separately, enforces summaries, supports legacy long summaries and get_result', async () => {
     await startApprovedRun();
     const coder = await spawn('coder');
@@ -363,8 +395,27 @@ describe('v0.4 result summaries and finished-agent hygiene', () => {
     expect(Buffer.byteLength(waited.text)).toBeLessThan(Buffer.byteLength(details) / 10);
   });
 
+  it('caps every structured field delivered to the lead while preserving full parts on demand', async () => {
+    await startApprovedRun();
+    const worker = await spawn('coder');
+    const long = 'z'.repeat(4000);
+    await call('report_result', { summary: 'short', files: [long], verification: long, open_issues: long },
+      workerCaller(worker.providerSessionId!, worker.provider));
+    const body = store.messages(worker.runId).find((m) => m.kind === 'result' && m.from === worker.id)!.body;
+    expect(body.length).toBeLessThan(3000);
+    expect(body).toContain('part: "files"');
+    expect(body).toContain('part: "verification"');
+    expect(body).toContain('part: "open_issues"');
+    expect(body).toContain('restart the session');
+    expect((await call('get_result', { worker: worker.id, part: 'verification' })).text).toContain(long);
+    expect((await call('get_result', { worker: worker.id, part: 'constructor' })).ok).toBe(false);
+  });
+
   it('pages state history by event/message cursors and limits the run list', async () => {
     const run = await startApprovedRun();
+    store.addEvent(run.id, run.leadAgentId, 'wait_start', { agents: ['old-worker'] });
+    store.addEvent(run.id, run.leadAgentId, 'wait_end', { reason: 'done', allFinished: true });
+    store.addEvent(run.id, 'old-worker', 'workspace_archived', { kind: 'project' });
     for (let i = 0; i < 205; i++) {
       store.addMessage(run.id, null, run.leadAgentId, 'system', `m${i}`);
       store.addEvent(run.id, run.leadAgentId, 'recovered', { i });
@@ -377,6 +428,17 @@ describe('v0.4 result summaries and finished-agent hygiene', () => {
     expect(first.runsCount).toBe(56);
     expect(first.history!.beforeMessage).not.toBeNull();
     expect(first.history!.beforeEvent).not.toBeNull();
+    expect(first.current!.facts).toMatchObject({
+      cleanup: { 'old-worker:project': 'archived' },
+      waitWindows: [{ agents: ['old-worker'], reason: 'done', allFinished: true }],
+    });
+    const newestMessage = first.current!.messages.at(-1)!.id;
+    const newestEvent = first.current!.events.at(-1)!.id;
+    store.addMessage(run.id, null, run.leadAgentId, 'system', 'after-page');
+    store.addEvent(run.id, run.leadAgentId, 'recovered', { after: true });
+    const after = broker.state('lead-app', run.id, null, null, newestEvent, newestMessage);
+    expect(after.current!.messages.map((m) => m.body)).toContain('after-page');
+    expect(after.current!.events.some((e) => e.data.after === true)).toBe(true);
     const older = broker.state('lead-app', run.id, first.history!.beforeEvent, first.history!.beforeMessage);
     expect(older.current!.messages.length).toBeGreaterThan(0);
     expect(older.current!.messages.at(-1)!.id).toBeLessThan(first.current!.messages[0].id);

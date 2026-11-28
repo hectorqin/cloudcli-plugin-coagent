@@ -69,6 +69,9 @@ export function buildTimeline(d: RunDetailDTO): Timeline {
       case 'agent_ended':
         row = { kind: 'node', ts: e.createdAt, lane, label: e.data.handoff ? 'ended (handed off)' : 'ended', tone: 'muted', shape: 'square', ref };
         break;
+      case 'agent_reopened':
+        row = { kind: 'node', ts: e.createdAt, lane, label: 'reopened for rework', tone: 'accent', shape: 'square', ref };
+        break;
       case 'handoff':
         // An arrow from the old worker's lane to the worker that took over.
         row = {
