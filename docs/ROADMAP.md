@@ -261,3 +261,36 @@
 - **第二波**：token/耗时可见性、发布工程（CI、URL 安装、升级/卸载）、端到端验收（脚本 + 浏览器清单）。
 
 - **v0.3.0 发布（2026-11-26）**：第二波及追加项全部合并——token/耗时可见性、发布工程（CI、URL 安装冒烟、迁移前备份、注册开关）、端到端验收（Claude/Codex 均 PASS）、GitHub 风格 diff 面板、等待卡片只显示本轮目标、合并后工作区清理（项目/会话归档、合并分支删除）、`/coagent` skill、额度暂停自动续跑与 `handoff_agent`。fork 安装包 `1.37.10-coagent.3`（patch 1–4）。每个分支均经跨 provider 审查（Codex 额度耗尽期间临时由 Claude 审查）。
+
+## 七、v0.4 方向（2026-11-28，三个 Codex planner 并行分析汇总）
+
+分析视角：真实使用数据（run `r-8038eb`：32 agent、119 消息、15 gate、276 事件、约 66 小时）、代码健康与可靠性、生态与战略。
+
+### 关键证据
+- 合并 gate 等待用户：中位 1.7 分钟，P90 14 分钟，最长 8.8 小时（无主动通知）。
+- 11 条代码流共 13 轮审查，至少 9 次初审阻断——审查是最重复、最依赖 lead 手工编排的环节。
+- 发给 lead 的消息约 18 万字符，单个结果最长 1.3 万字符，全部灌入 lead 上下文。
+- `list_agents` 输出 33 行 / 4.3k 字符且永远包含已结束 agent；时间线 33 条泳道 × 380 行，无折叠；`/state` 每 2 秒返回全量。
+- `broker.ts` 1604 行，承担路由、投递、恢复、配额、handoff、合并、状态等；10 个仅内存的状态集合；迁移无版本号；关键查询缺索引。
+- 上游方向：维护者接受“宿主通用能力 + 插件业务逻辑”（#1862/#1863 已合并）；近期在做跨会话待办提示（#1840/#1874）、服务端 turn 实时显示（#1859）、额度后自动续跑（#1849）。
+
+### 建议分期
+**A. 体验（纯插件，优先）**
+1. 已结束 agent 卫生：`list_agents` 默认只列活跃，只读 reviewer 汇报后自动结束，`/state` 历史分页。（S/M）
+2. 结果摘要 + 按需取全文：`report_result` 拆成 ≤1k 摘要与完整详情，`wait_for_agents` 只注入摘要和发现项，新增 `get_result`。（M）
+3. 审查一等公民：`request_review` / 审查轮次 / verdict / findings；自动派另一 provider 的 reviewer，阻断项自动回送，通过后才允许合并。（M）
+4. 待审批/异常通知：tab 徽标、浏览器通知（去重），仅限待审批、暂停/出错、全部完成。（S）
+5. 时间线可扩展：默认折叠已完成泳道、按任务/审查轮分组、过滤、增量游标。（M）
+
+**B. 地基**
+6. Broker 在 facade 下拆分：helper/锁 → state → delivery → merge → lifecycle → tool router。（M）
+7. 版本化迁移（`user_version`）+ 补关键索引。（M）
+8. CI 端到端：fake CloudCLI 下 shim→HTTP→broker→SQLite；kill/双进程故障注入；nightly 真实 E2E。（M）
+9. （v0.5）repo 级 DB 租约与持久化 operation，覆盖双 broker/插件升级。（L）
+
+**C. 方向**
+10. （v0.5）PR-first：`local|pull_request`，push + 开 PR、记录 SHA/URL/CI，默认不自动远程合并。
+11. 发布获客：向 CloudCLI README 的 Available Plugins 提文档 PR，补 60 秒 GIF、能力矩阵、案例。（S）
+12. （v0.5+）任务模板、预算/额度策略（额度感知，不做伪精确美元调度）、run 归档与“开新阶段”。
+
+**上游**：先跟进 #1861 / #1880；子会话不要一次提交整块补丁——先提后端（`parent_session_id` + Agent API `parentSessionId` + capability），合并后再提侧边栏；每个都独立、单提交、带复现。
