@@ -25,6 +25,25 @@ const ctx = (toolName: string, toolInput: unknown, result: string | null, status
 });
 
 describe('tool cards', () => {
+  it('renders merge review rounds/findings and escapes their content', () => {
+    const reviewed: RunDetailDTO = {
+      ...run,
+      gates: [{
+        id: 9, runId: 'r', kind: 'merge', requestedBy: 'lead', subjectAgent: 'coder-1', payload: 'merge', status: 'pending',
+        comment: null, createdAt: '', snapshot: {
+          workerHead: '1234567890abcdef', leadHead: 'lead', mergeBase: 'base', files: [], diffTruncated: false,
+          reviews: [{ id: 1, runId: 'r', subjectWorker: 'coder-1', round: 1, reviewerAgent: 'reviewer-2', provider: 'codex',
+            status: 'blocked', verdict: 'block', workerHead: '123', createdAt: '', decidedAt: '',
+            findings: [{ severity: 'high<script>', file: 'src/<x>.ts', line: 7, problem: '<broken>', fix: 'escape & fix' }] }],
+        },
+      }],
+    };
+    const html = cardHtml(ctx('request_merge', { worker: 'coder-1' }, 'gate #9'), { ...state, current: reviewed });
+    expect(html).toContain('round 1 · block · codex');
+    expect(html).toContain('high&#60;script&#62;');
+    expect(html).toContain('src/&#60;x&#62;.ts');
+    expect(html).not.toContain('<broken>');
+  });
   it('offers Resume for failed/interrupted workers and Resume now / Cancel auto-resume for paused ones', () => {
     const r2: RunDetailDTO = {
       ...run,

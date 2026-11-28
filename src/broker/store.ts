@@ -4,6 +4,7 @@ import path from 'node:path';
 import type {
   AgentDTO, AgentStatus, DeliveryState, EventDTO, EventType, GateDTO, GateKind, GateStatus, MergeSnapshot,
   AgentUsageDTO, MergeSnapshotData, MessageDTO, PlanStatus, Provider, RunDTO, RunUsageDTO, TurnOutcome,
+  ReviewDTO, ReviewFinding, ReviewStatus, ReviewVerdict,
 } from '../shared/protocol.js';
 import type { TurnUsage } from './usage.js';
 import { writeLog } from './log.js';
@@ -172,6 +173,37 @@ const RESULT_DETAILS_FRAGMENT: SchemaFragment = {
   columns: { result_details: 'TEXT', result_files: 'TEXT', result_verification: 'TEXT', result_open_issues: 'TEXT' },
 };
 
+const REVIEWS_FRAGMENT: SchemaFragment = {
+  table: 'reviews',
+  create: `CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    subject_worker TEXT NOT NULL REFERENCES agents(id),
+    round INTEGER NOT NULL,
+    reviewer_agent TEXT REFERENCES agents(id),
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    verdict TEXT,
+    findings TEXT NOT NULL DEFAULT '[]',
+    worker_head TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    decided_at TEXT
+  )`,
+  columns: {
+    run_id: 'TEXT', subject_worker: 'TEXT', round: 'INTEGER', reviewer_agent: 'TEXT', provider: 'TEXT',
+    status: "TEXT NOT NULL DEFAULT 'pending'", verdict: 'TEXT', findings: "TEXT NOT NULL DEFAULT '[]'",
+    worker_head: 'TEXT', created_at: 'TEXT', decided_at: 'TEXT',
+  },
+  indexes: {
+    reviews_subject: 'CREATE UNIQUE INDEX IF NOT EXISTS reviews_subject ON reviews(run_id, subject_worker, round)',
+    reviews_reviewer: 'CREATE INDEX IF NOT EXISTS reviews_reviewer ON reviews(reviewer_agent)',
+  },
+};
+
+const GATE_REVIEWS_FRAGMENT: SchemaFragment = {
+  table: 'gates', columns: { review_rounds: "TEXT NOT NULL DEFAULT '[]'", skip_review_reason: 'TEXT' },
+};
+
 /** Indexes for the hot queries in this file; test/migrations.test.ts checks each one against the real statement. */
 const HOT_INDEXES_FRAGMENT: SchemaFragment = {
   indexes: {
@@ -276,6 +308,7 @@ export const MIGRATIONS: readonly VersionedMigration[] = [
   fragmentStep(6, 'paused worker resume state', [PAUSE_FRAGMENT], 'agents'),
   fragmentStep(7, 'hot-path query indexes', [HOT_INDEXES_FRAGMENT]),
   fragmentStep(8, 'structured agent result details', [RESULT_DETAILS_FRAGMENT], 'agents'),
+  fragmentStep(9, 'structured worker review rounds', [REVIEWS_FRAGMENT, GATE_REVIEWS_FRAGMENT], 'reviews'),
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.at(-1)?.version ?? 0;
@@ -456,9 +489,11 @@ export class Store {
       messages: ['id', 'run_id', 'to_agent', 'kind', 'body', 'created_at', 'delivered_at', 'gate_id',
         'delivery_state', 'attempts', 'lease_until'],
       gates: ['id', 'run_id', 'kind', 'status', 'created_at', 'worker_head', 'lead_head', 'merge_base',
-        'diff_stat', 'name_status', 'snapshot_files', 'unified_diff', 'diff_truncated'],
+        'diff_stat', 'name_status', 'snapshot_files', 'unified_diff', 'diff_truncated', 'review_rounds', 'skip_review_reason'],
       events: ['id', 'run_id', 'type', 'data', 'created_at'],
       turns: ['id', ...Object.keys(TURN_COLUMNS)],
+      reviews: ['id', 'run_id', 'subject_worker', 'round', 'reviewer_agent', 'provider', 'status', 'verdict',
+        'findings', 'worker_head', 'created_at', 'decided_at'],
       kv: ['k', 'v'],
     };
     const missingColumns: Record<string, string[]> = {};
@@ -741,13 +776,15 @@ export class Store {
 
   // ── gates ─────────────────────────────────────────────────────────
   addGate(runId: string, kind: GateKind, requestedBy: string, subjectAgent: string | null, payload: string,
-    snapshot: MergeSnapshotData | null = null): number {
+    snapshot: MergeSnapshotData | null = null, reviews: ReviewDTO[] = [], skipReviewReason: string | null = null): number {
     const r = this.db.prepare(`INSERT INTO gates (run_id, kind, requested_by, subject_agent, payload, created_at,
-      worker_head, lead_head, merge_base, diff_stat, name_status, snapshot_files, unified_diff, diff_truncated)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      worker_head, lead_head, merge_base, diff_stat, name_status, snapshot_files, unified_diff, diff_truncated,
+      review_rounds, skip_review_reason)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       runId, kind, requestedBy, subjectAgent, payload, this.ts(), snapshot?.workerHead ?? null, snapshot?.leadHead ?? null,
       snapshot?.mergeBase ?? null, snapshot?.stat ?? null, snapshot?.nameStatus ?? null,
-      snapshot ? JSON.stringify(snapshot.files) : null, snapshot?.diff ?? null, snapshot ? Number(snapshot.diffTruncated) : null);
+      snapshot ? JSON.stringify(snapshot.files) : null, snapshot?.diff ?? null, snapshot ? Number(snapshot.diffTruncated) : null,
+      JSON.stringify(reviews), skipReviewReason);
     return Number(r.lastInsertRowid);
   }
   gate(id: number): GateDTO | null {
@@ -761,6 +798,43 @@ export class Store {
   }
   gates(runId: string): GateDTO[] {
     return (this.db.prepare('SELECT * FROM gates WHERE run_id = ? ORDER BY id').all(runId) as Row[]).map(toGate);
+  }
+
+  // ── reviews ──────────────────────────────────────────────────────
+  addReview(runId: string, subjectWorker: string, round: number, reviewerAgent: string | null, provider: Provider,
+    workerHead: string, status: ReviewStatus = 'pending'): number {
+    const r = this.db.prepare(`INSERT INTO reviews
+      (run_id, subject_worker, round, reviewer_agent, provider, status, worker_head, created_at)
+      VALUES (?,?,?,?,?,?,?,?)`).run(runId, subjectWorker, round, reviewerAgent, provider, status, workerHead, this.ts());
+    return Number(r.lastInsertRowid);
+  }
+  reviews(runId: string, subjectWorker?: string): ReviewDTO[] {
+    const rows = subjectWorker
+      ? this.db.prepare('SELECT * FROM reviews WHERE run_id = ? AND subject_worker = ? ORDER BY round').all(runId, subjectWorker)
+      : this.db.prepare('SELECT * FROM reviews WHERE run_id = ? ORDER BY id').all(runId);
+    return (rows as Row[]).map(toReview);
+  }
+  latestReview(runId: string, subjectWorker: string): ReviewDTO | null {
+    const r = this.db.prepare('SELECT * FROM reviews WHERE run_id = ? AND subject_worker = ? ORDER BY round DESC LIMIT 1')
+      .get(runId, subjectWorker) as Row | undefined;
+    return r ? toReview(r) : null;
+  }
+  reviewForReviewer(reviewerAgent: string): ReviewDTO | null {
+    const r = this.db.prepare("SELECT * FROM reviews WHERE reviewer_agent = ? AND status IN ('pending','running') ORDER BY id DESC LIMIT 1")
+      .get(reviewerAgent) as Row | undefined;
+    return r ? toReview(r) : null;
+  }
+  decideReview(id: number, status: ReviewStatus, verdict: ReviewVerdict | null, findings: ReviewFinding[]): boolean {
+    return Number(this.db.prepare(`UPDATE reviews SET status = ?, verdict = ?, findings = ?, decided_at = ?
+      WHERE id = ? AND status IN ('pending','running')`).run(status, verdict, JSON.stringify(findings), this.ts(), id).changes) > 0;
+  }
+  setReviewRunning(id: number) {
+    this.db.prepare("UPDATE reviews SET status = 'running' WHERE id = ? AND status = 'pending'").run(id);
+  }
+  skipReview(runId: string, subjectWorker: string, round: number, provider: Provider, workerHead: string): number {
+    const id = this.addReview(runId, subjectWorker, round, null, provider, workerHead, 'skipped');
+    this.db.prepare('UPDATE reviews SET decided_at = ? WHERE id = ?').run(this.ts(), id);
+    return id;
   }
   pendingGate(runId: string, kind: GateKind, subjectAgent: string | null): GateDTO | null {
     const r = this.db.prepare(`SELECT * FROM gates WHERE run_id = ? AND kind = ? AND status = 'pending'
@@ -966,10 +1040,22 @@ function toGate(r: Row): GateDTO {
     workerHead: String(r.worker_head), leadHead: String(r.lead_head), mergeBase: String(r.merge_base),
     files: JSON.parse(String(r.snapshot_files ?? '[]')) as MergeSnapshot['files'],
     diffTruncated: Boolean(r.diff_truncated),
+    reviews: JSON.parse(String(r.review_rounds ?? '[]')) as ReviewDTO[],
+    skipReviewReason: s(r.skip_review_reason),
   };
   return {
     id: Number(r.id), runId: String(r.run_id), kind: String(r.kind) as GateKind, requestedBy: String(r.requested_by),
     subjectAgent: s(r.subject_agent), payload: String(r.payload), status: String(r.status) as GateStatus,
     comment: s(r.comment), createdAt: String(r.created_at), snapshot,
+  };
+}
+
+function toReview(r: Row): ReviewDTO {
+  return {
+    id: Number(r.id), runId: String(r.run_id), subjectWorker: String(r.subject_worker), round: Number(r.round),
+    reviewerAgent: s(r.reviewer_agent), provider: String(r.provider) as Provider, status: String(r.status) as ReviewStatus,
+    verdict: s(r.verdict) as ReviewVerdict | null,
+    findings: JSON.parse(String(r.findings ?? '[]')) as ReviewFinding[], workerHead: String(r.worker_head ?? ''),
+    createdAt: String(r.created_at), decidedAt: s(r.decided_at),
   };
 }

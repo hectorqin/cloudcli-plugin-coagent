@@ -10,6 +10,8 @@ export type ToolName =
   | 'read_inbox'
   | 'report_result'
   | 'get_result'
+  | 'request_review'
+  | 'report_review'
   | 'request_merge'
   | 'list_agents'
   | 'wait_for_agents'
@@ -82,6 +84,34 @@ export interface MergeSnapshot {
   mergeBase: string;
   files: MergeSnapshotFile[];
   diffTruncated: boolean;
+  /** Review history captured when this merge gate was opened. */
+  reviews?: ReviewDTO[];
+  /** Present only when the lead explicitly bypassed review policy. */
+  skipReviewReason?: string | null;
+}
+
+export type ReviewStatus = 'pending' | 'running' | 'passed' | 'blocked' | 'failed' | 'skipped';
+export type ReviewVerdict = 'pass' | 'block';
+export interface ReviewFinding {
+  severity: string;
+  file: string;
+  line?: number | null;
+  problem: string;
+  fix: string;
+}
+export interface ReviewDTO {
+  id: number;
+  runId: string;
+  subjectWorker: string;
+  round: number;
+  reviewerAgent: string | null;
+  provider: Provider;
+  status: ReviewStatus;
+  verdict: ReviewVerdict | null;
+  findings: ReviewFinding[];
+  workerHead: string;
+  createdAt: string;
+  decidedAt: string | null;
 }
 
 /** Stored by the broker, but never included in the ordinary state/tool payloads. */
@@ -212,6 +242,7 @@ export interface RunDetailDTO {
   messages: MessageDTO[];
   gates: GateDTO[];
   events: EventDTO[];
+  reviews?: ReviewDTO[];
   /** Facts derived from complete history, so paged timeline rows cannot break controls or notifications. */
   facts?: {
     cleanup: Record<string, 'archived' | 'deleted'>;

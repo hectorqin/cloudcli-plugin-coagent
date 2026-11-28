@@ -55,6 +55,33 @@ describe('versioned schema migrations', () => {
     expect(MIGRATIONS.every((m) => m.description.length > 5)).toBe(true);
   });
 
+  it('upgrades v8 to the v9 review schema, preserves data, and repairs its structure', () => {
+    const { dir, file } = tempFile();
+    new Store(file).close();
+    const old = new DatabaseSync(file);
+    old.exec('DROP TABLE reviews');
+    old.exec('ALTER TABLE gates DROP COLUMN review_rounds');
+    old.exec('ALTER TABLE gates DROP COLUMN skip_review_reason');
+    old.exec('PRAGMA user_version = 8');
+    old.prepare('INSERT INTO kv(k,v) VALUES (?,?)').run('v8-data', 'preserved');
+    expect(pendingMigrations(old)).toEqual(['v9: structured worker review rounds']);
+    old.close();
+
+    new Store(file).close();
+    const db = new DatabaseSync(file, { readOnly: true });
+    expect(userVersion(db)).toBe(9);
+    expect(db.prepare("SELECT v FROM kv WHERE k='v8-data'").get()).toEqual({ v: 'preserved' });
+    expect((db.prepare('PRAGMA table_info(reviews)').all() as { name: string }[]).map((x) => x.name)).toEqual(expect.arrayContaining([
+      'run_id', 'subject_worker', 'round', 'reviewer_agent', 'provider', 'status', 'verdict', 'findings', 'worker_head',
+      'created_at', 'decided_at',
+    ]));
+    expect((db.prepare('PRAGMA table_info(gates)').all() as { name: string }[]).map((x) => x.name))
+      .toEqual(expect.arrayContaining(['review_rounds', 'skip_review_reason']));
+    expect(pendingMigrations(db)).toEqual([]);
+    db.close();
+    expect(fs.readdirSync(path.join(dir, 'backups'))).toHaveLength(1);
+  });
+
   it.each([1, 2, 3, 4, 5, 6])('upgrades the historical v%i shape, preserves data, and is idempotent', (version) => {
     const { dir, file } = tempFile();
     historicalShape(file, version);

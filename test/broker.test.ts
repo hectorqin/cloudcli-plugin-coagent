@@ -9,7 +9,7 @@ import { HttpCloudCli, type CloudCli, type SendInput, type SendResult, type Sess
 import { Git } from '../src/broker/git.js';
 import { filePrompts } from '../src/broker/prompts.js';
 import { MIGRATIONS, pendingMigrations, Store } from '../src/broker/store.js';
-import type { Caller, ToolName } from '../src/shared/protocol.js';
+import type { AgentDTO, Caller, ToolName } from '../src/shared/protocol.js';
 import { CLAUDE_TURN, CODEX_TURN, claudeBudget, codexBudget } from './fixtures/usage.js';
 
 const PROMPTS = path.resolve(__dirname, '..', 'prompts');
@@ -97,7 +97,12 @@ let clock: number;
 const LEAD: Caller = { provider: 'claude', providerSessionId: 'lead-prov', cwd: null };
 
 async function call(tool: ToolName, args: Record<string, unknown>, caller: Caller = LEAD) {
-  const r = await broker.handleTool({ tool, args, caller });
+  // Most pre-review merge tests exercise git/gate behavior without a report/review phase. Keep those fixtures focused
+  // by making their bypass explicit; review-protocol tests use reported workers and therefore exercise the real policy.
+  const worker = tool === 'request_merge' && typeof args.worker === 'string' ? store.agent(args.worker) : null;
+  const actual = tool === 'request_merge' && worker?.status !== 'reported' && args.skip_review === undefined
+    ? { ...args, skip_review: true, reason: 'legacy merge fixture' } : args;
+  const r = await broker.handleTool({ tool, args: actual, caller });
   await broker.settle();
   return r;
 }
@@ -1501,7 +1506,7 @@ describe('endRun safety (review: stop barrier, repo lock, stale paths)', () => {
     const entered = deferred();
     // A request_merge holding the repository lock (blocked in commitAll) keeps endRun waiting.
     withGit({ commitAll: async (...args: Parameters<typeof Git.commitAll>) => { entered.resolve(); await hold.promise; return Git.commitAll(...args); } });
-    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: w.id }, caller: LEAD });
+    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: w.id, skip_review: true, reason: 'lock fixture' }, caller: LEAD });
     await entered.promise;
     const ending = broker.endRun(run.id, false);
     store.addMessage(run.id, null, w.id, 'message', 'rework');
@@ -1561,7 +1566,7 @@ describe('endRun safety (review: stop barrier, repo lock, stale paths)', () => {
       commonDir: async () => key,
       commitAll: async (...args: Parameters<typeof Git.commitAll>) => { entered.resolve(); await hold.promise; return Git.commitAll(...args); },
     });
-    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: b.id }, caller: LEAD }); // holds the lock
+    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: b.id, skip_review: true, reason: 'lock fixture' }, caller: LEAD }); // holds the lock
     await entered.promise;
     const ending = broker.endRun(run.id, false); // persists 'ending' at once, then waits for the lock
     const deciding = broker.decideGate(gate.id, true, null);
@@ -1696,7 +1701,7 @@ describe('end_agent / endRun re-review (lock scope, persisted stop)', () => {
     const hold = deferred();
     const entered = deferred();
     withGit({ mergeSnapshot: async (...args: Parameters<typeof Git.mergeSnapshot>) => { entered.resolve(); await hold.promise; return Git.mergeSnapshot(...args); } });
-    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: w.id }, caller: LEAD });
+    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: w.id, skip_review: true, reason: 'lock fixture' }, caller: LEAD });
     await entered.promise;
     const ending = broker.endAgent(w.id, true, null);
     await new Promise((r) => setTimeout(r, 20));
@@ -1961,7 +1966,7 @@ describe('stalled ending runs (third review)', () => {
       store, cloudcli: cc, prompts: filePrompts(PROMPTS), now: () => clock,
       git: { ...Git, commitAll: async (...args: Parameters<typeof Git.commitAll>) => { entered(); await hold; return Git.commitAll(...args); } },
     });
-    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: w.id }, caller: LEAD });
+    const merging = broker.handleTool({ tool: 'request_merge', args: { worker: w.id, skip_review: true, reason: 'lock fixture' }, caller: LEAD });
     await inside;
     const ending = broker.endRun(run.id, false);
     await new Promise((r) => setTimeout(r, 10));
@@ -2169,6 +2174,7 @@ describe('turn usage (review rework)', () => {
 
   it('exports the migration list; pendingMigrations sees what an older database lacks', () => {
     expect(MIGRATIONS.map((m) => m.table)).toContain('turns');
+    expect(MIGRATIONS.map((m) => m.table)).toContain('reviews');
     const file = path.join(tmp, 'pending.sqlite');
     new Store(file).close();
     const raw = new DatabaseSync(file);
@@ -2181,6 +2187,76 @@ describe('turn usage (review rework)', () => {
     const again = new DatabaseSync(file, { readOnly: true });
     expect(pendingMigrations(again)).toEqual([]);
     again.close();
+  });
+});
+
+describe('first-class review protocol', () => {
+  async function reportedCoder(spawnArgs: Record<string, unknown> = {}) {
+    await startApprovedRun();
+    const made = await call('spawn_agent', { role: 'coder', task: 'write reviewed code', ...spawnArgs });
+    const w = store.agent(made.text.match(/Spawned (\S+)/)![1])!;
+    fs.writeFileSync(path.join(w.worktreePath!, 'reviewed.txt'), 'review me\n');
+    await call('report_result', { summary: 'implemented reviewed.txt' }, workerCaller(w.providerSessionId!, w.provider));
+    return store.agent(w.id)!;
+  }
+  async function requestAndReviewer(w: AgentDTO, args: Record<string, unknown> = {}) {
+    const r = await call('request_review', { worker: w.id, ...args });
+    expect(r.ok, r.text).toBe(true);
+    const id = r.text.match(/Spawned (reviewer-\S+)/)![1];
+    return { response: r, reviewer: store.agent(id)! };
+  }
+  async function verdict(reviewer: AgentDTO, value: 'pass' | 'block', findings: Record<string, unknown>[] = []) {
+    return call('report_review', { verdict: value, findings }, workerCaller(reviewer.providerSessionId!, reviewer.provider));
+  }
+
+  it('selects the other provider, falls back explicitly when unavailable, and auto-ends reviewers', async () => {
+    const w = await reportedCoder();
+    const first = await requestAndReviewer(w);
+    expect(first.reviewer.provider).toBe('codex');
+    await verdict(first.reviewer, 'pass');
+    expect(store.agent(first.reviewer.id)!.status).toBe('ended');
+    expect(store.latestReview(w.runId, w.id)).toMatchObject({ status: 'passed', verdict: 'pass' });
+
+    const w2 = await spawn('coder', 'second writer');
+    await call('report_result', { summary: 'second done' }, workerCaller(w2.providerSessionId!, w2.provider));
+    store.setJson('providerAvailability', { codex: false });
+    const second = await requestAndReviewer(store.agent(w2.id)!);
+    expect(second.reviewer.provider).toBe('claude');
+    expect(second.response.text).toMatch(/fell back to claude/);
+  });
+
+  it('returns blocking findings as rework, opens the next round, and caps automatic rounds', async () => {
+    const w = await reportedCoder({ auto_review: true, max_rounds: 1 });
+    // Unit calls do not run inside a CloudCLI turn, so explicitly request the pending first round.
+    store.setJson(`autoReviewPending:${w.id}`, false);
+    const first = await requestAndReviewer(w);
+    await verdict(first.reviewer, 'block', [{ severity: 'high', file: 'reviewed.txt', line: 1, problem: 'wrong text', fix: 'use right text' }]);
+    expect(store.messages(w.runId).some((m) => m.to === w.id && /wrong text[\s\S]*use right text/.test(m.body))).toBe(true);
+    await call('report_result', { summary: 'fixed the text' }, workerCaller(w.providerSessionId!, w.provider));
+    expect(store.messages(w.runId).some((m) => m.to === store.run(w.runId)!.leadAgentId && /automatic review is capped at 1/.test(m.body))).toBe(true);
+    const second = await requestAndReviewer(store.agent(w.id)!);
+    expect(store.latestReview(w.runId, w.id)!.round).toBe(2);
+    await verdict(second.reviewer, 'pass');
+  });
+
+  it('refuses merge without a pass, records an explicit skip reason, and rejects a stale reviewed HEAD', async () => {
+    const w = await reportedCoder();
+    expect((await call('request_merge', { worker: w.id })).text).toMatch(/no review/);
+    const skipped = await call('request_merge', { worker: w.id, skip_review: true, reason: 'tests-only emergency' });
+    expect(skipped.ok, skipped.text).toBe(true);
+    const skipGate = store.gates(w.runId).findLast((g) => g.subjectAgent === w.id)!;
+    expect(skipGate.snapshot).toMatchObject({ skipReviewReason: 'tests-only emergency' });
+
+    // A separate writer exercises a real passing review and stale-HEAD detection without a pending gate.
+    const w2 = await spawn('coder', 'stale writer');
+    fs.writeFileSync(path.join(w2.worktreePath!, 'stale.txt'), 'one\n');
+    await call('report_result', { summary: 'stale candidate' }, workerCaller(w2.providerSessionId!, w2.provider));
+    const opened = await requestAndReviewer(store.agent(w2.id)!);
+    await verdict(opened.reviewer, 'pass');
+    fs.writeFileSync(path.join(w2.worktreePath!, 'stale.txt'), 'two\n');
+    sh(w2.worktreePath!, 'add', '-A');
+    sh(w2.worktreePath!, 'commit', '-q', '-m', 'move after review');
+    expect((await call('request_merge', { worker: w2.id })).text).toMatch(/outdated.*HEAD moved/);
   });
 });
 

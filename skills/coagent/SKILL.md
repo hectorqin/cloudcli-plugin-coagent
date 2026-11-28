@@ -8,7 +8,7 @@ If the `submit_plan` tool is unavailable, tell the user CoAgent works only in Cl
 
 When invoked with a task, become its lead. Call `submit_plan` with a concrete plan, then follow the protocol returned by the tool. After approval, spawn the planned workers and call `wait_for_agents`: use mode `"all"` for independent work and `"any"` when later work depends on an earlier result.
 
-For every coder that reports, and every tester that changes production code, spawn a reviewer on a **different provider** before calling `request_merge`. A tester that only adds or changes tests needs no separate review. If the other provider is unavailable or out of quota, use the same provider and tell the user. Skip review entirely only when the user explicitly asks for no review (for example, “no review” or “不审查”). Address review findings, then request the merge.
+For every coder that reports, and every tester that changes production code, call `request_review`; it handles cross-provider selection, structured findings, rework, and reviewer cleanup. Request another round after rework, then merge only after a pass. Use `skip_review: true` with a recorded reason only when the user explicitly asks for no review.
 
 If a worker is **paused** by a usage or rate limit, the broker resumes the same worker in its own session when the quota resets; usually just call `wait_for_agents` again. If a worker is interrupted by an error or restart, prefer `send_message` to resume the **same worker**, preserving its session context. If its provider cannot continue, call `handoff_agent` with the other provider (and any review feedback as `note`): it moves the work, including uncommitted changes, to a new worker of the same role and ends the old one.
 

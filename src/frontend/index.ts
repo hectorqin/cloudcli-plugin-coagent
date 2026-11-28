@@ -451,10 +451,11 @@ export function mount(container: HTMLElement, api: PluginAPI) {
         <div class="row" style="margin-top:6px"><button class="primary" data-act="approve" data-id="${g.id}">Approve</button>
         <button class="danger" data-act="reject" data-id="${g.id}">Reject</button></div>`
       : `<div class="sub">Decision: <span class="badge b-${esc(g.status)}">${esc(g.status)}</span>${g.comment ? ` — ${esc(g.comment)}` : ''}</div>`;
+    const rounds = g.snapshot?.reviews?.length ? `<h3>Review rounds</h3>${g.snapshot.reviews.map((r) => `<div class="file"><span>round ${r.round}</span><span class="badge b-${r.status === 'passed' ? 'approved' : r.status === 'blocked' || r.status === 'failed' ? 'rejected' : r.status}">${esc(r.verdict ?? r.status)}</span><span class="path">${esc(r.provider)}${r.reviewerAgent ? ` · ${esc(r.reviewerAgent)}` : ''}</span></div>${r.findings.map((f) => `<div class="sub">[${esc(f.severity)}] ${esc(f.file)}${f.line ? `:${f.line}` : ''}: ${esc(f.problem)} — ${esc(f.fix)}</div>`).join('')}`).join('')}${g.snapshot.skipReviewReason ? `<div class="sub">Review skipped: ${esc(g.snapshot.skipReviewReason)}</div>` : ''}` : '';
     const review = g.snapshot ? `<div class="sub">Reviewed worker ${esc(g.snapshot.workerHead.slice(0, 10))} · base ${esc(g.snapshot.mergeBase.slice(0, 10))}</div>
       <div class="files">${g.snapshot.files.map((f) => `<div class="file"><span>${esc(f.status)}</span><span class="path">${f.oldPath ? `${esc(f.oldPath)} → ` : ''}${esc(f.path)}</span>${f.binary
         ? '<span>binary</span>' : `<span class="plus">+${f.additions ?? 0}</span><span class="minus">-${f.deletions ?? 0}</span>`}</div>`).join('')}</div>
-      <details data-diff="${g.id}"><summary>View diff${g.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details>` : '';
+      ${rounds}<details data-diff="${g.id}"><summary>View diff${g.snapshot.diffTruncated ? ' (truncated at 200 KB)' : ''}</summary></details>` : '';
     const worker = g.kind === 'merge' ? state?.current?.agents.find((a) => a.id === g.subjectAgent) : undefined;
     const cleanup = g.status === 'approved' && worker?.status === 'merged' ? workspaceActions(worker) : '';
     return `<div class="row"><b class="grow">${title}</b>${close}</div><pre>${esc(g.payload)}</pre>${review}${actions}${cleanup}`;
@@ -477,6 +478,7 @@ export function mount(container: HTMLElement, api: PluginAPI) {
         ${a.resultFiles?.length ? `<div class="sub"><b>Files:</b> ${esc(a.resultFiles.join(', '))}</div>` : ''}
         ${fullResults.has(a.id) ? `<details open><summary>Full text</summary><pre>${esc(fullResults.get(a.id))}</pre></details>`
           : `<button data-act="load-result" data-id="${esc(a.id)}">Load full text</button>`}` : ''}
+      ${(state?.current?.reviews ?? []).filter((r) => r.subjectWorker === a.id).map((r) => `<div class="sub">Review round ${r.round} · ${esc(r.verdict ?? r.status)}</div>`).join('')}
       ${a.status === 'interrupted' ? '<div class="sub">Interrupted (a broker restart, or its auto-resume was cancelled). Resume it in its session, send it a message, or end it.</div>' : ''}
       ${!ended ? resumeRow(a) : ''}
       ${canMsg ? `<div class="row" style="margin-top:8px"><input class="grow" style="width:auto" data-draft="msg-${esc(a.id)}" placeholder="Message ${esc(a.id)}…">

@@ -92,6 +92,7 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
   const config = () => ({
     roleProviders: d.broker.roleProviders(), autoRegister: d.store.getJson('autoRegister', true),
     quotaBackoffMinutes: d.broker.quotaBackoffMinutes(),
+    reviewExemptRoles: d.broker.reviewExemptRoles(),
   });
 
   async function route(req: http.IncomingMessage, url: URL): Promise<unknown> {
@@ -163,6 +164,7 @@ export function createHandler(d: HandlerDeps): http.RequestListener {
       if (body.roleProviders && typeof body.roleProviders === 'object') d.broker.setRoleProviders(body.roleProviders as Record<string, string>);
       if (typeof body.autoRegister === 'boolean') d.store.setJson('autoRegister', body.autoRegister);
       if (body.quotaBackoffMinutes !== undefined) d.broker.setQuotaBackoffMinutes(body.quotaBackoffMinutes);
+      if (body.reviewExemptRoles !== undefined) d.broker.setReviewExemptRoles(body.reviewExemptRoles);
       return config();
     }
     if (p === '/registration' && method === 'POST') {
