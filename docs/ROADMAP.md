@@ -294,3 +294,7 @@
 12. （v0.5+）任务模板、预算/额度策略（额度感知，不做伪精确美元调度）、run 归档与“开新阶段”。
 
 **上游**：先跟进 #1861 / #1880；子会话不要一次提交整块补丁——先提后端（`parent_session_id` + Agent API `parentSessionId` + capability），合并后再提侧边栏；每个都独立、单提交、带复现。
+
+### 进展
+- **v0.4 第一波（2026-11-28，run `r-8038eb`）已合并到 main**：B7 版本化迁移 + 热点索引（`user_version` 账本，现为 v9；拒绝打开更新版本的 DB）、A4 待处理计数与浏览器通知、A1 已结束 agent 卫生与 `/state` 分页、A2 结果摘要 + `get_result`（典型等待结果 14.5 KB → 0.3 KB）、A3 审查协议（`request_review` / `report_review`，合并须最新审查通过且对应当前 HEAD）。均由 Codex 实现、Claude 跨 provider 审查（每项 2–3 轮）；Codex 额度耗尽时 B7 修复与 A3 rebase 经 `handoff_agent` 交给 Claude 完成。
+- **第二波**：A5 时间线折叠/过滤 + 增量状态，B6 broker 拆分，然后 B8 CI 端到端；C11 文档 PR。

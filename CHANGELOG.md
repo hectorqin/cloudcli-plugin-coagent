@@ -11,6 +11,25 @@ All notable changes to this project are documented in this file. The format is b
   worker's first turn sends `parentSessionId` (the lead's app session id, else its provider id), so worker sessions
   nest under the lead in the sidebar. Never sent on continuation turns, for the lead, or when the capability is missing
   or unknown.
+- Review as a protocol step: `request_review(worker, focus?, provider?)` spawns a reviewer on the other provider (with
+  a quota-aware fallback) against the worker's snapshotted HEAD; the reviewer answers with
+  `report_review(verdict, findings)`. Blocking findings go back to the worker as rework automatically;
+  `auto_review` / `max_rounds` (default 3) repeat rounds without the lead. `request_merge` refuses unless the latest
+  review passed for the current HEAD (uncommitted changes count), or `skip_review` is given with a reason recorded in
+  the merge gate. Testers that change only test files are exempt. Review rounds show on worker lanes and merge cards.
+- Result summaries: `report_result` takes a ≤1000-char `summary` plus `details`, `files`, `verification` and
+  `open_issues`. Waits and inbox delivery carry only the summary (a typical wait result shrank from ~14.5 KB to
+  ~0.3 KB); the new lead tool `get_result(worker, part?)` and the tab fetch the full text on demand.
+- `list_agents` hides merged and ended agents by default (`include_finished: true` lists them). Read-only workers end
+  automatically after reporting and reopen when sent rework.
+- Tab: attention counts in the header and opt-in browser notifications for pending gates, paused/failed workers and
+  finished waits; `/state` history is paged (newest 50 runs, 200 rows per page) with **Load older**.
+
+### Changed
+
+- Database schema is versioned with `PRAGMA user_version` (append-only steps, now v9), with hot-path indexes. A
+  database from a newer CoAgent is refused instead of being modified. Same-version drift repair no longer takes a
+  backup.
 
 ## [0.3.0] - 2026-11-26
 
