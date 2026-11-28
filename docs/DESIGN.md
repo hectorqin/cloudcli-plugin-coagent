@@ -186,6 +186,7 @@ tab 改为泳道时序图：每个 agent 一条泳道（最左为 You），时�
 - **已知限制（上下文可能偏高）**：SDK 不带逐条 assistant usage 时，CloudCLI 退回 `extractCumulativeTokenBudget`（整轮账单，含所有请求与子 agent），线上无法区分，此时 “ctx” 可能是实际占用的数倍。coagent 无法可靠修正，UI 在提示中标注为近似值。
 - **用户中止**：已被接受的 turn 被用户在 CloudCLI 中止时（`complete.aborted` / `status.aborted`），send 返回 `aborted`，turn 记 `aborted`，投递关闭不重试，worker 置 idle 并以 system 消息告知 lead（不按失败处理）。
 - **查询开销**：`/state` 的 run 列表与当前 run 的 agent 用量都用分组查询批量计算，查询数不随历史增长。迁移项以 `MIGRATIONS`（含 `TURNS_MIGRATION`）导出，`pendingMigrations(db)` 只读判断是否需要迁移。
+- **Schema 版本（v0.4 B7）**：`PRAGMA user_version` 记录已应用的最后一步；`MIGRATIONS` 是只追加的版本列表（v1–v7，`{ version, description, up }`），每步与 user_version 更新在同一事务里，失败整体回滚。无 ledger 的旧库（user_version 0）按表/列形状推断为 v1–v6。仅当版本要前进时才做迁移前备份；**同版本的漂移修复（缺索引/列，按各步 `repair` 片段幂等补齐）不再备份**。user_version 大于本插件支持的版本时拒绝启动（“database is from a newer coagent … upgrade the plugin”），也不跑修复。v8/v9 预留给 result details（A2）与 reviews（A3）。热点索引由 `test/migrations.test.ts` 对 store.ts 的真实语句做 EXPLAIN QUERY PLAN 校验；`node scripts/bench-state.mjs` 测 10k 消息 / 2k 事件下 /state 读取耗时（不在测试套件内）。诊断输出含 `schema.version` / `latestVersion`。
 - 只覆盖 broker 跑的 turn；用户在 UI 里直接与 lead 的对话不经过 broker，不计入。
 
 ## 14. 合并后的清理（2026-11-26，Q38–Q40）
@@ -229,3 +230,9 @@ tab 改为泳道时序图：每个 agent 一条泳道（最左为 You），时�
 - Q48：先在 fork 实现自用，现有 PR 有维护者反馈后再提上游。
 - broker 实现：仅当 `GET /api/agent/capabilities` 返回 `childSessions: true`（缓存；未知/超时视为不支持）时，worker **创建会话的首轮**（spawn_agent、handoff_agent 的新 worker）在 `POST /api/agent` 里带 `parentSessionId` = lead 的 app 会话 id（无则 provider 会话 id）。续接轮与 lead 自己的轮次从不发送，因此不会触发宿主的 “parentSessionId cannot change” 400。
 - 上游进展（2026-11-27）：#1862（toolRenderers）与 #1863（Agent API permissionMode / capabilities / sessions/:id）已合并，随 **v1.37.11** 发布；#1861 待提供复现步骤（已回复）；#1864 被要求改为独立 PR（Q49 待定）。fork 改为基于 v1.37.11。
+
+## 17. Tab 通知（2026-11-28）
+
+待审批 gate 和暂停/错误 worker 会显示在 CoAgent tab 标题中。用户可选择启用浏览器 Notification API；开关保存在
+`localStorage`，存取失败时安全降级，通知按 run 内的 gate/agent 去重（切换 run 时重新取基线，不会补发旧状态）；“lead 等待中所有目标 worker 已完成”取自 broker 的 `wait_end` 事件（`reason: 'done'`、`allFinished`、目标 `agents`），每次 wait 至多一条。`new Notification` 抛错（如 Chrome Android 的 Illegal constructor）时静默关闭通知，不影响刷新。这个实现仍是纯插件能力。CloudCLI 目前没有插件宿主
+通知 API；上游 #1840/#1874 的跨会话待处理 prompt 工作以后可能提供更一致的宿主级入口，届时再评估迁移。

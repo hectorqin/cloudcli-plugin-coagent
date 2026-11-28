@@ -1379,7 +1379,10 @@ export class Broker {
 
     this.waiting.delete(leadId);
     this.leases.delete(leadId);
-    store.addEvent(runId, leadId, 'wait_end', { mode, reason: a.give_up ? 'timeout' : urgent ? 'urgent' : 'done' });
+    // `agents` + `allFinished` let the tab notify "all targeted workers finished while the lead waited", once per wait.
+    store.addEvent(runId, leadId, 'wait_end', {
+      mode, reason: a.give_up ? 'timeout' : urgent ? 'urgent' : 'done', agents: [...ids], allFinished: targets.length > 0 && allDone,
+    });
     store.markDelivered(inbox.map((m) => m.id));
     const paused = targets.filter((t) => !store.busy.has(t.id) && t.status === 'paused');
     const still = targets.filter((t) => !finished(t) && !paused.includes(t)).map((t) => t.id);
