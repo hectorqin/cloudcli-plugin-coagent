@@ -254,7 +254,9 @@ describe('database migration backups', () => {
 
   it.each([
     ['a dropped base table', 'DROP TABLE kv'],
-    ['a dropped turns index', 'DROP INDEX turns_run'],
+    ['a dropped turns index', 'DROP INDEX turns_agent'],
+    ['a dropped hot-path index', 'DROP INDEX messages_gate_id'],
+    ['a redundant legacy turns_run index', 'CREATE INDEX turns_run ON turns(run_id)'],
     ['a dropped schema index', 'DROP INDEX events_run'],
     ['a missing delivery index', 'DROP INDEX messages_delivery'],
     ['a legacy inbox index', 'CREATE INDEX messages_inbox ON messages(to_agent)'],
@@ -264,9 +266,13 @@ describe('database migration backups', () => {
     new Store(file).close();
     const db = new DatabaseSync(file);
     db.exec(change);
+    expect(pendingMigrations(db).length).toBeGreaterThan(0);
     db.close();
     new Store(file).close();
     expect(fs.existsSync(path.join(tmp, 'backups'))).toBe(false);
+    const repaired = new DatabaseSync(file, { readOnly: true });
+    expect(pendingMigrations(repaired)).toEqual([]);
+    repaired.close();
     new Store(file).close();
     expect(fs.existsSync(path.join(tmp, 'backups'))).toBe(false);
     fs.rmSync(tmp, { recursive: true, force: true });

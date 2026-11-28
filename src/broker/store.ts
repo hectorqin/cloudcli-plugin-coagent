@@ -84,17 +84,21 @@ CREATE INDEX IF NOT EXISTS events_run ON events(run_id, id);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 `;
 
-/** Legacy additive schema fragment. Kept exported because parallel features can compose their table/column additions. */
-export interface MigrationItem {
-  table: string;
-  /** CREATE TABLE IF NOT EXISTS for tables added after the base SCHEMA (minimal columns; the rest come from `columns`). */
+/**
+ * An idempotent description of the objects one version step creates. A step's `up` applies it; drift repair (see
+ * VersionedMigration.repair) re-applies it to a current database whose schema was damaged by hand.
+ */
+export interface SchemaFragment {
+  /** Table whose columns this fragment adds (and which `create` creates). */
+  table?: string;
+  /** CREATE TABLE/INDEX IF NOT EXISTS statement(s) run first. */
   create?: string;
   /** Columns added with ALTER TABLE ADD COLUMN when missing: name → type/constraints. */
-  columns: Record<string, string>;
+  columns?: Record<string, string>;
   /** SQL run in the same transaction as adding that column (backfill for older rows). */
   backfill?: Record<string, string>;
   /** Indexes that must exist: name → CREATE INDEX IF NOT EXISTS statement. */
-  indexes: Record<string, string>;
+  indexes?: Record<string, string>;
   /** Indexes that must no longer exist. */
   dropIndexes?: string[];
 }
@@ -109,7 +113,7 @@ export const TURN_COLUMNS: Readonly<Record<string, string>> = {
   output_tokens: 'INTEGER', cache_read_tokens: 'INTEGER', cache_creation_tokens: 'INTEGER',
 };
 
-export const TURNS_MIGRATION: MigrationItem = {
+export const TURNS_MIGRATION: SchemaFragment = {
   table: 'turns',
   create: `CREATE TABLE IF NOT EXISTS turns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,119 +122,152 @@ export const TURNS_MIGRATION: MigrationItem = {
     started_at TEXT NOT NULL
   )`,
   columns: TURN_COLUMNS,
-  indexes: {
-    turns_agent: 'CREATE INDEX IF NOT EXISTS turns_agent ON turns(agent_id, id)',
-    turns_run: 'CREATE INDEX IF NOT EXISTS turns_run ON turns(run_id)',
+  // turns_run(run_id) of older databases is dropped by v7: turns_run_agent_id(run_id, ...) covers it.
+  indexes: { turns_agent: 'CREATE INDEX IF NOT EXISTS turns_agent ON turns(agent_id, id)' },
+};
+
+/** The base SCHEMA as one fragment per statement, so drift repair can name exactly what is missing. */
+const BASE_FRAGMENTS: readonly SchemaFragment[] = SCHEMA.split(';').map((x) => x.trim()).filter(Boolean).map((stmt) => {
+  const table = /^CREATE TABLE IF NOT EXISTS (\w+)/.exec(stmt);
+  if (table) return { table: table[1], create: stmt };
+  const index = /^CREATE INDEX IF NOT EXISTS (\w+)/.exec(stmt);
+  if (!index) throw new Error(`unexpected base schema statement: ${stmt}`);
+  return { indexes: { [index[1]]: stmt } };
+});
+
+const DELIVERY_FRAGMENT: SchemaFragment = {
+  table: 'messages',
+  columns: {
+    gate_id: 'INTEGER',
+    delivery_state: "TEXT NOT NULL DEFAULT 'queued'",
+    attempts: 'INTEGER NOT NULL DEFAULT 0',
+    lease_until: 'INTEGER',
+  },
+  backfill: {
+    // Older databases only had delivered_at (set before dispatch, cleared on failure): it is the truth we have.
+    delivery_state: "UPDATE messages SET delivery_state = 'delivered' WHERE delivered_at IS NOT NULL",
+  },
+  indexes: { messages_delivery: 'CREATE INDEX IF NOT EXISTS messages_delivery ON messages(to_agent, delivery_state)' },
+  dropIndexes: ['messages_inbox'],
+};
+
+const SNAPSHOT_FRAGMENT: SchemaFragment = {
+  table: 'gates',
+  columns: {
+    worker_head: 'TEXT', lead_head: 'TEXT', merge_base: 'TEXT', diff_stat: 'TEXT', name_status: 'TEXT',
+    snapshot_files: 'TEXT', unified_diff: 'TEXT', diff_truncated: 'INTEGER',
   },
 };
 
-const ADDITIVE_MIGRATIONS: readonly MigrationItem[] = [
-  {
-    table: 'messages',
-    columns: {
-      gate_id: 'INTEGER',
-      delivery_state: "TEXT NOT NULL DEFAULT 'queued'",
-      attempts: 'INTEGER NOT NULL DEFAULT 0',
-      lease_until: 'INTEGER',
-    },
-    backfill: {
-      // Older databases only had delivered_at (set before dispatch, cleared on failure): it is the truth we have.
-      delivery_state: "UPDATE messages SET delivery_state = 'delivered' WHERE delivered_at IS NOT NULL",
-    },
-    indexes: { messages_delivery: 'CREATE INDEX IF NOT EXISTS messages_delivery ON messages(to_agent, delivery_state)' },
-    dropIndexes: ['messages_inbox'],
-  },
-  {
-    table: 'gates',
-    columns: {
-      worker_head: 'TEXT', lead_head: 'TEXT', merge_base: 'TEXT', diff_stat: 'TEXT', name_status: 'TEXT',
-      snapshot_files: 'TEXT', unified_diff: 'TEXT', diff_truncated: 'INTEGER',
-    },
-    indexes: {},
-  },
-  TURNS_MIGRATION,
-  {
-    // Set by endRun before it waits for the repository lock: the persisted stop intent (see Broker.endRun/recover).
-    table: 'runs',
-    columns: { ending_at: 'TEXT' },
-    indexes: {},
-  },
-  {
-    // A worker paused by a provider usage/rate limit: when the broker resumes it, why, and whether the resume needs a
-    // "you were interrupted" message (its interrupted turn had been accepted). Persisted so a restart keeps the plan.
-    table: 'agents',
-    columns: { resume_at: 'TEXT', pause_reason: 'TEXT', pause_nudge: 'INTEGER' },
-    indexes: {},
-  },
-];
+// Set by endRun before it waits for the repository lock: the persisted stop intent (see Broker.endRun/recover).
+const ENDING_FRAGMENT: SchemaFragment = { table: 'runs', columns: { ending_at: 'TEXT' } };
 
-const SCHEMA_TABLES = [...SCHEMA.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
-const SCHEMA_INDEXES = [...SCHEMA.matchAll(/CREATE INDEX IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
+// A worker paused by a provider usage/rate limit: when the broker resumes it, why, and whether the resume needs a
+// "you were interrupted" message (its interrupted turn had been accepted). Persisted so a restart keeps the plan.
+const PAUSE_FRAGMENT: SchemaFragment = { table: 'agents', columns: { resume_at: 'TEXT', pause_reason: 'TEXT', pause_nudge: 'INTEGER' } };
 
-function structuralPending(db: DatabaseSync): string[] {
-  const out: string[] = [];
-  const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Row[]).map((r) => String(r.name)));
-  const indexes = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Row[]).map((r) => String(r.name)));
-  // The base SCHEMA is the first migration step (migrate() runs it before MIGRATIONS), so check it here too.
-  for (const t of SCHEMA_TABLES) if (!tables.has(t)) out.push(`table ${t}`);
-  for (const i of SCHEMA_INDEXES) if (!indexes.has(i)) out.push(`index ${i}`);
-  for (const m of ADDITIVE_MIGRATIONS) {
-    if (!tables.has(m.table)) { out.push(`table ${m.table}`); continue; }
-    const cols = new Set((db.prepare(`PRAGMA table_info(${m.table})`).all() as Row[]).map((r) => String(r.name)));
-    for (const c of Object.keys(m.columns)) if (!cols.has(c)) out.push(`column ${m.table}.${c}`);
-    for (const i of Object.keys(m.indexes)) if (!indexes.has(i)) out.push(`index ${i}`);
-    for (const i of m.dropIndexes ?? []) if (indexes.has(i)) out.push(`drop index ${i}`);
+/** Indexes for the hot queries in this file; test/migrations.test.ts checks each one against the real statement. */
+const HOT_INDEXES_FRAGMENT: SchemaFragment = {
+  indexes: {
+    agents_run_created: 'CREATE INDEX IF NOT EXISTS agents_run_created ON agents(run_id, created_at)',
+    agents_app_session: 'CREATE INDEX IF NOT EXISTS agents_app_session ON agents(app_session_id)',
+    messages_run_id: 'CREATE INDEX IF NOT EXISTS messages_run_id ON messages(run_id, id)',
+    messages_delivery_id: 'CREATE INDEX IF NOT EXISTS messages_delivery_id ON messages(delivery_state, id)',
+    messages_gate_id: 'CREATE INDEX IF NOT EXISTS messages_gate_id ON messages(gate_id, id)',
+    gates_run_id: 'CREATE INDEX IF NOT EXISTS gates_run_id ON gates(run_id, id)',
+    gates_pending_subject: 'CREATE INDEX IF NOT EXISTS gates_pending_subject ON gates(run_id, kind, status, subject_agent)',
+    turns_run_agent_id: 'CREATE INDEX IF NOT EXISTS turns_run_agent_id ON turns(run_id, agent_id, id)',
+  },
+  // turns_run is redundant with turns_run_agent_id; messages_delivery_lease_id was this index set's pre-release shape.
+  dropIndexes: ['turns_run', 'messages_delivery_lease_id'],
+};
+
+type Tx = (fn: () => void) => void;
+const inline: Tx = (fn) => fn();
+
+/** Applies a fragment idempotently. `tx` wraps each column's ALTER + backfill (a no-op inside a step's transaction). */
+function applyFragment(db: DatabaseSync, f: SchemaFragment, tx: Tx = inline) {
+  if (f.create) db.exec(f.create);
+  if (f.table && f.columns) {
+    const cols = new Set((db.prepare(`PRAGMA table_info(${f.table})`).all() as Row[]).map((r) => String(r.name)));
+    for (const [name, type] of Object.entries(f.columns)) {
+      if (cols.has(name)) continue;
+      tx(() => {
+        db.exec(`ALTER TABLE ${f.table} ADD COLUMN ${name} ${type}`);
+        const backfill = f.backfill?.[name];
+        if (backfill) db.exec(backfill);
+      });
+    }
   }
+  for (const i of f.dropIndexes ?? []) db.exec(`DROP INDEX IF EXISTS ${i}`);
+  for (const sql of Object.values(f.indexes ?? {})) db.exec(sql);
+}
+
+/** What applyFragment would change, in the same order (read-only). */
+function fragmentPending(db: DatabaseSync, f: SchemaFragment, tables: Set<string>, indexes: Set<string>): string[] {
+  const out: string[] = [];
+  if (f.table && !tables.has(f.table)) {
+    out.push(`table ${f.table}`);
+    return out;
+  }
+  if (f.table && f.columns) {
+    const cols = new Set((db.prepare(`PRAGMA table_info(${f.table})`).all() as Row[]).map((r) => String(r.name)));
+    for (const c of Object.keys(f.columns)) if (!cols.has(c)) out.push(`column ${f.table}.${c}`);
+  }
+  for (const i of f.dropIndexes ?? []) if (indexes.has(i)) out.push(`drop index ${i}`);
+  for (const i of Object.keys(f.indexes ?? {})) if (!indexes.has(i)) out.push(`index ${i}`);
   return out;
 }
 
-function addFragment(db: DatabaseSync, m: MigrationItem) {
-  if (m.create) db.exec(m.create);
-  const cols = new Set((db.prepare(`PRAGMA table_info(${m.table})`).all() as Row[]).map((r) => String(r.name)));
-  for (const [name, type] of Object.entries(m.columns)) {
-    if (cols.has(name)) continue;
-    db.exec(`ALTER TABLE ${m.table} ADD COLUMN ${name} ${type}`);
-    const backfill = m.backfill?.[name];
-    if (backfill) db.exec(backfill);
-  }
-  for (const i of m.dropIndexes ?? []) db.exec(`DROP INDEX IF EXISTS ${i}`);
-  for (const sql of Object.values(m.indexes)) db.exec(sql);
-}
-
 export interface VersionedMigration {
-  /** Monotonically increasing; append only. Never edit a released step. */
+  /** Monotonically increasing, gap-free; append only. Never edit a released step's `up`. */
   version: number;
   description: string;
-  /** Primary table, when the step has one (compatibility/introspection only). */
+  /** Primary table, when the step has one (introspection only). */
   table?: string;
+  /** Runs in one transaction with the PRAGMA user_version update: all of it commits, or none of it. */
   up(db: DatabaseSync): void;
+  /**
+   * Optional drift repair: idempotent fragments re-applied on every open to a database at or past this version (for
+   * a hand-damaged schema; never backed up, never changes user_version). Unlike `up`, this may be edited later: when
+   * a newer step drops or renames something, remove it here too, or repair would bring it back.
+   */
+  repair?: readonly SchemaFragment[];
 }
 
-const HOT_INDEXES: Readonly<Record<string, string>> = {
-  agents_run_created: 'CREATE INDEX IF NOT EXISTS agents_run_created ON agents(run_id, created_at)',
-  agents_app_session: 'CREATE INDEX IF NOT EXISTS agents_app_session ON agents(app_session_id)',
-  messages_run_id: 'CREATE INDEX IF NOT EXISTS messages_run_id ON messages(run_id, id)',
-  messages_delivery_lease_id: 'CREATE INDEX IF NOT EXISTS messages_delivery_lease_id ON messages(delivery_state, lease_until, id)',
-  gates_run_id: 'CREATE INDEX IF NOT EXISTS gates_run_id ON gates(run_id, id)',
-  gates_pending_subject: 'CREATE INDEX IF NOT EXISTS gates_pending_subject ON gates(run_id, kind, status, subject_agent)',
-  turns_run_agent_id: 'CREATE INDEX IF NOT EXISTS turns_run_agent_id ON turns(run_id, agent_id, id)',
-};
+const fragmentStep = (version: number, description: string, fragments: readonly SchemaFragment[], table?: string): VersionedMigration => ({
+  version, description, table, repair: fragments,
+  up: (db) => { for (const f of fragments) applyFragment(db, f); },
+});
 
 /**
- * Schema ledger. Append one atomic step with the next version; never reorder or modify released entries. A step may
- * use addFragment for parallel additive work, or arbitrary SQL for renames, constraints and complex backfills.
- * Store wraps every `up` call and its PRAGMA user_version update in the same transaction.
+ * The schema ledger. PRAGMA user_version records the last step applied; Store applies every newer step in order, each
+ * in its own transaction together with the user_version bump, and backs the database up first whenever a step is
+ * pending. A database whose user_version is newer than the last step here refuses to open (downgrade).
+ *
+ * Databases from before the ledger (user_version 0) are matched to v1–v6 by inferredLegacyVersion().
+ *
+ * To change the schema, APPEND a step; never reorder, renumber or edit a released `up`:
+ *
+ *   { version: N, description: 'short summary', up: (db) => { db.exec('ALTER TABLE ...'); } }
+ *
+ * - `up` may run any SQL: renames, table rebuilds, constraint changes, multi-statement backfills. It must not COMMIT.
+ *   For a purely additive change, `fragmentStep(N, description, [fragment])` also gives it drift repair.
+ * - Also update Store.diagnostics() (its `expected` column map) for new tables/columns; pendingMigrations() and the
+ *   repair list follow from `repair` automatically.
+ * - Add the shape to test/migrations.test.ts (upgrade from N-1, idempotent, backup only on the version change).
+ * - Reserved for branches in flight: v8 = result details (A2), v9 = reviews (A3). Take the next free number when
+ *   rebasing onto whichever lands first.
  */
 export const MIGRATIONS: readonly VersionedMigration[] = [
-  { version: 1, description: 'initial run, agent, message, gate and event schema', up: (db) => db.exec(SCHEMA) },
-  { version: 2, description: 'reliable message delivery leases', table: 'messages', up: (db) => addFragment(db, ADDITIVE_MIGRATIONS[0]) },
-  { version: 3, description: 'merge gate snapshots', table: 'gates', up: (db) => addFragment(db, ADDITIVE_MIGRATIONS[1]) },
-  { version: 4, description: 'turn accounting', table: 'turns', up: (db) => addFragment(db, ADDITIVE_MIGRATIONS[2]) },
-  { version: 5, description: 'persisted run ending intent', table: 'runs', up: (db) => addFragment(db, ADDITIVE_MIGRATIONS[3]) },
-  { version: 6, description: 'paused worker resume state', table: 'agents', up: (db) => addFragment(db, ADDITIVE_MIGRATIONS[4]) },
-  { version: 7, description: 'hot-path query indexes', up: (db) => {
-    for (const sql of Object.values(HOT_INDEXES)) db.exec(sql);
-  } },
+  { version: 1, description: 'initial run, agent, message, gate and event schema', repair: BASE_FRAGMENTS,
+    up: (db) => db.exec(SCHEMA) },
+  fragmentStep(2, 'reliable message delivery leases', [DELIVERY_FRAGMENT], 'messages'),
+  fragmentStep(3, 'merge gate snapshots', [SNAPSHOT_FRAGMENT], 'gates'),
+  fragmentStep(4, 'turn accounting', [TURNS_MIGRATION], 'turns'),
+  fragmentStep(5, 'persisted run ending intent', [ENDING_FRAGMENT], 'runs'),
+  fragmentStep(6, 'paused worker resume state', [PAUSE_FRAGMENT], 'agents'),
+  fragmentStep(7, 'hot-path query indexes', [HOT_INDEXES_FRAGMENT]),
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.at(-1)?.version ?? 0;
@@ -241,7 +278,7 @@ const hasTable = (db: DatabaseSync, table: string) => !!db.prepare(
   "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
 ).get(table);
 
-/** Infer the newest contiguous historical shape for databases created before the ledger existed. */
+/** Infer the newest contiguous historical shape for databases created before the ledger existed. Frozen at v6. */
 function inferredLegacyVersion(db: DatabaseSync): number {
   if (!['runs', 'agents', 'messages', 'gates', 'events', 'kv'].every((table) => hasTable(db, table))) return 0;
   let version = 1;
@@ -257,23 +294,38 @@ function inferredLegacyVersion(db: DatabaseSync): number {
   return 6;
 }
 
+const recordedVersion = (db: DatabaseSync) => Number((db.prepare('PRAGMA user_version').get() as Row).user_version ?? 0);
+
 export function schemaVersion(db: DatabaseSync): number {
-  const recorded = Number((db.prepare('PRAGMA user_version').get() as Row).user_version ?? 0);
-  return recorded || inferredLegacyVersion(db);
+  return recordedVersion(db) || inferredLegacyVersion(db);
 }
 
-/** Read-only description of the version steps (and any additive repair) migrate() would apply. */
-export function pendingMigrations(db: DatabaseSync): string[] {
-  const recorded = Number((db.prepare('PRAGMA user_version').get() as Row).user_version ?? 0);
-  const version = recorded || inferredLegacyVersion(db);
-  const pending = MIGRATIONS.filter((m) => m.version > version).map((m) => `v${m.version}: ${m.description}`);
-  // A current ledger with a manually damaged/additively extended schema is repaired without rewriting its version.
-  if (recorded >= SCHEMA_VERSION) {
-    pending.push(...structuralPending(db));
-    const indexes = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Row[]).map((r) => String(r.name)));
-    for (const name of Object.keys(HOT_INDEXES)) if (!indexes.has(name)) pending.push(`index ${name}`);
+/** Refuses a database written by a newer coagent: its schema may not mean what this code expects. */
+function assertSupported(db: DatabaseSync, latest: number) {
+  const recorded = recordedVersion(db);
+  if (recorded > latest) {
+    throw new Error(`database is from a newer coagent (v${recorded}, this plugin supports v${latest}); upgrade the plugin`);
   }
-  return pending;
+}
+
+/** Drift repair a database at `version` gets: the repair fragments of every step it already has, in order. */
+function repairFragments(version: number, migrations: readonly VersionedMigration[]): SchemaFragment[] {
+  return migrations.filter((m) => m.version <= version).flatMap((m) => m.repair ?? []);
+}
+
+function names(db: DatabaseSync, type: 'table' | 'index') {
+  return new Set((db.prepare('SELECT name FROM sqlite_master WHERE type = ?').all(type) as Row[]).map((r) => String(r.name)));
+}
+
+/** Read-only description of the version steps and the drift repair Store would apply. Throws for a newer database. */
+export function pendingMigrations(db: DatabaseSync): string[] {
+  assertSupported(db, SCHEMA_VERSION);
+  const version = schemaVersion(db);
+  const steps = MIGRATIONS.filter((m) => m.version > version);
+  if (steps.length) return steps.map((m) => `v${m.version}: ${m.description}`);
+  const tables = names(db, 'table');
+  const indexes = names(db, 'index');
+  return repairFragments(version, MIGRATIONS).flatMap((f) => fragmentPending(db, f, tables, indexes));
 }
 
 export interface NewAgent {
@@ -299,9 +351,15 @@ export class Store {
   /** Recent activity per agent, captured from the run streams (process-local, like `busy`). */
   readonly activity = new Map<string, { ts: string; text: string; key?: string }[]>();
 
-  constructor(file: string, private now: () => Date = () => new Date(), opts: { maxBackupBytes?: number } = {}) {
+  private readonly migrations: readonly VersionedMigration[];
+
+  /** `opts.migrations` replaces the ledger (tests only). */
+  constructor(file: string, private now: () => Date = () => new Date(),
+    opts: { maxBackupBytes?: number; migrations?: readonly VersionedMigration[] } = {}) {
+    this.migrations = opts.migrations ?? MIGRATIONS;
     this.db = new DatabaseSync(file);
     try {
+      assertSupported(this.db, this.latestVersion);
       if (this.needsMigration()) this.backupOrSkip(file, opts.maxBackupBytes ?? MAX_BACKUP_BYTES);
       this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
       this.migrate();
@@ -315,8 +373,10 @@ export class Store {
   private needsMigration() {
     const userTables = this.db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").get() as Row;
     if (Number(userTables.n) === 0) return false; // A new/empty database has no user state to preserve.
-    return schemaVersion(this.db) < SCHEMA_VERSION;
+    return schemaVersion(this.db) < this.latestVersion;
   }
+
+  private get latestVersion() { return this.migrations.at(-1)?.version ?? 0; }
 
   /**
    * The backup runs before the broker prints its readiness line, and CloudCLI kills a plugin that is not ready within
@@ -364,11 +424,10 @@ export class Store {
     }
   }
 
-  /** Idempotent: each version step and its ledger update commit atomically. */
+  /** Idempotent: each version step and its ledger update commit atomically; then drift repair for steps <= version. */
   private migrate() {
-    const recorded = Number((this.db.prepare('PRAGMA user_version').get() as Row).user_version ?? 0);
-    let version = recorded || inferredLegacyVersion(this.db);
-    for (const m of MIGRATIONS) {
+    let version = schemaVersion(this.db);
+    for (const m of this.migrations) {
       if (m.version <= version) continue;
       this.transaction(() => {
         m.up(this.db);
@@ -376,10 +435,7 @@ export class Store {
       });
       version = m.version;
     }
-    // Compatibility for a current DB receiving additive fragments from a parallel feature branch.
-    this.db.exec(SCHEMA);
-    for (const m of ADDITIVE_MIGRATIONS) addFragment(this.db, m);
-    for (const sql of Object.values(HOT_INDEXES)) this.db.exec(sql);
+    for (const f of repairFragments(version, this.migrations)) applyFragment(this.db, f, (fn) => this.transaction(fn));
   }
 
   close() { this.db.close(); }
@@ -414,7 +470,7 @@ export class Store {
       'SELECT to_agent, COUNT(*) AS count FROM messages WHERE delivered_at IS NULL GROUP BY to_agent',
     ).all() as Row[]).map((r) => [String(r.to_agent), Number(r.count)]));
     return {
-      schema: { version: schemaVersion(this.db), latestVersion: SCHEMA_VERSION,
+      schema: { version: schemaVersion(this.db), latestVersion: this.latestVersion,
         ok: Object.keys(missingColumns).length === 0, columns: actualColumns, missingColumns },
       counts: { runs: countBy('runs'), agents: countBy('agents') },
       stuckBusy: [...this.busySince.entries()].filter(([, since]) => now - since > 30 * 60_000)
